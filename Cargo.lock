@@ -14093,6 +14093,7 @@ dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
  "anyhow",
+ "async-trait",
  "backon",
  "base64 0.22.1",
  "blake3",
@@ -15416,6 +15417,20 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+]
+
+[[package]]
+name = "xai-zcode-agent"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "xai-acp-lib",
 ]
 
 [[package]]

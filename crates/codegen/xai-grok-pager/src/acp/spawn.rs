@@ -17,6 +17,7 @@ use xai_acp_lib::{
     AcpAgentChannel, AcpClientChannel, AcpClientTx, AcpGatewayReceiver, AcpGatewaySender,
     acp_channels,
 };
+use super::{AgentHandle, AgentOps};
 use xai_grok_login::AuthManager;
 use xai_grok_shell::{
     agent::{MvpAgent, activity::SESSION_FLUSH_GRACE, config::Config as AgentConfig},
@@ -329,7 +330,7 @@ pub async fn spawn_grok_shell(
 
     let skills_paths = agent_config.skills.paths.clone();
 
-    let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<Rc<MvpAgent>> + Send + 'static> = {
+    let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<AgentHandle> + Send + 'static> = {
         Box::new(move |client_tx| {
             let gateway = AcpGatewaySender::new(client_tx);
 
@@ -340,7 +341,7 @@ pub async fn spawn_grok_shell(
             if let Some(mc) = memory_config {
                 agent.set_memory_config(mc);
             }
-            Ok(Rc::new(agent))
+            Ok(AgentHandle::new(Rc::new(agent)))
         })
     };
 
@@ -363,7 +364,7 @@ pub async fn spawn_grok_shell(
 /// The agent runs on a single-threaded tokio LocalSet runtime.
 /// RPC requests go directly to the agent via Rc, bypassing simplex pipes.
 async fn spawn_agent_thread_direct(
-    spawn_agent: Box<dyn FnOnce(AcpClientTx) -> Result<Rc<MvpAgent>> + Send + 'static>,
+    spawn_agent: Box<dyn FnOnce(AcpClientTx) -> Result<AgentHandle> + Send + 'static>,
     channel: AcpAgentChannel,
     cancel: CancellationToken,
     skills_paths: Vec<String>,
@@ -447,7 +448,7 @@ pub(super) async fn spawn_runtime_thread(
 }
 
 fn spawn_skills_file_watcher(
-    agent: Rc<MvpAgent>,
+    agent: AgentHandle,
     skills_paths: Vec<String>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
@@ -491,7 +492,7 @@ fn spawn_skills_file_watcher(
     })
 }
 
-fn apply_discovery_change(agent: &MvpAgent, change: DiscoveryChange, created_discovery_dir: bool) {
+fn apply_discovery_change(agent: &dyn AgentOps, change: DiscoveryChange, created_discovery_dir: bool) {
     match change {
         DiscoveryChange::Skills => {
             tracing::info!("skill directory changed on disk; reloading skills for all sessions");

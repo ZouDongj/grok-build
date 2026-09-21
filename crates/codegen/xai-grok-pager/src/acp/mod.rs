@@ -7,6 +7,8 @@ pub mod leader_bridge;
 pub mod meta;
 pub mod model_state;
 pub mod spawn;
+mod agent_handle;
+pub(crate) use agent_handle::{AgentHandle, AgentOps};
 pub(crate) mod subagent_label_registry;
 mod subagent_message;
 pub mod tracker;
