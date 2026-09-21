@@ -7,6 +7,7 @@
 //! model behavior match desktop ZCode by construction.
 
 mod agent;
+mod catalog;
 mod kernel;
 
 pub use agent::ZcodeAgent;

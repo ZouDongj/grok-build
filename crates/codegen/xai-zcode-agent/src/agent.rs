@@ -27,6 +27,8 @@ struct Shared {
 #[derive(Default)]
 struct AgentState {
     kernel: Option<Kernel>,
+    /// Full official catalog (workspace/readState) cached for pushes.
+    catalog: Option<acp::SessionModelState>,
     sessions: HashMap<acp::SessionId, Rc<SessionState>>,
     /// request_id dedupe — the kernel re-sends interactions under fresh
     /// envelope ids with backoff until answered.
@@ -72,6 +74,105 @@ impl ZcodeAgent {
         }
     }
 
+    /// Read the kernel's model catalog for this session and forward it to the
+    /// pager as `x.ai/models/update` (params = acp::SessionModelState).
+    async fn push_model_state(&self, kernel: &Kernel, session_id: &str) {
+        eprintln!("[zcode-agent] session/read for models");
+        let Ok(read) = kernel.call("session/read", kernel::read_params(session_id)).await else {
+            eprintln!("[zcode-agent] session/read FAILED");
+            return;
+        };
+        eprintln!("[zcode-agent] session/read ok");
+        let Some(mut state) = model_state_from_settings(&read) else {
+            return;
+        };
+        // Prefer the cached full catalog, but keep any context-window
+        // metadata session/read reports for models it knows.
+        if let Some(catalog) = self.shared.state.borrow().catalog.clone() {
+            if catalog.available_models.len() > state.available_models.len() {
+                let windows: std::collections::HashMap<String, &acp::ModelInfo> =
+                    state.available_models.iter().map(|m| (m.model_id.0.as_ref().to_string(), m)).collect();
+                state.available_models = catalog
+                    .available_models
+                    .iter()
+                    .map(|m| match windows.get(m.model_id.0.as_ref()) {
+                        Some(with_meta) => (*with_meta).clone(),
+                        None => m.clone(),
+                    })
+                    .collect();
+            }
+        }
+        if let Ok(params) = serde_json::value::to_raw_value(&state) {
+            self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                "x.ai/models/update",
+                params.into(),
+            ));
+        }
+        // The composer/status model label is SESSION-scoped: it only moves on
+        // a ModelChanged session notification, not on the catalog update.
+        {
+            let current = &state.current_model_id;
+            let payload = json!({
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "model_changed",
+                    "model_id": current.0.as_ref(),
+                },
+            });
+            if let Ok(params) = serde_json::value::to_raw_value(&payload) {
+                self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/session_notification",
+                    params.into(),
+                ));
+            }
+        }
+    }
+
+    /// Full catalog with zero kernel round-trips: the account provider and
+    /// current model come from the kernel config's `model/main`; every
+    /// enabled official model comes from the kernel's bundled registry.
+    async fn refresh_catalog(&self, _kernel: &Kernel) {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let Ok(config_raw) = std::fs::read_to_string(home.join(".zcode/cli/config.json")) else {
+            eprintln!("[zcode-agent] kernel config unreadable");
+            return;
+        };
+        let Ok(config) = serde_json::from_str::<Value>(&config_raw) else {
+            return;
+        };
+        let Some(main) = config
+            .pointer("/model/main")
+            .and_then(Value::as_str)
+            .or_else(|| config.get("model").and_then(Value::as_str))
+            .and_then(|main| main.split_once('/'))
+        else {
+            return;
+        };
+        let (provider_id, current) = (main.0, main.1);
+        let mut models = crate::catalog::bundled_models(&home, provider_id);
+        if models.is_empty() {
+            return;
+        }
+        let current_id = acp::ModelId::new(current.to_string());
+        if !models.iter().any(|m| m.model_id == current_id) {
+            models.insert(0, acp::ModelInfo::new(current.to_string(), current.to_string()));
+        }
+        let catalog = acp::SessionModelState::new(current_id, models);
+        eprintln!(
+            "[zcode-agent] catalog: {} models (current {current})",
+            catalog.available_models.len()
+        );
+        if let Ok(raw) = serde_json::value::to_raw_value(&catalog) {
+            self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                "x.ai/models/update",
+                raw.into(),
+            ));
+        }
+        self.shared.state.borrow_mut().catalog = Some(catalog);
+    }
+
     fn kernel(&self) -> Result<Kernel, acp::Error> {
         self.shared
             .state
@@ -82,17 +183,21 @@ impl ZcodeAgent {
     }
 
     /// Spawn the kernel once and start the event pump on this LocalSet.
-    fn ensure_kernel(&self) -> Result<Kernel, acp::Error> {
+    async fn ensure_kernel(&self) -> Result<Kernel, acp::Error> {
         if let Some(kernel) = self.shared.state.borrow().kernel.as_ref() {
             return Ok(kernel.clone());
         }
         let (kernel, inbound) = Kernel::spawn(&self.shared.kernel_bin)
             .map_err(|e| acp::Error::internal_error().data(format!("zcode app-server spawn failed: {e}")))?;
         self.shared.state.borrow_mut().kernel = Some(kernel.clone());
+        // Register the runtime provider (all official models) and cache the
+        // full catalog — session/read alone only reports the current model.
+        self.refresh_catalog(&kernel).await;
         let pump_shared = Rc::clone(&self.shared);
         let pump_gateway = self.gateway.clone();
         tokio::task::spawn_local(async move {
             let mut inbound = inbound;
+            let mut last_model: Option<String> = None;
             while let Some(message) = inbound.recv().await {
                 match message {
                     KernelMessage::Event { session_id, payload } => {
@@ -102,6 +207,41 @@ impl ZcodeAgent {
                         handle_server_request(&pump_gateway, &pump_shared, &id, &method, params)
                             .await;
                     }
+                    KernelMessage::StateUpdated(params) => {
+                        // The full model catalog (all official models, not
+                        // just the current one) rides state.updated patches.
+                        let Some(state) = model_state_from_patch(&params) else {
+                            continue;
+                        };
+                        let current = state.current_model_id.0.as_ref().to_string();
+                        let catalog_grew = state.available_models.len()
+                            > last_model.as_ref().map(|_| 1).unwrap_or(0);
+                        if last_model.as_deref() != Some(&current) || catalog_grew {
+                            if let Ok(raw) = serde_json::value::to_raw_value(&state) {
+                                pump_gateway.forward_fire_and_forget(
+                                    acp::ExtNotification::new("x.ai/models/update", raw.into()),
+                                );
+                            }
+                            if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
+                                let payload = json!({
+                                    "sessionId": session_id,
+                                    "update": {
+                                        "sessionUpdate": "model_changed",
+                                        "model_id": current,
+                                    },
+                                });
+                                if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+                                    pump_gateway.forward_fire_and_forget(
+                                        acp::ExtNotification::new(
+                                            "x.ai/session_notification",
+                                            raw.into(),
+                                        ),
+                                    );
+                                }
+                            }
+                            last_model = Some(current);
+                        }
+                    }
                 }
             }
             tracing::info!("zcode kernel inbound stream closed");
@@ -110,9 +250,22 @@ impl ZcodeAgent {
     }
 }
 
+fn debug_log(text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/zcode-agent-debug.log")
+    {
+        let _ = writeln!(f, "{text}");
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl acp::Agent for ZcodeAgent {
     async fn initialize(&self, _args: acp::InitializeRequest) -> acp::Result<acp::InitializeResponse> {
+        debug_log("acp: initialize");
+        eprintln!("[zcode-agent] initialize called");
         // Advertise a non-grok.com agent method: the pager's welcome screen
         // treats that as "credentials handled outside ACP" and skips its
         // login flow — the ZCode kernel owns auth (config.json / coding plan).
@@ -128,16 +281,20 @@ impl acp::Agent for ZcodeAgent {
                 acp::Implementation::new("zcode", env!("CARGO_PKG_VERSION"))
                     .title("ZCode (official kernel)"),
             )
+            .agent_capabilities(acp::AgentCapabilities::new().load_session(true))
             .auth_methods(vec![method]))
     }
 
     async fn authenticate(&self, _args: acp::AuthenticateRequest) -> acp::Result<acp::AuthenticateResponse> {
+        debug_log("acp: authenticate");
         // The kernel owns credentials (config.json / coding plan); no ACP-level auth.
         Ok(acp::AuthenticateResponse::default())
     }
 
     async fn new_session(&self, args: acp::NewSessionRequest) -> acp::Result<acp::NewSessionResponse> {
-        let kernel = self.ensure_kernel()?;
+        debug_log("acp: new_session");
+        eprintln!("[zcode-agent] new_session cwd={:?}", args.cwd);
+        let kernel = self.ensure_kernel().await?;
         let cwd = args.cwd.clone();
         let created = kernel
             .call("session/create", kernel::create_params(&cwd))
@@ -163,11 +320,19 @@ impl acp::Agent for ZcodeAgent {
             .borrow_mut()
             .sessions
             .insert(acp_session.clone(), Rc::new(SessionState::new()));
+        // The OFFICIAL session-scoped model channel: NewSessionResponse.models.
+        let initial_models = self.shared.state.borrow().catalog.clone();
+        // Belt and braces: the catalog also flows via NewSessionResponse
+        // above and the x.ai ext notifications below.
+        self.push_model_state(&kernel, &session_id).await;
         tracing::info!(%session_id, "zcode session created");
-        Ok(acp::NewSessionResponse::new(acp_session))
+        let mut response = acp::NewSessionResponse::new(acp_session);
+        response.models = initial_models;
+        Ok(response)
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
+        debug_log("acp: prompt");
         let kernel = self.kernel()?;
         let state = self
             .shared
@@ -190,6 +355,7 @@ impl acp::Agent for ZcodeAgent {
     }
 
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
+        debug_log("acp: cancel");
         let kernel = self.kernel()?;
         if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id) {
             state.cancelled.set(true);
@@ -200,9 +366,24 @@ impl acp::Agent for ZcodeAgent {
 
     async fn set_session_mode(
         &self,
-        _args: acp::SetSessionModeRequest,
+        args: acp::SetSessionModeRequest,
     ) -> acp::Result<acp::SetSessionModeResponse> {
-        // TODO(P4): map ACP modes to session/setMode (plan ⇄ zcode plan mode).
+        debug_log("acp: set_session_mode");
+        // grok's plan mode maps onto the kernel's plan mode; anything else
+        // returns to the default (build) mode. Confirm via CurrentModeUpdate
+        // so the pager's optimistic staging settles.
+        let kernel = self.kernel()?;
+        let kernel_mode = if args.mode_id.0.as_ref() == "plan" { "plan" } else { "build" };
+        kernel
+            .call("session/setMode", kernel::set_mode_params(&args.session_id.0, kernel_mode))
+            .await
+            .map_err(|e| acp::Error::internal_error().data(format!("setMode failed: {e}")))?;
+        self.gateway.forward_fire_and_forget(acp::SessionNotification::new(
+            args.session_id.clone(),
+            acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(
+                args.mode_id.clone(),
+            )),
+        ));
         Ok(acp::SetSessionModeResponse::default())
     }
 
@@ -210,6 +391,8 @@ impl acp::Agent for ZcodeAgent {
         &self,
         args: acp::SetSessionModelRequest,
     ) -> acp::Result<acp::SetSessionModelResponse> {
+        debug_log("acp: set_session_model");
+        eprintln!("[zcode-agent] set_session_model: {}", args.model_id.0);
         let kernel = self.kernel()?;
         let model = &*args.model_id.0;
         let provider = load_model_preference().map(|(p, _)| p).unwrap_or(DEFAULT_PROVIDER.to_string());
@@ -217,12 +400,58 @@ impl acp::Agent for ZcodeAgent {
             .call("session/setModel", kernel::set_model_params(&args.session_id.0, &provider, model))
             .await
             .map_err(|e| acp::Error::internal_error().data(format!("setModel failed: {e}")))?;
+        self.push_model_state(&kernel, &args.session_id.0).await;
         Ok(acp::SetSessionModelResponse::default())
     }
 
-    async fn ext_method(&self, _args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+    async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
+        debug_log(&format!("acp: ext_method {}", args.method));
+        eprintln!("[zcode-agent] ext_method: {}", args.method);
         Err(acp::Error::method_not_found())
     }
+}
+
+/// Build the ACP model state from a session/read result: the kernel reports
+/// `/model/available[] {label, ref{providerId, modelId}, contextWindow}` and
+/// `/model/current` (zcode-tui's controls_from_settings shape).
+fn model_state_from_patch(patch: &Value) -> Option<acp::SessionModelState> {
+    let model = patch.pointer("/model")?;
+    model_state_from_model(model)
+}
+
+fn model_state_from_settings(read: &Value) -> Option<acp::SessionModelState> {
+    let model = read.pointer("/settings/model")?;
+    model_state_from_model(model)
+}
+
+pub fn model_state_from_model(model: &Value) -> Option<acp::SessionModelState> {
+    let available = model.get("available")?.as_array()?;
+    let mut models = Vec::new();
+    for entry in available {
+        let model_id = entry
+            .pointer("/ref/modelId")
+            .and_then(Value::as_str)?
+            .to_string();
+        let mut info = acp::ModelInfo::new(model_id.clone(), {
+            let label = entry.get("label").and_then(Value::as_str).unwrap_or(&model_id);
+            label.to_string()
+        });
+        if let Some(window) = entry.get("contextWindow").and_then(Value::as_u64) {
+            let mut meta = acp::Meta::new();
+            meta.insert("totalContextTokens".to_string(), json!(window));
+            info.meta = Some(meta);
+        }
+        models.push(info);
+    }
+    if models.is_empty() {
+        return None;
+    }
+    let current = model
+        .pointer("/current/modelId")
+        .and_then(Value::as_str)
+        .map(|id| acp::ModelId::new(id.to_string()))
+        .unwrap_or_else(|| models[0].model_id.clone());
+    Some(acp::SessionModelState::new(current, models))
 }
 
 /// Flatten a prompt's text blocks into one string.

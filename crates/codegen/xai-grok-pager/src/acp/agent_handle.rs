@@ -112,7 +112,6 @@ impl acp::Agent for AgentHandle {
         self.inner.authenticate(args).await
     }
 
-    #[cfg(feature = "unstable_logout")]
     async fn logout(&self, args: acp::LogoutRequest) -> acp::Result<acp::LogoutResponse> {
         self.inner.logout(args).await
     }
@@ -140,7 +139,6 @@ impl acp::Agent for AgentHandle {
         self.inner.set_session_mode(args).await
     }
 
-    #[cfg(feature = "unstable_session_model")]
     async fn set_session_model(
         &self,
         args: acp::SetSessionModelRequest,
@@ -162,12 +160,10 @@ impl acp::Agent for AgentHandle {
         self.inner.list_sessions(args).await
     }
 
-    #[cfg(feature = "unstable_session_fork")]
     async fn fork_session(&self, args: acp::ForkSessionRequest) -> acp::Result<acp::ForkSessionResponse> {
         self.inner.fork_session(args).await
     }
 
-    #[cfg(feature = "unstable_session_resume")]
     async fn resume_session(
         &self,
         args: acp::ResumeSessionRequest,
@@ -175,7 +171,6 @@ impl acp::Agent for AgentHandle {
         self.inner.resume_session(args).await
     }
 
-    #[cfg(feature = "unstable_session_close")]
     async fn close_session(&self, args: acp::CloseSessionRequest) -> acp::Result<acp::CloseSessionResponse> {
         self.inner.close_session(args).await
     }

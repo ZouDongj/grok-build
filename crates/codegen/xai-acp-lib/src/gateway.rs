@@ -172,6 +172,15 @@ impl<C: acp::Agent + 'static> AcpGatewayReceiver<acp::ClientSide, C> {
         let spawn = self.spawn_fn.clone();
         let on_meta = self.on_meta.clone();
         while let Some(msg) = self.rx.recv().await {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/acp-wire-debug.log")
+                .and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, "inbound agent-side: {}", msg.method_name())
+                })
+                .ok();
             let conn = conn.clone();
             match msg {
                 AcpAgentMessage::Initialize(args) => {

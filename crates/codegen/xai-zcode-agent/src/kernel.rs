@@ -18,6 +18,19 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const DELIVERY_KIND: &str = "desktop-continuous";
 
+pub fn debug_log_kernel(text: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/zcode-agent-debug.log")
+    {
+        let _ = writeln!(f, "kernel: {text}");
+    }
+}
+
+pub use crate::agent::model_state_from_model as model_state_from_model_node;
+
 /// One decoded inbound kernel line.
 #[derive(Debug)]
 pub enum KernelMessage {
@@ -32,6 +45,8 @@ pub enum KernelMessage {
         method: String,
         params: Value,
     },
+    /// `state.updated` — carries the full model catalog patch.
+    StateUpdated(Value),
 }
 
 /// The event kind: `payload.kind` for streaming payloads, else `params.type`
@@ -100,11 +115,20 @@ impl Kernel {
     pub fn spawn(
         bin: &str,
     ) -> std::io::Result<(Kernel, mpsc::UnboundedReceiver<KernelMessage>)> {
+        let kernel_log = std::env::var_os("ZCODE_KERNEL_LOG")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/zcode-kernel.err"));
+        let kernel_err = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&kernel_log)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
         let mut child = Command::new(bin)
             .arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(kernel_err)
             .spawn()?;
         let mut stdin = child.stdin.take().expect("stdin piped");
         let stdout = child.stdout.take().expect("stdout piped");
@@ -184,9 +208,16 @@ impl Kernel {
                         }
                         continue;
                     }
-                    // state.updated and everything else: ignored for now.
+                    if value.get("method").and_then(Value::as_str) == Some("state.updated") {
+                        let _ = tx.send(KernelMessage::StateUpdated(
+                            value.get("params").cloned().unwrap_or(Value::Null),
+                        ));
+                        continue;
+                    }
+                    // everything else: ignored for now.
                 }
                 // Kernel gone: wake any pending request and stop the writer.
+                crate::kernel::debug_log_kernel("kernel stdout stream ended");
                 reader_pending.waiting.lock().unwrap().clear();
             })?;
 
@@ -203,9 +234,11 @@ impl Kernel {
                         .and_then(|_| stdin.flush())
                         .is_err()
                     {
+                        debug_log_kernel("writer: stdin write failed (kernel exited?)");
                         break;
                     }
                 }
+                debug_log_kernel("writer thread exited");
             })?;
 
         Ok((
@@ -295,6 +328,14 @@ pub fn set_model_params(session_id: &str, provider_id: &str, model_id: &str) -> 
             "options": {"reasoningLevel": "max"},
         }
     })
+}
+
+pub fn set_mode_params(session_id: &str, mode: &str) -> Value {
+    json!({"sessionId": session_id, "mode": mode})
+}
+
+pub fn read_params(session_id: &str) -> Value {
+    json!({"sessionId": session_id, "messageLimit": 1})
 }
 
 pub fn session_id_from(result: &Value) -> Option<String> {
