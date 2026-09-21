@@ -88,6 +88,17 @@ impl AgentOps for AgentHandle {
     }
 }
 
+// The ZCode backend has no in-process skills/workflow registry to hot-reload;
+// shutdown flush is unnecessary because the kernel owns session persistence.
+#[async_trait::async_trait(?Send)]
+impl AgentOps for xai_zcode_agent::ZcodeAgent {
+    fn reload_skills_all_sessions(&self) {}
+
+    fn advertise_commands_all_sessions(&self) {}
+
+    async fn flush_all_sessions(&self, _grace: Duration) {}
+}
+
 // Delegating `acp::Agent` impl: the default trait bodies answer
 // `method_not_found`, so EVERY method forwards explicitly — a lost default
 // here would silently break a protocol feature for the whole backend.

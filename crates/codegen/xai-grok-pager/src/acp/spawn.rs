@@ -330,20 +330,34 @@ pub async fn spawn_grok_shell(
 
     let skills_paths = agent_config.skills.paths.clone();
 
-    let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<AgentHandle> + Send + 'static> = {
-        Box::new(move |client_tx| {
-            let gateway = AcpGatewaySender::new(client_tx);
+    // Backend selection: GROK_BACKEND=zcode swaps the in-process agent for
+    // the ZCode kernel adapter (xai-zcode-agent); everything else keeps the
+    // grok-shell runtime. The kernel binary can be overridden via ZCODE_BIN.
+    let zcode_backend = std::env::var("GROK_BACKEND")
+        .map(|value| value.trim().eq_ignore_ascii_case("zcode"))
+        .unwrap_or(false);
+    let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<AgentHandle> + Send + 'static> =
+        if zcode_backend {
+            let kernel_bin = std::env::var("ZCODE_BIN").unwrap_or_else(|_| "zcode".to_string());
+            Box::new(move |client_tx| {
+                let gateway = AcpGatewaySender::new(client_tx);
+                let agent = xai_zcode_agent::ZcodeAgent::new(gateway, kernel_bin);
+                Ok(AgentHandle::new(Rc::new(agent)))
+            })
+        } else {
+            Box::new(move |client_tx| {
+                let gateway = AcpGatewaySender::new(client_tx);
 
-            let _t = xai_grok_telemetry::instrumentation::timer("startup.worker_spawn.agent_build");
-            let mut agent =
-                MvpAgent::with_models(gateway, &agent_config, auth_manager, models_manager);
-            drop(_t);
-            if let Some(mc) = memory_config {
-                agent.set_memory_config(mc);
-            }
-            Ok(AgentHandle::new(Rc::new(agent)))
-        })
-    };
+                let _t = xai_grok_telemetry::instrumentation::timer("startup.worker_spawn.agent_build");
+                let mut agent =
+                    MvpAgent::with_models(gateway, &agent_config, auth_manager, models_manager);
+                drop(_t);
+                if let Some(mc) = memory_config {
+                    agent.set_memory_config(mc);
+                }
+                Ok(AgentHandle::new(Rc::new(agent)))
+            })
+        };
 
     // Spawn the agent thread with direct dispatch
     startup::enter(StartupPhase::WorkerSpawn);
