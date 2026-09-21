@@ -18,6 +18,13 @@ use tokio::sync::{mpsc, oneshot};
 
 pub const DELIVERY_KIND: &str = "desktop-continuous";
 
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
 pub fn debug_log_kernel(text: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -25,7 +32,7 @@ pub fn debug_log_kernel(text: &str) {
         .append(true)
         .open("/tmp/zcode-agent-debug.log")
     {
-        let _ = writeln!(f, "kernel: {text}");
+        let _ = writeln!(f, "[{}] kernel: {text}", now_ms());
     }
 }
 
@@ -147,7 +154,11 @@ impl Kernel {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
                     let Ok(line) = line else { break };
+                    if std::env::var_os("ZCODE_WIRE_LOG").is_some() {
+                        debug_log_kernel(&format!("> {line}"));
+                    }
                     let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                        debug_log_kernel(&format!("unparseable line: {}", &line[..line.len().min(200)]));
                         continue;
                     };
                     // Server→client request: method AND id together. The kernel
@@ -161,11 +172,13 @@ impl Kernel {
                                 json!({"id": id, "result": reply}).to_string(),
                             );
                         } else {
-                            let _ = tx.send(KernelMessage::ServerRequest {
+                            if let Err(_) = tx.send(KernelMessage::ServerRequest {
                                 id: id.clone(),
                                 method: method.to_string(),
                                 params: value.get("params").cloned().unwrap_or(Value::Null),
-                            });
+                            }) {
+                                debug_log_kernel("server-request send FAILED: pump gone");
+                            }
                         }
                         continue;
                     }
@@ -196,22 +209,32 @@ impl Kernel {
                                 .cloned()
                                 .unwrap_or_else(|| serde_json::json!({}));
                             if payload.get("kind").is_none() {
-                                payload["kind"] = Value::String(kind);
+                                payload["kind"] = Value::String(kind.clone());
                             }
-                            let _ = tx.send(KernelMessage::Event {
+                            let send = tx.send(KernelMessage::Event {
                                 session_id: params
                                     .get("sessionId")
                                     .and_then(Value::as_str)
                                     .map(String::from),
                                 payload,
                             });
+                            if send.is_err() {
+                                debug_log_kernel(&format!(
+                                    "event send FAILED (pump gone): kind={kind}"
+                                ));
+                            }
                         }
                         continue;
                     }
                     if value.get("method").and_then(Value::as_str) == Some("state.updated") {
-                        let _ = tx.send(KernelMessage::StateUpdated(
-                            value.get("params").cloned().unwrap_or(Value::Null),
-                        ));
+                        if tx
+                            .send(KernelMessage::StateUpdated(
+                                value.get("params").cloned().unwrap_or(Value::Null),
+                            ))
+                            .is_err()
+                        {
+                            debug_log_kernel("state.updated send FAILED: pump gone");
+                        }
                         continue;
                     }
                     // everything else: ignored for now.
@@ -279,9 +302,36 @@ impl Kernel {
             .map_err(|_| anyhow::anyhow!("kernel writer is gone"))
     }
 
+    /// Upper bound for one kernel round-trip. The kernel answers control
+    /// calls (create/subscribe/setModel/read) in well under a second; a call
+    /// that exceeds this is a wedged kernel, and every ACP handler built on
+    /// `call` must fail fast instead of hanging the pager's request future.
+    pub const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     pub async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        let rx = self.request(method, params).map_err(|e| e.to_string())?;
-        rx.await.map_err(|_| "kernel reader dropped".to_string())?
+        let id = self.pending.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        self.pending.waiting.lock().unwrap().insert(id, tx);
+        let line = json!({"id": id, "method": method, "params": params}).to_string();
+        if let Err(error) = self.writer.send(line) {
+            self.pending.waiting.lock().unwrap().remove(&id);
+            debug_log_kernel(&format!("call {method}: writer gone ({error})"));
+            return Err(format!("kernel writer is gone: {error}"));
+        }
+        match tokio::time::timeout(Self::CALL_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("kernel reader dropped (kernel exited)".to_string()),
+            Err(_) => {
+                // Leave no stale waiter: a late response would hit a dead oneshot anyway.
+                self.pending.waiting.lock().unwrap().remove(&id);
+                debug_log_kernel(&format!(
+                    "call TIMEOUT after {}s: {method} (kernel alive: {})",
+                    Self::CALL_TIMEOUT.as_secs(),
+                    self.is_alive()
+                ));
+                Err(format!("kernel call timeout: {method}"))
+            }
+        }
     }
 }
 

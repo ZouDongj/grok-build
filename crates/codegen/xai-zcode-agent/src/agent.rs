@@ -65,6 +65,17 @@ impl SessionState {
 
 impl ZcodeAgent {
     pub fn new(gateway: AcpGatewaySender<acp::AgentSide>, kernel_bin: impl Into<String>) -> ZcodeAgent {
+        // A panicking pump/gateway task dies silently otherwise (spawn_local
+        // JoinHandles are never awaited): capture every panic into the debug
+        // log so a wedged turn leaves evidence instead of a mystery hang.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            debug_log(&format!(
+                "PANIC: {info} at {:?}",
+                info.location().map(|l| l.to_string())
+            ));
+            hook(info);
+        }));
         ZcodeAgent {
             gateway,
             shared: Rc::new(Shared {
@@ -77,12 +88,12 @@ impl ZcodeAgent {
     /// Read the kernel's model catalog for this session and forward it to the
     /// pager as `x.ai/models/update` (params = acp::SessionModelState).
     async fn push_model_state(&self, kernel: &Kernel, session_id: &str) {
-        eprintln!("[zcode-agent] session/read for models");
+        debug_log("push_model_state: session/read");
         let Ok(read) = kernel.call("session/read", kernel::read_params(session_id)).await else {
-            eprintln!("[zcode-agent] session/read FAILED");
+            debug_log("push_model_state: session/read FAILED");
             return;
         };
-        eprintln!("[zcode-agent] session/read ok");
+        debug_log("push_model_state: session/read ok");
         let Some(mut state) = model_state_from_settings(&read) else {
             return;
         };
@@ -146,7 +157,6 @@ impl ZcodeAgent {
             return;
         };
         let Ok(config_raw) = std::fs::read_to_string(home.join(".zcode/cli/config.json")) else {
-            eprintln!("[zcode-agent] kernel config unreadable");
             return;
         };
         let Ok(config) = serde_json::from_str::<Value>(&config_raw) else {
@@ -170,10 +180,6 @@ impl ZcodeAgent {
             models.insert(0, acp::ModelInfo::new(current.to_string(), current.to_string()));
         }
         let catalog = acp::SessionModelState::new(current_id, models);
-        eprintln!(
-            "[zcode-agent] catalog: {} models (current {current})",
-            catalog.available_models.len()
-        );
         if let Ok(raw) = serde_json::value::to_raw_value(&catalog) {
             self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
                 "x.ai/models/update",
@@ -184,18 +190,30 @@ impl ZcodeAgent {
     }
 
     fn kernel(&self) -> Result<Kernel, acp::Error> {
-        self.shared
+        let kernel = self
+            .shared
             .state
             .borrow()
             .kernel
             .clone()
-            .ok_or_else(|| acp::Error::internal_error().data("zcode kernel not running"))
+            .ok_or_else(|| acp::Error::internal_error().data("zcode kernel not running"))?;
+        if !kernel.is_alive() {
+            return Err(acp::Error::internal_error().data("zcode kernel exited"));
+        }
+        Ok(kernel)
     }
 
     /// Spawn the kernel once and start the event pump on this LocalSet.
+    /// A kernel that died since the last use is replaced with a fresh one
+    /// (its sessions are gone; subsequent calls on them fail visibly).
     async fn ensure_kernel(&self) -> Result<Kernel, acp::Error> {
-        if let Some(kernel) = self.shared.state.borrow().kernel.as_ref() {
-            return Ok(kernel.clone());
+        let existing = self.shared.state.borrow().kernel.clone();
+        if let Some(kernel) = existing {
+            if kernel.is_alive() {
+                return Ok(kernel);
+            }
+            debug_log("ensure_kernel: previous kernel dead, respawning");
+            self.shared.state.borrow_mut().kernel = None;
         }
         let (kernel, inbound) = Kernel::spawn(&self.shared.kernel_bin)
             .map_err(|e| acp::Error::internal_error().data(format!("zcode app-server spawn failed: {e}")))?;
@@ -208,14 +226,17 @@ impl ZcodeAgent {
         tokio::task::spawn_local(async move {
             let mut inbound = inbound;
             let mut last_model: Option<String> = None;
+            debug_log("pump: started");
             while let Some(message) = inbound.recv().await {
                 match message {
                     KernelMessage::Event { session_id, payload } => {
                         handle_event(&pump_gateway, &pump_shared, session_id.as_deref(), &payload);
                     }
                     KernelMessage::ServerRequest { id, method, params } => {
+                        debug_log(&format!("pump: server request {method}"));
                         handle_server_request(&pump_gateway, &pump_shared, &id, &method, params)
                             .await;
+                        debug_log(&format!("pump: server request {method} answered"));
                     }
                     KernelMessage::StateUpdated(params) => {
                         // The full model catalog (all official models, not
@@ -255,6 +276,21 @@ impl ZcodeAgent {
                 }
             }
             tracing::info!("zcode kernel inbound stream closed");
+            // The kernel is gone: unhang every open turn (its `prompt()`
+            // future parks on turn_done) and drop the dead handle so the next
+            // `ensure_kernel` respawns a fresh kernel.
+            let mut state = pump_shared.state.borrow_mut();
+            state.kernel = None;
+            for (session, session_state) in state.sessions.iter() {
+                notify(
+                    &pump_gateway,
+                    session,
+                    acp::SessionUpdate::AgentMessageChunk(text_chunk(
+                        "zcode kernel exited unexpectedly; turn aborted",
+                    )),
+                );
+                finish_turn(session_state, &pump_gateway, session, acp::StopReason::Cancelled);
+            }
         });
         Ok(kernel)
     }
@@ -262,12 +298,16 @@ impl ZcodeAgent {
 
 fn debug_log(text: &str) {
     use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/tmp/zcode-agent-debug.log")
     {
-        let _ = writeln!(f, "{text}");
+        let _ = writeln!(f, "[{now}] {text}");
     }
 }
 
@@ -275,7 +315,6 @@ fn debug_log(text: &str) {
 impl acp::Agent for ZcodeAgent {
     async fn initialize(&self, _args: acp::InitializeRequest) -> acp::Result<acp::InitializeResponse> {
         debug_log("acp: initialize");
-        eprintln!("[zcode-agent] initialize called");
         // Advertise a non-grok.com agent method: the pager's welcome screen
         // treats that as "credentials handled outside ACP" and skips its
         // login flow — the ZCode kernel owns auth (config.json / coding plan).
@@ -303,7 +342,6 @@ impl acp::Agent for ZcodeAgent {
 
     async fn new_session(&self, args: acp::NewSessionRequest) -> acp::Result<acp::NewSessionResponse> {
         debug_log("acp: new_session");
-        eprintln!("[zcode-agent] new_session cwd={:?}", args.cwd);
         let kernel = self.ensure_kernel().await?;
         let cwd = args.cwd.clone();
         let created = kernel
@@ -361,7 +399,33 @@ impl acp::Agent for ZcodeAgent {
             .request("session/send", kernel::send_params(&args.session_id.0, &text))
             .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
         let stop = rx.await.unwrap_or(acp::StopReason::EndTurn);
-        Ok(acp::PromptResponse::new(stop))
+        debug_log(&format!("acp: prompt done stop={stop:?}"));
+        // Turn-end broadcast (MvpAgent parity): the pager's queue rail
+        // finalizes a running turn from `x.ai/session/prompt_complete`, not
+        // from the PromptResponse alone, and matches responses to prompts by
+        // `meta.promptId`. Emit the broadcast BEFORE responding, like the
+        // grok shell does.
+        let stop_str = match stop {
+            acp::StopReason::Cancelled => "cancelled",
+            _ => "end_turn",
+        };
+        let prompt_id = args.meta.as_ref().and_then(|m| m.get("promptId")).cloned();
+        let mut payload = json!({
+            "sessionId": args.session_id.0,
+            "stopReason": stop_str,
+        });
+        if let Some(prompt_id) = prompt_id.as_ref() {
+            payload["promptId"] = prompt_id.clone();
+        }
+        if let Ok(params) = serde_json::value::to_raw_value(&payload) {
+            self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                "x.ai/session/prompt_complete",
+                params.into(),
+            ));
+        }
+        let mut response = acp::PromptResponse::new(stop);
+        response.meta = args.meta.clone();
+        Ok(response)
     }
 
     async fn cancel(&self, args: acp::CancelNotification) -> acp::Result<()> {
@@ -402,14 +466,18 @@ impl acp::Agent for ZcodeAgent {
         args: acp::SetSessionModelRequest,
     ) -> acp::Result<acp::SetSessionModelResponse> {
         debug_log("acp: set_session_model");
-        eprintln!("[zcode-agent] set_session_model: {}", args.model_id.0);
         let kernel = self.kernel()?;
         let model = &*args.model_id.0;
         let provider = load_model_preference().map(|(p, _)| p).unwrap_or(DEFAULT_PROVIDER.to_string());
+        debug_log(&format!("set_session_model: setModel {provider}/{model}"));
         kernel
             .call("session/setModel", kernel::set_model_params(&args.session_id.0, &provider, model))
             .await
-            .map_err(|e| acp::Error::internal_error().data(format!("setModel failed: {e}")))?;
+            .map_err(|e| {
+                debug_log(&format!("set_session_model: setModel FAILED: {e}"));
+                acp::Error::internal_error().data(format!("setModel failed: {e}"))
+            })?;
+        debug_log("set_session_model: setModel ok");
         // Reasoning effort (grok's /effort and the picker's [effort] arg)
         // rides the request meta as `reasoningEffort` — forward to the
         // kernel's thoughtLevel (low/high/max, GLM official levels).
@@ -419,20 +487,25 @@ impl acp::Agent for ZcodeAgent {
             .and_then(|meta| meta.get("reasoningEffort"))
             .and_then(Value::as_str)
         {
-            let _ = kernel
+            debug_log(&format!("set_session_model: setThoughtLevel {effort}"));
+            if let Err(error) = kernel
                 .call(
                     "session/setThoughtLevel",
                     kernel::set_thought_params(&args.session_id.0, effort),
                 )
-                .await;
+                .await
+            {
+                debug_log(&format!("set_session_model: setThoughtLevel FAILED: {error}"));
+            }
         }
+        debug_log("set_session_model: session/read");
         self.push_model_state(&kernel, &args.session_id.0).await;
+        debug_log("set_session_model: done");
         Ok(acp::SetSessionModelResponse::default())
     }
 
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
         debug_log(&format!("acp: ext_method {}", args.method));
-        eprintln!("[zcode-agent] ext_method: {}", args.method);
         Err(acp::Error::method_not_found())
     }
 }
@@ -531,9 +604,11 @@ fn handle_event(
     let Some(session_id) = session_id else { return };
     let acp_session = acp::SessionId::new(session_id.to_string());
     let Some(state) = shared.state.borrow().sessions.get(&acp_session).cloned() else {
+        debug_log(&format!("handle_event: UNKNOWN session {session_id}"));
         return;
     };
     let Some(event) = TurnEvent::decode(payload) else {
+        debug_log(&format!("handle_event: undecodable payload kind={:?}", payload.get("kind")));
         return;
     };
     match event.kind.as_str() {

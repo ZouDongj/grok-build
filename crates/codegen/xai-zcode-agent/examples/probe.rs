@@ -70,18 +70,33 @@ async fn main() -> anyhow::Result<()> {
         let session = acp_send(acp::NewSessionRequest::new(cwd), &client.tx).await?;
         println!("new_session ok: {:?}", session.session_id.0);
 
-        // Model switch round-trip test.
-        let switch = acp_send(
-            acp::SetSessionModelRequest::new(session.session_id.clone(), acp::ModelId::new("GLM-5.3-Flash".to_string())),
+        // Model switch round-trip test — FULL TUI sequence: a completed turn
+        // BEFORE the switch (the TUI repro requires it), effort meta included.
+        let prompt1 = acp_send(
+            acp::PromptRequest::new(
+                session.session_id.clone(),
+                vec![acp::ContentBlock::Text(acp::TextContent::new("hi".to_string()))],
+            ),
             &client.tx,
         )
         .await;
+        println!("prompt1 stop={:?}", prompt1.map(|r| r.stop_reason).map_err(|e| e.to_string()));
+
+        eprintln!("[probe] turn 1 done; switching model WITH effort meta");
+        let mut switch_req = acp::SetSessionModelRequest::new(
+            session.session_id.clone(),
+            acp::ModelId::new("GLM-5.3-Flash".to_string()),
+        );
+        let mut meta = acp::Meta::new();
+        meta.insert("reasoningEffort".to_string(), serde_json::json!("max"));
+        switch_req.meta = Some(meta);
+        let switch = acp_send(switch_req, &client.tx).await;
         println!("set_session_model: {}", match &switch { Ok(_) => "OK".into(), Err(e) => format!("ERR {e}") });
-        eprintln!("=== kernel alive after switch: start prompt");
+        eprintln!("=== post-switch prompt");
         let prompt2 = acp_send(
             acp::PromptRequest::new(
                 session.session_id.clone(),
-                vec![acp::ContentBlock::Text(acp::TextContent::new("what model are you? one word".to_string()))],
+                vec![acp::ContentBlock::Text(acp::TextContent::new("hi again".to_string()))],
             ),
             &client.tx,
         )
