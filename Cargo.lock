@@ -15427,6 +15427,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

@@ -86,17 +86,27 @@ impl ZcodeAgent {
         let Some(mut state) = model_state_from_settings(&read) else {
             return;
         };
-        // Prefer the cached full catalog, but keep any context-window
-        // metadata session/read reports for models it knows.
+        // Prefer the cached full catalog; runtime session/read entries are
+        // AUTHORITATIVE for models they list (kernel-resolved context
+        // window, modalities, reasoning levels) and override the fold.
         if let Some(catalog) = self.shared.state.borrow().catalog.clone() {
             if catalog.available_models.len() > state.available_models.len() {
-                let windows: std::collections::HashMap<String, &acp::ModelInfo> =
-                    state.available_models.iter().map(|m| (m.model_id.0.as_ref().to_string(), m)).collect();
+                let runtime: std::collections::HashMap<String, acp::ModelInfo> = read
+                    .pointer("/settings/model/available")
+                    .and_then(Value::as_array)
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .filter_map(crate::catalog::model_info_from_runtime_entry)
+                            .map(|m| (m.model_id.0.as_ref().to_string(), m))
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 state.available_models = catalog
                     .available_models
                     .iter()
-                    .map(|m| match windows.get(m.model_id.0.as_ref()) {
-                        Some(with_meta) => (*with_meta).clone(),
+                    .map(|m| match runtime.get(m.model_id.0.as_ref()) {
+                        Some(authoritative) => authoritative.clone(),
                         None => m.clone(),
                     })
                     .collect();
@@ -400,6 +410,22 @@ impl acp::Agent for ZcodeAgent {
             .call("session/setModel", kernel::set_model_params(&args.session_id.0, &provider, model))
             .await
             .map_err(|e| acp::Error::internal_error().data(format!("setModel failed: {e}")))?;
+        // Reasoning effort (grok's /effort and the picker's [effort] arg)
+        // rides the request meta as `reasoningEffort` — forward to the
+        // kernel's thoughtLevel (low/high/max, GLM official levels).
+        if let Some(effort) = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("reasoningEffort"))
+            .and_then(Value::as_str)
+        {
+            let _ = kernel
+                .call(
+                    "session/setThoughtLevel",
+                    kernel::set_thought_params(&args.session_id.0, effort),
+                )
+                .await;
+        }
         self.push_model_state(&kernel, &args.session_id.0).await;
         Ok(acp::SetSessionModelResponse::default())
     }

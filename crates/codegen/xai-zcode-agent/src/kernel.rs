@@ -330,6 +330,10 @@ pub fn set_model_params(session_id: &str, provider_id: &str, model_id: &str) -> 
     })
 }
 
+pub fn set_thought_params(session_id: &str, level: &str) -> Value {
+    json!({"sessionId": session_id, "thoughtLevel": level})
+}
+
 pub fn set_mode_params(session_id: &str, mode: &str) -> Value {
     json!({"sessionId": session_id, "mode": mode})
 }
