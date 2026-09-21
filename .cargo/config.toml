@@ -35,7 +35,9 @@ rustflags = [
 rustflags = ["-C", "force-unwind-tables=yes"]
 
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=neoverse-v2", "-C", "force-unwind-tables=yes"]
+# xAI ships for Neoverse-V2 (ARMv9); this host is a Kunpeng 920 (ARMv8.2) —
+# V2 codegen emits instructions it cannot execute (SIGILL in build scripts).
+rustflags = ["-C", "target-cpu=generic", "-C", "force-unwind-tables=yes"]
 
 [target.x86_64-unknown-linux-musl]
 rustflags = [
