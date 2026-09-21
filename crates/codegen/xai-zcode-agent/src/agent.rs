@@ -44,6 +44,10 @@ struct SessionState {
     streamed_text: std::cell::Cell<bool>,
     tools: RefCell<HashMap<String, acp::ToolCallId>>,
     next_tool: std::cell::Cell<u64>,
+    /// Prompt to send when the current turn finalizes (plan-approval
+    /// continuation: the kernel does not continue on its own after an
+    /// approved or revised plan).
+    pending_continuation: RefCell<Option<String>>,
 }
 
 impl SessionState {
@@ -54,6 +58,7 @@ impl SessionState {
             streamed_text: std::cell::Cell::new(false),
             tools: RefCell::new(HashMap::new()),
             next_tool: std::cell::Cell::new(0),
+            pending_continuation: RefCell::new(None),
         }
     }
 
@@ -189,6 +194,71 @@ impl ZcodeAgent {
         self.shared.state.borrow_mut().catalog = Some(catalog);
     }
 
+    /// The pager's session listings, answered from the kernel's own session
+    /// store. Two consumers, two shapes: `x.ai/session/list` (resume picker)
+    /// wants `{sessions:[{sessionId, summary, updatedAt(RFC3339), cwd, …}]}`,
+    /// `x.ai/sessions/list` (roster) wants RosterEntry camelCase. Also drops
+    /// a `summary.json` stub per session into grok's local store — the pager
+    /// refuses to load a session its own store cannot resolve.
+    async fn sessions_list(&self, method: &str) -> acp::Result<acp::ExtResponse> {
+        let kernel = self.kernel()?;
+        let listed = kernel
+            .call("session/list", json!({}))
+            .await
+            .map_err(|e| acp::Error::internal_error().data(format!("session/list failed: {e}")))?;
+        let roster = method == "x.ai/sessions/list";
+        let mut entries = Vec::new();
+        if let Some(sessions) = listed.get("sessions").and_then(Value::as_array) {
+            for session in sessions {
+                let Some(id) = session.get("sessionId").and_then(Value::as_str) else {
+                    continue;
+                };
+                let cwd = session
+                    .pointer("/workspace/workspacePath")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let title = session.get("title").and_then(Value::as_str).unwrap_or("");
+                let updated_ms = session.get("updatedAt").and_then(Value::as_i64).unwrap_or(0);
+                let created_ms = session.get("createdAt").and_then(Value::as_i64).unwrap_or(updated_ms);
+                let running = session.get("status").and_then(Value::as_str) == Some("running");
+                if roster {
+                    entries.push(json!({
+                        "sessionId": id,
+                        "title": title,
+                        "cwd": cwd,
+                        "isWorktree": false,
+                        "sessionKind": if session.get("mode").and_then(Value::as_str) == Some("plan") { "plan" } else { "build" },
+                        "yolo": false,
+                        "activity": if running { "working" } else { "idle" },
+                        "resident": false,
+                        "lastChangeUnixMs": updated_ms,
+                        "origin": {"kind": "local"},
+                    }));
+                } else {
+                    // The picker drops entries without a parseable RFC3339
+                    // updatedAt or any display text (summary).
+                    entries.push(json!({
+                        "sessionId": id,
+                        "summary": title,
+                        "cwd": cwd,
+                        "createdAt": ms_to_rfc3339(created_ms),
+                        "updatedAt": ms_to_rfc3339(updated_ms),
+                        "lastActiveAt": ms_to_rfc3339(updated_ms),
+                        "source": "local",
+                        "running": running,
+                    }));
+                }
+                if !cwd.is_empty() {
+                    write_summary_stub(id, cwd);
+                }
+            }
+        }
+        debug_log(&format!("{method}: {} sessions", entries.len()));
+        let body = json!({"result": {"sessions": entries}});
+        let params = serde_json::value::to_raw_value(&body).expect("serialize session list");
+        Ok(acp::ExtResponse::new(params.into()))
+    }
+
     fn kernel(&self) -> Result<Kernel, acp::Error> {
         let kernel = self
             .shared
@@ -296,6 +366,83 @@ impl ZcodeAgent {
     }
 }
 
+/// Percent-encode a cwd the way grok's session store lays out directories
+/// (`<grok-home>/sessions/<encoded-cwd>/<session-id>/summary.json`):
+/// unreserved bytes stay, everything else becomes uppercase `%XX`. The
+/// shell's over-length fallback (slug+blake3) is not replicated — sessions
+/// under such paths stay resumable only within their own process lifetime.
+fn encode_cwd_dirname(cwd: &str) -> Option<String> {
+    if cwd.len() > 200 {
+        return None;
+    }
+    let mut out = String::with_capacity(cwd.len());
+    for byte in cwd.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    Some(out)
+}
+
+/// Grok's resume gate resolves a session through its own on-disk store and
+/// only checks that `summary.json` EXISTS — the listing itself comes from the
+/// kernel via `x.ai/sessions/list`. Write the stub so picked sessions load.
+fn write_summary_stub(session_id: &str, cwd: &str) {
+    let Some(home) = std::env::var_os("GROK_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+    else {
+        return;
+    };
+    let Some(encoded) = encode_cwd_dirname(cwd) else { return };
+    let path = home
+        .join(".grok")
+        .join("sessions")
+        .join(encoded)
+        .join(session_id)
+        .join("summary.json");
+    if path.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("")));
+    let summary = json!({
+        "info": {"id": session_id, "cwd": cwd},
+        "session_summary": "",
+        "created_at": "1970-01-01T00:00:00Z",
+        "updated_at": "1970-01-01T00:00:00Z",
+        "num_messages": 0,
+        "current_model_id": "GLM-5.3",
+    });
+    if let Err(error) = std::fs::write(&path, summary.to_string()) {
+        tracing::warn!(%error, path = %path.display(), "summary stub write failed");
+    }
+}
+
+/// Epoch-ms → RFC3339 (UTC) without a chrono dependency. The resume picker
+/// drops entries whose `updatedAt` does not parse as an RFC3339 string.
+fn ms_to_rfc3339(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let millis = ms.rem_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let tod = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
 fn debug_log(text: &str) {
     use std::io::Write;
     let now = std::time::SystemTime::now()
@@ -368,6 +515,8 @@ impl acp::Agent for ZcodeAgent {
             .borrow_mut()
             .sessions
             .insert(acp_session.clone(), Rc::new(SessionState::new()));
+        // Resumable through the pager's local-store gate from the start.
+        write_summary_stub(&session_id, &cwd.to_string_lossy());
         // The OFFICIAL session-scoped model channel: NewSessionResponse.models.
         let initial_models = self.shared.state.borrow().catalog.clone();
         // Belt and braces: the catalog also flows via NewSessionResponse
@@ -375,6 +524,94 @@ impl acp::Agent for ZcodeAgent {
         self.push_model_state(&kernel, &session_id).await;
         tracing::info!(%session_id, "zcode session created");
         let mut response = acp::NewSessionResponse::new(acp_session);
+        response.models = initial_models;
+        Ok(response)
+    }
+
+    async fn load_session(&self, args: acp::LoadSessionRequest) -> acp::Result<acp::LoadSessionResponse> {
+        debug_log("acp: load_session");
+        let kernel = self.ensure_kernel().await?;
+        let session_id = args.session_id.0.as_ref().to_string();
+        let resumed = kernel
+            .call("session/resume", kernel::resume_params(&session_id))
+            .await
+            .map_err(|e| acp::Error::internal_error().data(format!("session/resume failed: {e}")))?;
+        kernel
+            .call("session/subscribe", kernel::subscribe_params(&session_id))
+            .await
+            .map_err(|e| acp::Error::internal_error().data(format!("session/subscribe failed: {e}")))?;
+        // Resume restores the conversation but not the model runtime —
+        // revive it or the first send fails with ZCODE_RUNTIME_MODEL_UNAVAILABLE.
+        if let Some((provider, model)) = load_model_preference() {
+            let _ = kernel
+                .call("session/setModel", kernel::set_model_params(&session_id, &provider, &model))
+                .await;
+        }
+        self.shared
+            .state
+            .borrow_mut()
+            .sessions
+            .insert(args.session_id.clone(), Rc::new(SessionState::new()));
+        let cwd_text = args.cwd.to_string_lossy().to_string();
+        write_summary_stub(&session_id, &cwd_text);
+
+        // Transcript replay (full-fidelity, zcode-tui parity): every
+        // user/assistant turn with its reasoning parts, sent BEFORE the
+        // response so the pager renders history as part of the load.
+        if let Some(messages) = resumed.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                let Some(role) = message.pointer("/info/role").and_then(Value::as_str) else {
+                    continue;
+                };
+                if role != "user" && role != "assistant" {
+                    continue;
+                }
+                let mut reasoning = String::new();
+                let mut text = String::new();
+                if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+                    for part in parts {
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("text") => {
+                                text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
+                            }
+                            Some("reasoning") => {
+                                reasoning.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if role == "assistant" && !reasoning.trim().is_empty() {
+                    notify(
+                        &self.gateway,
+                        &args.session_id,
+                        acp::SessionUpdate::AgentThoughtChunk(text_chunk(reasoning)),
+                    );
+                }
+                if !text.trim().is_empty() {
+                    let update = if role == "user" {
+                        acp::SessionUpdate::UserMessageChunk(text_chunk(text))
+                    } else {
+                        acp::SessionUpdate::AgentMessageChunk(text_chunk(text))
+                    };
+                    notify(&self.gateway, &args.session_id, update);
+                }
+            }
+        }
+        // Initial plan indicator from the resumed session's mode.
+        if resumed.pointer("/session/mode").and_then(Value::as_str) == Some("plan") {
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(
+                    acp::SessionModeId::new("plan"),
+                )),
+            );
+        }
+        let initial_models = self.shared.state.borrow().catalog.clone();
+        self.push_model_state(&kernel, &session_id).await;
+        tracing::info!(%session_id, "zcode session resumed");
+        let mut response = acp::LoadSessionResponse::new();
         response.models = initial_models;
         Ok(response)
     }
@@ -506,6 +743,13 @@ impl acp::Agent for ZcodeAgent {
 
     async fn ext_method(&self, args: acp::ExtRequest) -> acp::Result<acp::ExtResponse> {
         debug_log(&format!("acp: ext_method {}", args.method));
+        match args.method.as_ref() {
+            // Resume picker (singular) and dashboard roster (plural).
+            "x.ai/session/list" | "x.ai/sessions/list" => {
+                return self.sessions_list(args.method.as_ref()).await;
+            }
+            _ => {}
+        }
         Err(acp::Error::method_not_found())
     }
 }
@@ -671,6 +915,7 @@ fn handle_event(
                 );
             }
             finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
+            drain_pending_continuation(shared, &acp_session);
         }
         "turn.failed" => {
             if let Some(why) = event.output.as_deref().filter(|t| !t.is_empty()) {
@@ -681,6 +926,7 @@ fn handle_event(
                 );
             }
             finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
+            drain_pending_continuation(shared, &acp_session);
         }
         _ => {}
     }
@@ -690,6 +936,24 @@ fn finish_turn(state: &Rc<SessionState>, _gateway: &AcpGatewaySender<acp::AgentS
     let stop = if state.cancelled.get() { acp::StopReason::Cancelled } else { done };
     if let Some(tx) = state.turn_done.borrow_mut().take() {
         let _ = tx.send(stop);
+    }
+}
+
+/// Send a plan-approval continuation queued for this session, if any. Runs
+/// after finish_turn so the approving turn's ACP prompt settles first.
+fn drain_pending_continuation(shared: &Rc<Shared>, session: &acp::SessionId) {
+    let state = shared.state.borrow().sessions.get(session).cloned();
+    let Some(state) = state else { return };
+    let Some(text) = state.pending_continuation.borrow_mut().take() else {
+        return;
+    };
+    let Some(kernel) = shared.state.borrow().kernel.clone() else {
+        return;
+    };
+    debug_log(&format!("plan continuation: {} chars", text.len()));
+    state.streamed_text.set(false);
+    if let Err(error) = kernel.request("session/send", kernel::send_params(&session.0, &text)) {
+        tracing::warn!(%error, "plan continuation send failed");
     }
 }
 
@@ -719,6 +983,11 @@ async fn handle_server_request(
         return; // Duplicate envelope of an already-answered request.
     }
     let Some(kernel) = shared.state.borrow().kernel.clone() else { return };
+
+    if interaction.interaction == "plan_approval" {
+        handle_plan_approval(gateway, shared, &kernel, envelope_id, &interaction).await;
+        return;
+    }
 
     let options: Vec<acp::PermissionOption> = interaction
         .options
@@ -758,6 +1027,107 @@ async fn handle_server_request(
     }
 }
 
+/// A kernel plan-approval interaction, bridged to grok's native plan review:
+/// forward as an `x.ai/exit_plan_mode` ext request, then translate the
+/// pager's `{outcome, feedback}` back into the kernel contract (pinned via
+/// zcode-tui: after "approve" the kernel neither flips the mode nor
+/// continues on its own — the client does both).
+async fn handle_plan_approval(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    shared: &Rc<Shared>,
+    kernel: &Kernel,
+    envelope_id: &Value,
+    interaction: &InteractionWire,
+) {
+    let params = json!({
+        "sessionId": interaction.session_id,
+        "toolCallId": interaction.request_id,
+        "planContent": interaction.plan,
+    });
+    let request = acp::ExtRequest::new(
+        "x.ai/exit_plan_mode",
+        serde_json::value::to_raw_value(&params)
+            .expect("serialize exit_plan_mode params")
+            .into(),
+    );
+    let (outcome, feedback) = match gateway.send(request).await {
+        Ok(response) => {
+            let parsed: Value = serde_json::from_str(response.0.get()).unwrap_or(json!({}));
+            (
+                parsed
+                    .get("outcome")
+                    .and_then(Value::as_str)
+                    .unwrap_or("abandoned")
+                    .to_string(),
+                parsed
+                    .get("feedback")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            )
+        }
+        Err(_) => ("abandoned".to_string(), None),
+    };
+    debug_log(&format!("plan_approval outcome={outcome} feedback={feedback:?}"));
+
+    let session = acp::SessionId::new(interaction.session_id.clone());
+    let state = shared.state.borrow().sessions.get(&session).cloned();
+    let queue_continuation = |text: Option<String>| {
+        if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
+            if let Some(state) = state.as_ref() {
+                *state.pending_continuation.borrow_mut() = Some(text);
+            }
+        }
+    };
+
+    match outcome.as_str() {
+        "approved" => {
+            let index = interaction
+                .options
+                .iter()
+                .position(|o| o.option_id == "approve")
+                .unwrap_or(0);
+            if let Err(error) = kernel.reply(envelope_id, interaction.reply_result(index)) {
+                tracing::warn!(%error, "plan approval reply failed");
+            }
+            let _ = kernel
+                .call(
+                    "session/setMode",
+                    kernel::set_mode_params(&interaction.session_id, "build"),
+                )
+                .await;
+            queue_continuation(Some("Proceed with the approved plan.".to_string()));
+        }
+        "cancelled" => {
+            // Revise: end this turn via a non-approve option (the kernel has
+            // no deny on plan approvals), then send the feedback as the
+            // revision prompt once the turn finalizes.
+            match interaction.options.iter().position(|o| o.option_id != "approve") {
+                Some(index) => {
+                    let _ = kernel.reply(envelope_id, interaction.reply_result(index));
+                }
+                None => {
+                    if let Some(state) = state.as_ref() {
+                        state.cancelled.set(true);
+                    }
+                    let _ = kernel.request(
+                        "session/stop",
+                        kernel::stop_params(&interaction.session_id),
+                    );
+                }
+            }
+            queue_continuation(feedback);
+        }
+        _ => {
+            // Abandoned (dismissed or the pager dropped the request): stop
+            // the turn; plan mode stays on.
+            if let Some(state) = state.as_ref() {
+                state.cancelled.set(true);
+            }
+            let _ = kernel.request("session/stop", kernel::stop_params(&interaction.session_id));
+        }
+    }
+}
+
 // ---- zcode interaction parsing (ported from zcode-tui, pinned live) ----
 
 struct InteractionOptionWire {
@@ -778,6 +1148,10 @@ struct InteractionWire {
     options: Vec<InteractionOptionWire>,
     deny_index: Option<usize>,
     permission: bool,
+    /// `schema.interaction` — "plan_approval" rides requestUserInput.
+    interaction: String,
+    /// `input.plan` — the plan text under review (plan_approval).
+    plan: Option<String>,
 }
 
 impl InteractionWire {
@@ -878,6 +1252,15 @@ fn parse_interaction(method: &str, params: &Value) -> Option<InteractionWire> {
         options,
         deny_index,
         permission,
+        interaction: params
+            .pointer("/schema/interaction")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        plan: params
+            .pointer("/input/plan")
+            .and_then(Value::as_str)
+            .map(String::from),
     })
 }
 

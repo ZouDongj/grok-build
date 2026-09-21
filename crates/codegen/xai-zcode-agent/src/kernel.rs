@@ -36,8 +36,6 @@ pub fn debug_log_kernel(text: &str) {
     }
 }
 
-pub use crate::agent::model_state_from_model as model_state_from_model_node;
-
 /// One decoded inbound kernel line.
 #[derive(Debug)]
 pub enum KernelMessage {
@@ -359,6 +357,13 @@ pub fn create_params(workspace: &std::path::Path) -> Value {
 
 pub fn subscribe_params(session_id: &str) -> Value {
     json!({"sessionId": session_id, "deliveryKind": DELIVERY_KIND})
+}
+
+/// `session/resume` — reopen an existing session; the result is shaped like
+/// session/create's (messages/projection/session). Resume restores the
+/// conversation but NOT the model runtime: follow with session/setModel.
+pub fn resume_params(session_id: &str) -> Value {
+    json!({"sessionId": session_id})
 }
 
 pub fn send_params(session_id: &str, content: &str) -> Value {
