@@ -15,3 +15,7 @@ tokio = { workspace = true }
 xai-acp-lib = { workspace = true }
 tracing = { workspace = true }
 regex = { workspace = true }
+# Session deletion writes to the kernel's own store (~/.zcode/cli/db) — the
+# app-server protocol has no delete method. Same pinned version as
+# xai-grok-dashboard-store (bundled = self-contained SQLite).
+rusqlite = { version = "0.37", features = ["bundled"] }

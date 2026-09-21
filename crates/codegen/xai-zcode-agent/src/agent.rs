@@ -421,6 +421,75 @@ fn write_summary_stub(session_id: &str, cwd: &str) {
     }
 }
 
+/// Remove one session from the kernel's store. The app-server protocol has
+/// no delete method; the desktop app edits this same db. Best-effort per
+/// child table (schema varies across kernel versions), but the session row
+/// itself must delete (an absent id is already-deleted = success). WAL +
+/// busy timeout coexist with live kernels.
+fn delete_kernel_session(session_id: &str, cwd: &str) -> Result<(), String> {
+    use rusqlite::Connection;
+
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or("no HOME")?;
+    let db_path = home.join(".zcode/cli/db/db.sqlite");
+    let db = Connection::open(&db_path)
+        .and_then(|conn| {
+            conn.busy_timeout(std::time::Duration::from_secs(3))?;
+            Ok(conn)
+        })
+        .map_err(|e| format!("open db: {e}"))?;
+    let children = [
+        "DELETE FROM message WHERE session_id = ?1",
+        "DELETE FROM part WHERE session_id = ?1",
+        "DELETE FROM todo WHERE session_id = ?1",
+        "DELETE FROM session_entry WHERE session_id = ?1",
+        "DELETE FROM input_history WHERE session_id = ?1",
+        "DELETE FROM session_target WHERE session_id = ?1",
+        "DELETE FROM turn_usage WHERE session_id = ?1",
+        "DELETE FROM model_usage WHERE session_id = ?1",
+        "DELETE FROM tool_usage WHERE session_id = ?1",
+        "DELETE FROM session_input WHERE session_id = ?1",
+        "DELETE FROM dwf_actor WHERE session_id = ?1",
+        "DELETE FROM workflow_run WHERE parent_session_id = ?1",
+        "DELETE FROM dwf_run WHERE parent_session_id = ?1",
+        "DELETE FROM workflow_activity WHERE child_session_id = ?1",
+        "DELETE FROM session_task_link WHERE parent_session_id = ?1 OR child_session_id = ?1",
+    ];
+    db.execute_batch("BEGIN")
+        .map_err(|e| format!("begin: {e}"))?;
+    for sql in children {
+        // Missing table (older/newer schema) must not abort the whole delete.
+        let _ = db.execute(sql, [session_id]);
+    }
+    let removed = db
+        .execute("DELETE FROM session WHERE id = ?1", [session_id])
+        .map_err(|e| format!("delete session: {e}"));
+    match removed {
+        Ok(_) => {
+            let _ = db.execute_batch("COMMIT");
+        }
+        Err(error) => {
+            let _ = db.execute_batch("ROLLBACK");
+            return Err(error);
+        }
+    }
+    // File-layer traces: model-io rollout, artifacts, and the grok resume
+    // stub written for the picker gate.
+    let _ = std::fs::remove_file(home.join(format!(
+        ".zcode/cli/rollout/model-io-{session_id}.jsonl"
+    )));
+    let _ = std::fs::remove_dir_all(home.join(format!(".zcode/cli/artifacts/{session_id}")));
+    if !cwd.is_empty() {
+        if let Some(encoded) = encode_cwd_dirname(cwd) {
+            let _ = std::fs::remove_dir_all(
+                home.join(".grok/sessions").join(encoded).join(session_id),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Epoch-ms → RFC3339 (UTC) without a chrono dependency. The resume picker
 /// drops entries whose `updatedAt` does not parse as an RFC3339 string.
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -747,6 +816,25 @@ impl acp::Agent for ZcodeAgent {
             // Resume picker (singular) and dashboard roster (plural).
             "x.ai/session/list" | "x.ai/sessions/list" => {
                 return self.sessions_list(args.method.as_ref()).await;
+            }
+            // The picker's delete action. The kernel protocol has no delete
+            // method, so this removes the session from the kernel's own
+            // store directly (db + rollout/artifacts + grok resume stub).
+            "x.ai/session/delete" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
+                let cwd = params.get("cwd").and_then(Value::as_str).unwrap_or_default();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                delete_kernel_session(id, cwd).map_err(|e| {
+                    acp::Error::internal_error().data(format!("session delete failed: {e}"))
+                })?;
+                debug_log(&format!("session deleted: {id}"));
+                let body = json!({"result": {"ok": true, "sessionId": id}});
+                let raw = serde_json::value::to_raw_value(&body).expect("serialize delete ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
             }
             _ => {}
         }

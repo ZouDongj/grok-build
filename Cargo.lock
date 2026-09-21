@@ -15428,6 +15428,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
