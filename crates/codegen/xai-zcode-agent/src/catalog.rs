@@ -123,9 +123,13 @@ fn fold_rules(rules: &[Value], model_id: &str) -> ResolvedProps {
 }
 
 fn registry_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut candidates = vec![
-        home.join(".zcode/v2/runtime/provider/bundled/zcode-builtin.json"),
-    ];
+    let mut candidates = Vec::new();
+    // The launcher (and the desktop) point the kernel at the active registry
+    // via ZCODE_BUILTIN_PROVIDER_CONFIG_FILE — that file is authoritative.
+    if let Some(path) = std::env::var_os("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE") {
+        candidates.push(path.into());
+    }
+    candidates.push(home.join(".zcode/v2/runtime/provider/bundled/zcode-builtin.json"));
     if let Ok(entries) = std::fs::read_dir(home.join(".zcode/v2/runtime/provider")) {
         let mut dirs: Vec<_> = entries
             .filter_map(Result::ok)
@@ -148,34 +152,58 @@ pub fn bundled_models(home: &std::path::Path, provider_id: &str) -> Vec<acp::Mod
         let Ok(value) = serde_json::from_str::<Value>(&raw) else {
             continue;
         };
-        let rules = value
-            .pointer("/config/modelConfigRules/builtinProviderModelRules")
-            .and_then(Value::as_array);
-        let Some(rules) = rules else {
-            continue;
-        };
         let model_rules = value
             .pointer("/config/modelConfigRules/modelRules")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let models: Vec<acp::ModelInfo> = rules
-            .iter()
-            .filter(|rule| {
-                rule.get("providerId").and_then(Value::as_str) == Some(provider_id)
-                    && rule
-                        .pointer("/config/enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-            })
-            .filter_map(|rule| {
-                let id = rule.get("modelId").and_then(Value::as_str)?;
-                let props = fold_rules(&model_rules, id);
-                Some(acp::ModelInfo::new(id.to_string(), id.to_string()).meta(props.into_meta()))
-            })
-            .collect();
-        if !models.is_empty() {
-            return models;
+        // 0.16.9+ registry: providerConfigRules.providerRules carries each
+        // account provider's builtinModelIds (+ access entitlement).
+        if let Some(provider_rules) = value
+            .pointer("/config/providerConfigRules/providerRules")
+            .and_then(Value::as_array)
+        {
+            let models: Vec<acp::ModelInfo> = provider_rules
+                .iter()
+                .filter(|rule| rule.get("providerId").and_then(Value::as_str) == Some(provider_id))
+                .filter_map(|rule| {
+                    rule.pointer("/config/builtinModelIds")
+                        .and_then(Value::as_array)
+                })
+                .flat_map(|ids| ids.iter().filter_map(Value::as_str))
+                .map(|id| {
+                    let props = fold_rules(&model_rules, id);
+                    acp::ModelInfo::new(id.to_string(), id.to_string()).meta(props.into_meta())
+                })
+                .collect();
+            if !models.is_empty() {
+                return models;
+            }
+        }
+        // 0.16.5 registry: builtinProviderModelRules enable models per
+        // provider ({providerId, modelId, config.enabled}).
+        if let Some(rules) = value
+            .pointer("/config/modelConfigRules/builtinProviderModelRules")
+            .and_then(Value::as_array)
+        {
+            let models: Vec<acp::ModelInfo> = rules
+                .iter()
+                .filter(|rule| {
+                    rule.get("providerId").and_then(Value::as_str) == Some(provider_id)
+                        && rule
+                            .pointer("/config/enabled")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                })
+                .filter_map(|rule| {
+                    let id = rule.get("modelId").and_then(Value::as_str)?;
+                    let props = fold_rules(&model_rules, id);
+                    Some(acp::ModelInfo::new(id.to_string(), id.to_string()).meta(props.into_meta()))
+                })
+                .collect();
+            if !models.is_empty() {
+                return models;
+            }
         }
     }
     Vec::new()

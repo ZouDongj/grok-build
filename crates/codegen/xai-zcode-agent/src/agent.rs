@@ -259,6 +259,47 @@ impl ZcodeAgent {
         Ok(acp::ExtResponse::new(params.into()))
     }
 
+    /// Push account entitlement to the kernel (0.16.9+): the app-server
+    /// worker starts fail-closed and expects its HOST to declare which
+    /// account providers are entitled (`provider/updateAccountConfig`) and
+    /// to supply request auth (`interaction/requestProviderRuntimeHeaders`).
+    /// On 0.16.5 the method does not exist and the push is ignored.
+    async fn push_account_config(&self, kernel: &Kernel) {
+        let provider = DEFAULT_PROVIDER;
+        let revision = format!(
+            "host:{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)
+        );
+        let params = json!({
+            "revision": revision,
+            "basedOnZCodeBuiltinRevision": "host",
+            "providers": {
+                provider: {
+                    "access": {
+                        "type": "zhipu-account",
+                        "mode": "individual-coding-plan",
+                        "accountType": "bigmodel",
+                        "entitled": true,
+                    }
+                }
+            },
+            "states": {
+                provider: {
+                    "availability": "available",
+                    "entitled": true,
+                    "current": true,
+                }
+            },
+        });
+        match kernel.call("provider/updateAccountConfig", params).await {
+            Ok(_) => debug_log("account config pushed"),
+            Err(error) => debug_log(&format!("account config push skipped: {error}")),
+        }
+    }
+
     fn kernel(&self) -> Result<Kernel, acp::Error> {
         let kernel = self
             .shared
@@ -291,6 +332,7 @@ impl ZcodeAgent {
         // Register the runtime provider (all official models) and cache the
         // full catalog — session/read alone only reports the current model.
         self.refresh_catalog(&kernel).await;
+        self.push_account_config(&kernel).await;
         let pump_shared = Rc::clone(&self.shared);
         let pump_gateway = self.gateway.clone();
         tokio::task::spawn_local(async move {
@@ -488,6 +530,35 @@ fn delete_kernel_session(session_id: &str, cwd: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Look up the coding-plan API key for an account provider from the kernel's
+/// credential store. Keys are embedded with the account uid:
+/// `account-provider:coding-plan:<providerId>:account:<uid>:api-key`.
+/// Read in-process only; the value is never logged or forwarded.
+fn coding_plan_api_key(provider_id: &str) -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let raw = std::fs::read_to_string(
+        std::path::PathBuf::from(home).join(".zcode/v2/credentials.json"),
+    )
+    .ok()?;
+    let creds: Value = serde_json::from_str(&raw).ok()?;
+    let prefix = format!("account-provider:coding-plan:{provider_id}:account:");
+    let suffix = ":api-key";
+    let mut best: Option<&str> = None;
+    if let Some(map) = creds.as_object() {
+        for (key, value) in map {
+            if key.starts_with(&prefix)
+                && key.ends_with(suffix)
+                && key.len() > prefix.len() + suffix.len()
+            {
+                if let Some(text) = value.as_str().filter(|v| !v.trim().is_empty()) {
+                    best = Some(text);
+                }
+            }
+        }
+    }
+    best.map(str::to_string)
 }
 
 /// Epoch-ms → RFC3339 (UTC) without a chrono dependency. The resume picker
@@ -1054,6 +1125,31 @@ async fn handle_server_request(
     method: &str,
     params: Value,
 ) {
+    // 0.16.9+ request-time account auth: the worker asks its host for the
+    // account provider's API key before every model request. We are the
+    // host — answer from the kernel's own credential store. The key never
+    // leaves this process (no logging, no ACP forwarding).
+    if method == "interaction/requestProviderRuntimeHeaders" {
+        let provider_id = params
+            .get("providerId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let reply = match coding_plan_api_key(&provider_id) {
+            Some(api_key) => json!({
+                "headersApplied": true,
+                "requestAuth": {"apiKey": api_key},
+            }),
+            None => json!({
+                "headersApplied": false,
+                "errorMessage": "no coding-plan credential for provider",
+            }),
+        };
+        if let Some(kernel) = shared.state.borrow().kernel.clone() {
+            let _ = kernel.reply(envelope_id, reply);
+        }
+        return;
+    }
     let Some(interaction) = parse_interaction(method, &params) else {
         // Unknown reverse request: answer with a benign error so the kernel
         // stops retrying instead of hanging the turn.
