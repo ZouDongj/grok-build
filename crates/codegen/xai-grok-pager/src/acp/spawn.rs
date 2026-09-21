@@ -330,12 +330,16 @@ pub async fn spawn_grok_shell(
 
     let skills_paths = agent_config.skills.paths.clone();
 
-    // Backend selection: GROK_BACKEND=zcode swaps the in-process agent for
-    // the ZCode kernel adapter (xai-zcode-agent); everything else keeps the
-    // grok-shell runtime. The kernel binary can be overridden via ZCODE_BIN.
+    // Backend selection: the ZCode kernel adapter is the DEFAULT backend
+    // (this build is the ZCode TUI); GROK_BACKEND=grok|shell opts back into
+    // the original grok-shell runtime. The kernel binary can be overridden
+    // via ZCODE_BIN (default: `zcode` on PATH).
     let zcode_backend = std::env::var("GROK_BACKEND")
-        .map(|value| value.trim().eq_ignore_ascii_case("zcode"))
-        .unwrap_or(false);
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !(value == "grok" || value == "shell")
+        })
+        .unwrap_or(true);
     let spawn_fn: Box<dyn FnOnce(AcpClientTx) -> Result<AgentHandle> + Send + 'static> =
         if zcode_backend {
             let kernel_bin = std::env::var("ZCODE_BIN").unwrap_or_else(|_| "zcode".to_string());
