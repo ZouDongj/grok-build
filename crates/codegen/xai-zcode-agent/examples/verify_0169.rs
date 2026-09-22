@@ -250,6 +250,64 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- interject: mid-turn "send now" queues as a continuation ---
+            seen.borrow().current_text.borrow_mut().clear();
+            let ij_tx = client.tx.clone();
+            let ij_sid = sid.clone();
+            let ij_prompt = tokio::task::spawn_local(async move {
+                acp_send(
+                    acp::PromptRequest::new(
+                        ij_sid,
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "请从1慢慢数到15，每个数字单独一行".to_string(),
+                        ))],
+                    ),
+                    &ij_tx,
+                )
+                .await
+            });
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            let ij_params = serde_json::json!({
+                "sessionId": sid.0.as_ref(),
+                "text": "插话：不用数了。请只回复两个字：收到",
+                "interjectionId": "verify-ij-1",
+            });
+            let interject = acp_send(
+                acp::ExtRequest::new(
+                    "x.ai/interject",
+                    serde_json::value::to_raw_value(&ij_params).expect("serialize interject").into(),
+                ),
+                &client.tx,
+            )
+            .await;
+            let ij_ack = matches!(&interject, Ok(r) if {
+                let v: serde_json::Value = serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                v.get("accepted") == Some(&serde_json::json!(true))
+            });
+            check(
+                "interject-ack",
+                ij_ack,
+                format!("result={:?}", interject.as_ref().map(|_| "ok").map_err(|e| e.to_string())),
+                &mut summary,
+                &mut fail,
+            );
+            let first_stop = ij_prompt.await.ok().and_then(|r| r.ok()).map(|r| r.stop_reason);
+            let mut got_echo = false;
+            for _ in 0..45 {
+                if seen.borrow().current_text.borrow().contains("收到") {
+                    got_echo = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            check(
+                "interject-delivered-next-turn",
+                got_echo && first_stop == Some(acp::StopReason::EndTurn),
+                format!("first turn stop={first_stop:?}, continuation echoed={got_echo}"),
+                &mut summary,
+                &mut fail,
+            );
+
             // --- resume replay ---
             seen.borrow().replay_text.borrow_mut().clear();
             let loaded = acp_send(

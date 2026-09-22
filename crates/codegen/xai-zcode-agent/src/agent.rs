@@ -1191,6 +1191,62 @@ impl acp::Agent for ZcodeAgent {
             "x.ai/session/list" | "x.ai/sessions/list" => {
                 return self.sessions_list(args.method.as_ref()).await;
             }
+            // Mid-turn "send now": the pager queues a follow-up client-side
+            // and force-sends it via this method. The kernel's sendText has
+            // startNow (preempt) / queue delivery modes, but preempting a
+            // long GLM turn throws away its work — deliver as the next turn
+            // instead (the proven plan-approval continuation path): the
+            // current turn finishes, then this text auto-sends with no
+            // further user action.
+            "x.ai/interject" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                if !id.starts_with("sess_") || text.is_empty() {
+                    return Err(acp::Error::invalid_params().data("bad interject"));
+                }
+                let session = acp::SessionId::new(id.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&session)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let in_flight = state.turn_done.borrow().is_some();
+                if in_flight {
+                    let mut pending = state.pending_continuation.borrow_mut();
+                    match pending.as_mut() {
+                        Some(existing) => existing.push_str(&format!("\n\n{text}")),
+                        None => *pending = Some(text),
+                    }
+                    debug_log("interject: queued as next-turn continuation");
+                } else {
+                    let kernel = self.kernel()?;
+                    kernel
+                        .call("session/send", kernel::send_params(&id, &text))
+                        .await
+                        .map_err(|e| {
+                            acp::Error::internal_error().data(format!("interject send failed: {e}"))
+                        })?;
+                    debug_log("interject: sent immediately (no turn in flight)");
+                }
+                let body = json!({"sessionId": id, "accepted": true});
+                let raw =
+                    serde_json::value::to_raw_value(&body).expect("serialize interject ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // The picker's delete action. The kernel protocol has no delete
             // method, so this removes the session from the kernel's own
             // store directly (db + rollout/artifacts + grok resume stub).
