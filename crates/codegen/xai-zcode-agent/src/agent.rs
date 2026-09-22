@@ -667,6 +667,65 @@ fn input_history_prompts(session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The current context footprint: the latest turn's computed total (input
+/// for that turn already contains the whole conversation). Sums would
+/// overcount — every turn re-reads the context.
+fn last_turn_context_tokens(kernel_session_id: &str) -> u64 {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return 0;
+    };
+    con.query_row(
+        "SELECT COALESCE(computed_total_tokens,0) FROM turn_usage \
+         WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        [kernel_session_id],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|v| v.max(0) as u64)
+    .unwrap_or(0)
+}
+
+/// The current model's context window from the catalog (`_meta
+/// .totalContextTokens`), for the UsageUpdate denominator.
+fn context_window_tokens(shared: &Rc<Shared>) -> u64 {
+    let state = shared.state.borrow();
+    let Some(catalog) = state.catalog.as_ref() else {
+        return 0;
+    };
+    let current = catalog.current_model_id.0.as_ref();
+    catalog
+        .available_models
+        .iter()
+        .find(|m| m.model_id.0.as_ref() == current)
+        .and_then(|m| m.meta.as_ref())
+        .and_then(|meta| meta.get("totalContextTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Emit the pager's context meter update for a session.
+fn push_context_usage(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    shared: &Rc<Shared>,
+    state: &Rc<SessionState>,
+    session: &acp::SessionId,
+) {
+    let used = last_turn_context_tokens(&state.kernel_id.borrow());
+    let size = context_window_tokens(shared);
+    if used == 0 || size == 0 {
+        return;
+    }
+    notify(
+        gateway,
+        session,
+        acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(used, size)),
+    );
+}
+
 /// Session token totals aggregated from the kernel's per-turn usage ledger,
 /// in the pager's PromptUsage wire shape.
 fn session_usage_totals(session_id: &str) -> Value {
@@ -2348,6 +2407,7 @@ fn handle_event(
             }
             finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
             drain_pending_continuation(shared, &acp_session);
+            push_context_usage(gateway, shared, &state, &acp_session);
         }
         "turn.failed" => {
             // 0.16.9 emits turn.failed per failed ATTEMPT and may retry the

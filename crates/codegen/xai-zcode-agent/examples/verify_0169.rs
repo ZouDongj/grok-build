@@ -18,6 +18,7 @@ const MARKER: &str = "暗号紫色河马ZK9173";
 struct Seen {
     prompt_sent_at: Option<std::time::Instant>,
     ack_arrival_ms: Option<u128>,
+    usage_updates: std::cell::RefCell<Vec<(u64, u64)>>,
     plan_approval_ext: bool,
     plan_outcome_sent: Option<String>,
     permissions_answered: usize,
@@ -116,6 +117,13 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         }
                                     }
+                                }
+                                if let acp::SessionUpdate::UsageUpdate(usage) = &u.update {
+                                    seen
+                                        .borrow_mut()
+                                        .usage_updates
+                                        .borrow_mut()
+                                        .push((usage.used, usage.size));
                                 }
                                 if let Some(mode) = mode_name(&u.update) {
                                     seen.borrow_mut().mode_updates.push(mode.clone());
@@ -569,6 +577,16 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await;
             }
+
+            let usages = seen.borrow().usage_updates.borrow().clone();
+            let usage_ok = usages.iter().any(|(used, size)| *used > 0 && *size >= 200_000);
+            check(
+                "context-usage-updates",
+                usage_ok,
+                format!("{:?}", usages.last()),
+                &mut summary,
+                &mut fail,
+            );
 
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
