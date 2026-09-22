@@ -1426,6 +1426,74 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize plugins action");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // Extensions modal → Skills tab. The pager sends only {cwd:"."}
+            // (the shell resolved the workspace itself); use a live
+            // session's cwd, falling back to the grok process's launch
+            // directory. Kernel `skills/referenceCatalog` returns exactly
+            // what the model's Skill tool sees.
+            "x.ai/skills/list" => {
+                let cwd = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .values()
+                    .next()
+                    .map(|s| s.cwd.borrow().clone())
+                    .filter(|c| !c.is_empty())
+                    .or_else(|| {
+                        std::env::current_dir().ok().map(|p| p.display().to_string())
+                    })
+                    .unwrap_or_else(|| ".".to_string());
+                let kernel = self.kernel()?;
+                let result = kernel
+                    .call(
+                        "skills/referenceCatalog",
+                        json!({"workspace": {"workspaceKey": cwd, "workspacePath": cwd}}),
+                    )
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!(
+                            "skills/referenceCatalog failed: {e}"
+                        ))
+                    })?;
+                let skills: Vec<Value> = result
+                    .get("skills")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| {
+                        let kernel_scope =
+                            s.get("scope").and_then(Value::as_str).unwrap_or("user");
+                        // Pager scopes: local/repo/user/server. Kernel
+                        // "workspace" is the project scope (repo); plugin
+                        // skills ride the user scope with their plugin name.
+                        let scope = match kernel_scope {
+                            "workspace" => "repo",
+                            _ => "user",
+                        };
+                        let mut entry = json!({
+                            "name": s.get("name").cloned().unwrap_or(Value::Null),
+                            "description": s
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            "hasUserSpecifiedDescription": true,
+                            "path": s.get("path").cloned().unwrap_or(Value::Null),
+                            "scope": scope,
+                        });
+                        if let Some(plugin) = s.get("pluginName").and_then(Value::as_str) {
+                            entry["pluginName"] = json!(plugin);
+                        }
+                        entry
+                    })
+                    .collect();
+                let body = json!({"result": {"skills": skills}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize skills list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // Mid-turn "send now": the pager queues a follow-up client-side
             // and force-sends it via this method. The kernel's sendText has
             // startNow (preempt) / queue delivery modes, but preempting a

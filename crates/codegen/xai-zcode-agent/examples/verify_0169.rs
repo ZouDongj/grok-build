@@ -358,6 +358,39 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- skills list bridge ---
+            let skills_resp = acp_send(
+                acp::ExtRequest::new(
+                    "x.ai/skills/list",
+                    serde_json::value::to_raw_value(&serde_json::json!({"cwd": "."}))
+                        .expect("serialize skills list params")
+                        .into(),
+                ),
+                &client.tx,
+            )
+            .await;
+            let skills_detail = match &skills_resp {
+                Ok(r) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                    let inner = v.get("result").unwrap_or(&v);
+                    let n = inner
+                        .get("skills")
+                        .and_then(|s| s.as_array())
+                        .map(|a| a.len())
+                        .unwrap_or(0);
+                    format!("skills={n}")
+                }
+                Err(e) => format!("err={e}"),
+            };
+            check(
+                "skills-list-bridge",
+                skills_resp.is_ok() && !skills_detail.contains("skills=0"),
+                skills_detail,
+                &mut summary,
+                &mut fail,
+            );
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();
