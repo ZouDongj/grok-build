@@ -667,9 +667,12 @@ fn input_history_prompts(session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The current context footprint: the latest turn's computed total (input
-/// for that turn already contains the whole conversation). Sums would
-/// overcount — every turn re-reads the context.
+/// The current context footprint: the latest MAIN-line model request's
+/// input+output. BigModel reports inputTokens inclusive of cache reads, and
+/// every request's input contains the whole conversation — so the newest
+/// request IS the current context. Turn-level sums overcount (each tool
+/// round-trip re-sends the context), and subagent rows describe their own
+/// conversations, hence the main_turn filter.
 fn last_turn_context_tokens(kernel_session_id: &str) -> u64 {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
@@ -680,8 +683,10 @@ fn last_turn_context_tokens(kernel_session_id: &str) -> u64 {
         return 0;
     };
     con.query_row(
-        "SELECT COALESCE(computed_total_tokens,0) FROM turn_usage \
-         WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1",
+        "SELECT COALESCE(mu.input_tokens,0) + COALESCE(mu.output_tokens,0) \
+         FROM model_usage mu WHERE mu.session_id = ?1 \
+         AND mu.query_source = 'main_turn' \
+         ORDER BY mu.started_at DESC LIMIT 1",
         [kernel_session_id],
         |r| r.get::<_, i64>(0),
     )
