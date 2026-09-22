@@ -308,6 +308,45 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- image input: switch to Flash (the multimodal model), send a
+            // solid-red PNG, expect a color answer that proves the pixels
+            // reached the model ---
+            let _ = acp_send(
+                acp::SetSessionModelRequest::new(
+                    sid.clone(),
+                    acp::ModelId::new("GLM-5.3-Flash".to_string()),
+                ),
+                &client.tx,
+            )
+            .await;
+            seen.borrow().current_text.borrow_mut().clear();
+            const RED_PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC";
+            let img_turn = acp_send(
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![
+                        acp::ContentBlock::Text(acp::TextContent::new(
+                            "这张图片是什么颜色？只回答一个颜色词".to_string(),
+                        )),
+                        acp::ContentBlock::Image(acp::ImageContent::new(
+                            RED_PNG.to_string(),
+                            "image/png",
+                        )),
+                    ],
+                ),
+                &client.tx,
+            )
+            .await;
+            let answer = seen.borrow().current_text.borrow().clone();
+            let color_ok = answer.contains('红') || answer.to_lowercase().contains("red");
+            check(
+                "image-input-flash-color",
+                matches!(&img_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn) && color_ok,
+                format!("stop={:?}, answer={:?}", img_turn.as_ref().map(|r| r.stop_reason.clone()).map_err(|e| e.to_string()), answer.chars().take(40).collect::<String>()),
+                &mut summary,
+                &mut fail,
+            );
+
             // --- resume replay ---
             seen.borrow().replay_text.borrow_mut().clear();
             let loaded = acp_send(

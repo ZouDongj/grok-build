@@ -1054,6 +1054,10 @@ impl acp::Agent for ZcodeAgent {
             .cloned()
             .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
         let text = prompt_text(&args.prompt);
+        let attachments = prompt_attachments(&args.prompt);
+        if !attachments.is_empty() {
+            debug_log(&format!("prompt: {} image attachment(s)", attachments.len()));
+        }
         let (tx, rx) = oneshot::channel();
         *state.turn_done.borrow_mut() = Some(tx);
         state.cancelled.set(false);
@@ -1062,7 +1066,10 @@ impl acp::Agent for ZcodeAgent {
         // its registry against the builtin revision — re-push before sends.
         self.push_account_config(&kernel).await;
         kernel
-            .request("session/send", kernel::send_params(&args.session_id.0, &text))
+            .request(
+                "session/send",
+                kernel::send_params_with_attachments(&args.session_id.0, &text, &attachments),
+            )
             .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
         let stop = rx.await.unwrap_or(acp::StopReason::EndTurn);
         debug_log(&format!("acp: prompt done stop={stop:?}"));
@@ -1325,6 +1332,41 @@ fn prompt_text(prompt: &[acp::ContentBlock]) -> String {
         }
     }
     out.trim_end().to_string()
+}
+
+/// Image blocks of a prompt as kernel wire attachments. The kernel's
+/// `session/send` normalizer takes inline base64 directly
+/// (`{kind:"image", dataBase64, mimeType, filename}`), so pasted images need
+/// no upload round-trip. Data-URI values are stripped to raw base64.
+fn prompt_attachments(prompt: &[acp::ContentBlock]) -> Vec<Value> {
+    prompt
+        .iter()
+        .filter_map(|block| match block {
+            acp::ContentBlock::Image(image) => {
+                let mut data = image.data.trim();
+                if let Some(comma) = data.find(',').filter(|i| data.starts_with("data:")) {
+                    data = &data[comma + 1..];
+                }
+                if data.is_empty() || !image.mime_type.starts_with("image/") {
+                    return None;
+                }
+                let filename = image
+                    .uri
+                    .as_deref()
+                    .and_then(|uri| uri.rsplit('/').next())
+                    .filter(|name| !name.is_empty() && !name.contains(':'))
+                    .unwrap_or("image.png")
+                    .to_string();
+                Some(json!({
+                    "kind": "image",
+                    "dataBase64": data,
+                    "mimeType": image.mime_type,
+                    "filename": filename,
+                }))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// ~/.config/zcode-tui/model.json — the /model preference zcode-tui already

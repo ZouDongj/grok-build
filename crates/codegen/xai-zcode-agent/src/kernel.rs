@@ -381,6 +381,16 @@ pub fn send_params(session_id: &str, content: &str) -> Value {
     json!({"sessionId": session_id, "content": content})
 }
 
+/// `session/send` params with inline attachments. The kernel's wire
+/// normalizer (per-kind records) accepts images/videos/pdfs as
+/// `{kind, dataBase64, mimeType, filename}` — no upload round-trip.
+pub fn send_params_with_attachments(session_id: &str, content: &str, attachments: &[Value]) -> Value {
+    if attachments.is_empty() {
+        return send_params(session_id, content);
+    }
+    json!({"sessionId": session_id, "content": content, "attachments": attachments})
+}
+
 pub fn stop_params(session_id: &str) -> Value {
     json!({"sessionId": session_id})
 }
