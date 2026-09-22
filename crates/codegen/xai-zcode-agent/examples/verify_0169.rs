@@ -20,6 +20,8 @@ struct Seen {
     ack_arrival_ms: Option<u128>,
     usage_updates: std::cell::RefCell<Vec<(u64, u64)>>,
     subagent_events: std::cell::RefCell<Vec<String>>,
+    child_content: std::cell::Cell<usize>,
+    main_sid: RefCell<Option<String>>,
     plan_approval_ext: bool,
     plan_outcome_sent: Option<String>,
     permissions_answered: usize,
@@ -126,6 +128,23 @@ async fn main() -> anyhow::Result<()> {
                                         .borrow_mut()
                                         .push((usage.used, usage.size));
                                 }
+                                let is_child = seen
+                                    .borrow()
+                                    .main_sid
+                                    .borrow()
+                                    .as_deref()
+                                    .is_some_and(|m| u.request.session_id.0.as_ref() != m);
+                                if is_child {
+                                    match &u.update {
+                                        acp::SessionUpdate::AgentThoughtChunk(_)
+                                        | acp::SessionUpdate::AgentMessageChunk(_)
+                                        | acp::SessionUpdate::ToolCall(_) => {
+                                            let n = seen.borrow().child_content.get();
+                                            seen.borrow_mut().child_content.set(n + 1);
+                                        }
+                                        _ => {}
+                                    }
+                                }
                                 if let Some(mode) = mode_name(&u.update) {
                                     seen.borrow_mut().mode_updates.push(mode.clone());
                                     println!("[verify] MODE UPDATE: {mode}");
@@ -177,6 +196,7 @@ async fn main() -> anyhow::Result<()> {
             .await?;
             let sid = session.session_id.clone();
             println!("[verify] session {}", sid.0);
+            *seen.borrow_mut().main_sid.borrow_mut() = Some(sid.0.to_string());
 
             // --- turn 1: establish a context marker for the resume check ---
             seen.borrow_mut().prompt_sent_at = Some(std::time::Instant::now());
@@ -602,6 +622,7 @@ async fn main() -> anyhow::Result<()> {
 
             // --- subagent lifecycle visualization ---
             seen.borrow_mut().subagent_events.borrow_mut().clear();
+            seen.borrow_mut().child_content.set(0);
             let sub_turn = acp_send(
                 acp::PromptRequest::new(
                     sid.clone(),
@@ -612,6 +633,7 @@ async fn main() -> anyhow::Result<()> {
                 &client.tx,
             )
             .await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let events = seen.borrow().subagent_events.borrow().clone();
             let saw_spawn = events.iter().any(|e| e == "subagent_spawned");
             let saw_finish = events.iter().any(|e| e == "subagent_finished");
@@ -620,6 +642,14 @@ async fn main() -> anyhow::Result<()> {
                 matches!(&sub_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn)
                     && saw_spawn && saw_finish,
                 format!("events={:?}", events),
+                &mut summary,
+                &mut fail,
+            );
+            let child_events = seen.borrow().child_content.get();
+            check(
+                "subagent-content-streamed",
+                child_events >= 2,
+                format!("{child_events} child thought/message/tool updates reached the pager view"),
                 &mut summary,
                 &mut fail,
             );

@@ -67,6 +67,10 @@ struct SessionState {
     /// finished_announced). The kernel's child events don't reach our
     /// subscription, so the poller diffs session/subagents instead.
     subagents: RefCell<HashMap<String, (bool, bool)>>,
+    /// Per subagent child: message ids already forwarded to the pager
+    /// (content rides the message ledger, not a live event stream — the
+    /// kernel serves no subscribe channel for subagent sessions).
+    child_seen: RefCell<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 impl SessionState {
@@ -82,6 +86,7 @@ impl SessionState {
             cwd: RefCell::new(String::new()),
             kernel_id: RefCell::new(String::new()),
             subagents: RefCell::new(HashMap::new()),
+            child_seen: RefCell::new(HashMap::new()),
         }
     }
 
@@ -808,6 +813,7 @@ async fn poll_subagents_once(
                 );
                 subs.insert(id.clone(), (true, false));
                 announced_spawn.push(id.clone());
+
             }
         }
     }
@@ -834,6 +840,23 @@ async fn poll_subagents_once(
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let duration = (now_ms - started).max(0) as u64;
+            // Content: the ledger is the only channel — forward new
+            // assistant reasoning/text parts to the pager's child view.
+            {
+                let mut seen_map = state.child_seen.borrow_mut();
+                let seen = seen_map.entry(id.clone()).or_default();
+                let fresh = child_new_messages(&id, seen);
+                debug_log(&format!("subagent content poll {}: {} new parts", id.get(0..24).unwrap_or(&id), fresh.len()));
+                for (_, kind, text) in fresh {
+                    let update = if kind == "reasoning" {
+                        acp::SessionUpdate::AgentThoughtChunk(text_chunk(text))
+                    } else {
+                        acp::SessionUpdate::AgentMessageChunk(text_chunk(text))
+                    };
+                    let child = acp::SessionId::new(id.clone());
+                    notify(gateway, &child, update);
+                }
+            }
             emit_subagent_update(
                 gateway,
                 parent,
@@ -868,6 +891,8 @@ async fn poll_subagents_once(
         if let Some(entry @ (true, false)) = subs.get_mut(&id) {
             entry.1 = true;
             drop(subs);
+            flush_child_content(gateway, &state, &id);
+            schedule_delayed_child_flush(gateway.clone(), state.clone(), id.clone());
             emit_subagent_update(
                 gateway,
                 parent,
@@ -896,6 +921,8 @@ async fn poll_subagents_once(
             if let Some(entry @ (true, false)) = state.subagents.borrow_mut().get_mut(&id) {
                 entry.1 = true;
             }
+            flush_child_content(gateway, &state, &id);
+            schedule_delayed_child_flush(gateway.clone(), state.clone(), id.clone());
             emit_subagent_update(
                 gateway,
                 parent,
@@ -2556,6 +2583,151 @@ fn text_chunk(text: impl Into<String>) -> acp::ContentChunk {
 
 /// Translate one kernel `session/event` payload into ACP session updates.
 /// Runs on the pump task (single LocalSet thread) — sessions are Rc.
+/// The ledger often lands a child's tail messages seconds AFTER the
+/// parent turn closes — re-flush once more on a delay.
+fn schedule_delayed_child_flush(
+    gateway: AcpGatewaySender<acp::AgentSide>,
+    state: Rc<SessionState>,
+    child_id: String,
+) {
+    tokio::task::spawn_local(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        flush_child_content(&gateway, &state, &child_id);
+    });
+}
+
+/// Forward any not-yet-delivered child content (the ledger often lands
+/// the tail of a child's messages only as the parent turn closes).
+fn flush_child_content(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    state: &Rc<SessionState>,
+    child_id: &str,
+) {
+    let mut seen_map = state.child_seen.borrow_mut();
+    let Some(seen) = seen_map.get_mut(child_id) else { return };
+    for (_, kind, text) in child_new_messages(child_id, seen) {
+        let update = if kind == "reasoning" {
+            acp::SessionUpdate::AgentThoughtChunk(text_chunk(text))
+        } else {
+            acp::SessionUpdate::AgentMessageChunk(text_chunk(text))
+        };
+        let child = acp::SessionId::new(child_id.to_string());
+        notify(gateway, &child, update);
+    }
+}
+
+/// New assistant messages of a subagent child since the last poll, as
+/// (message_id, kind, text) triples — kind is "reasoning" or "text".
+fn child_new_messages(child_id: &str, seen: &mut std::collections::HashSet<String>) -> Vec<(String, &'static str, String)> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
+    let mut out = Vec::new();
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return out;
+    };
+    let Ok(mut stmt) = con.prepare(
+        "SELECT m.id, p.data FROM message m JOIN part p ON p.message_id = m.id \
+         WHERE m.session_id = ?1 AND m.data LIKE '%\"role\":\"assistant\"%' \
+         ORDER BY m.sequence, p.sequence",
+    ) else {
+        return out;
+    };
+    let rows = stmt
+        .query_map([child_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+        .unwrap_or_default();
+    for (id, data) in rows {
+        if seen.contains(&id) {
+            continue;
+        }
+        let Ok(part) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let kind = match part.get("type").and_then(Value::as_str) {
+            Some("reasoning") => "reasoning",
+            Some("text") => "text",
+            _ => continue,
+        };
+        let Some(text) = part.get("text").and_then(Value::as_str) else {
+            continue;
+        };
+        if !text.is_empty() {
+            out.push((id.clone(), kind, text.to_string()));
+        }
+        seen.insert(id);
+    }
+    out
+}
+
+/// Is this kernel session id a subagent child the poller announced?
+fn is_known_subagent_child(shared: &Rc<Shared>, session_id: &str) -> bool {
+    shared
+        .state
+        .borrow()
+        .sessions
+        .values()
+        .any(|state| state.subagents.borrow().contains_key(session_id))
+}
+
+/// Content-only translation for subagent child events: the pager's
+/// subagent view renders these under the child's session id.
+fn forward_child_event(gateway: &AcpGatewaySender<acp::AgentSide>, child: &acp::SessionId, payload: &Value) {
+    let Some(event) = TurnEvent::decode(payload) else { return };
+    match event.kind.as_str() {
+        "text_delta" => {
+            if !event.delta.is_empty() {
+                notify(
+                    gateway,
+                    child,
+                    acp::SessionUpdate::AgentMessageChunk(text_chunk(event.delta)),
+                );
+            }
+        }
+        "reasoning_delta" => {
+            if !event.delta.is_empty() {
+                notify(
+                    gateway,
+                    child,
+                    acp::SessionUpdate::AgentThoughtChunk(text_chunk(event.delta)),
+                );
+            }
+        }
+        "tool_input_start" | "tool_call" => {
+            let Some(call_id) = event.tool_call_id.as_deref() else { return };
+            let call = acp::ToolCall::new(
+                acp::ToolCallId::new(call_id.to_string()),
+                event.tool_name.clone().unwrap_or_else(|| "tool".into()),
+            )
+            .status(acp::ToolCallStatus::InProgress);
+            notify(gateway, child, acp::SessionUpdate::ToolCall(call));
+        }
+        "result" => {
+            let Some(call_id) = event.tool_call_id.as_deref() else { return };
+            let fields = acp::ToolCallUpdateFields::new()
+                .status(acp::ToolCallStatus::Completed)
+                .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+                    acp::ContentBlock::Text(acp::TextContent::new(
+                        event.output.clone().unwrap_or_default(),
+                    )),
+                ))]);
+            notify(
+                gateway,
+                child,
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    acp::ToolCallId::new(call_id.to_string()),
+                    fields,
+                )),
+            );
+        }
+        _ => {}
+    }
+}
+
 fn handle_event(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     shared: &Rc<Shared>,
@@ -2565,7 +2737,14 @@ fn handle_event(
     let Some(session_id) = session_id else { return };
     let acp_session = acp::SessionId::new(session_id.to_string());
     let Some(state) = shared.state.borrow().sessions.get(&acp_session).cloned() else {
-        debug_log(&format!("handle_event: UNKNOWN session {session_id}"));
+        // Not one of OUR sessions — but it may be a subagent child the
+        // poller announced: forward its content to the pager's subagent
+        // view (thoughts, text, tool calls) without parent turn logic.
+        if is_known_subagent_child(shared, session_id) {
+            forward_child_event(gateway, &acp_session, payload);
+        } else {
+            debug_log(&format!("handle_event: UNKNOWN session {session_id}"));
+        }
         return;
     };
     let Some(event) = TurnEvent::decode(payload) else {
