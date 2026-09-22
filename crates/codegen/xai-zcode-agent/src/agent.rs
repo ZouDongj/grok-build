@@ -52,6 +52,10 @@ struct SessionState {
     /// continuation: the kernel does not continue on its own after an
     /// approved or revised plan).
     pending_continuation: RefCell<Option<String>>,
+    /// Cancels the pending grace timer after a turn.failed: 0.16.9 emits
+    /// turn.failed for a failed ATTEMPT and then retries, so termination must
+    /// wait to see whether the turn actually continues.
+    fail_grace_cancel: RefCell<Option<oneshot::Sender<()>>>,
 }
 
 impl SessionState {
@@ -63,6 +67,7 @@ impl SessionState {
             tools: RefCell::new(HashMap::new()),
             next_tool: std::cell::Cell::new(0),
             pending_continuation: RefCell::new(None),
+            fail_grace_cancel: RefCell::new(None),
         }
     }
 
@@ -1238,6 +1243,12 @@ fn handle_event(
         debug_log(&format!("handle_event: undecodable payload kind={:?}", payload.get("kind")));
         return;
     };
+    // Any activity after a turn.failed means the kernel is retrying the turn:
+    // cancel the pending grace termination.
+    if let Some(cancel) = state.fail_grace_cancel.borrow_mut().take() {
+        let _ = cancel.send(());
+        debug_log("turn.failed grace cancelled (turn continues)");
+    }
     match event.kind.as_str() {
         "text_delta" => {
             if !event.delta.is_empty() {
@@ -1297,10 +1308,15 @@ fn handle_event(
                     acp::SessionUpdate::AgentMessageChunk(text_chunk(response)),
                 );
             }
+            if let Some(cancel) = state.fail_grace_cancel.borrow_mut().take() {
+                let _ = cancel.send(());
+            }
             finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
             drain_pending_continuation(shared, &acp_session);
         }
         "turn.failed" => {
+            // 0.16.9 emits turn.failed per failed ATTEMPT and may retry the
+            // turn; finish only after a grace period with no further events.
             if let Some(why) = event.output.as_deref().filter(|t| !t.is_empty()) {
                 notify(
                     gateway,
@@ -1308,8 +1324,23 @@ fn handle_event(
                     acp::SessionUpdate::AgentMessageChunk(text_chunk(why)),
                 );
             }
-            finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
-            drain_pending_continuation(shared, &acp_session);
+            let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+            *state.fail_grace_cancel.borrow_mut() = Some(cancel_tx);
+            let state = state.clone();
+            let session = acp_session.clone();
+            let gateway = gateway.clone();
+            let shared = Rc::clone(shared);
+            tokio::task::spawn_local(async move {
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
+                        state.fail_grace_cancel.borrow_mut().take();
+                        debug_log("turn.failed grace expired — finishing turn");
+                        finish_turn(&state, &gateway, &session, acp::StopReason::EndTurn);
+                        drain_pending_continuation(&shared, &session);
+                    }
+                    _ = cancel_rx => {}
+                }
+            });
         }
         _ => {}
     }
