@@ -82,6 +82,23 @@ impl SessionState {
 }
 
 impl ZcodeAgent {
+/// Session lookup shared by the workspace-scoped ext bridges: the session's
+/// cwd (for workspace-keyed kernel calls) plus the live kernel handle.
+fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kernel)> {
+    let session = acp::SessionId::new(session_id.to_string());
+    let state = self
+        .shared
+        .state
+        .borrow()
+        .sessions
+        .get(&session)
+        .cloned()
+        .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+    let cwd = state.cwd.borrow().clone();
+    let kernel = self.kernel()?;
+    Ok((cwd, kernel))
+}
+
     pub fn new(gateway: AcpGatewaySender<acp::AgentSide>, kernel_bin: impl Into<String>) -> ZcodeAgent {
         // A panicking pump/gateway task dies silently otherwise (spawn_local
         // JoinHandles are never awaited): capture every panic into the debug
@@ -1282,6 +1299,131 @@ impl acp::Agent for ZcodeAgent {
                 });
                 let raw =
                     serde_json::value::to_raw_value(&body).expect("serialize mcp list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Extensions modal → Plugins tab. Kernel `plugins/list` returns
+            // registry entries; map onto the pager's PluginInfo (camelCase,
+            // required fields synthesized where the kernel has no notion).
+            "x.ai/plugins/list" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let (cwd, kernel) = self.session_cwd_and_kernel(&id)?;
+                let result = kernel
+                    .call(
+                        "plugins/list",
+                        json!({"workspace": {"workspaceKey": cwd, "workspacePath": cwd}}),
+                    )
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("plugins/list failed: {e}"))
+                    })?;
+                let plugins: Vec<Value> = result
+                    .get("plugins")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|p| {
+                        let mcp_names = p
+                            .get("mcpServerNames")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut entry = json!({
+                            "name": p.get("name").cloned().unwrap_or(Value::Null),
+                            "id": p.get("id").cloned().unwrap_or(Value::Null),
+                            "root": "",
+                            "scope": "user",
+                            "trusted": true,
+                            "enabled": p.get("enabled").and_then(Value::as_bool).unwrap_or(false),
+                            "skillCount": p.get("skillCount").and_then(Value::as_u64).unwrap_or(0),
+                            "agentCount": 0,
+                            "hookStatus": "none",
+                            "mcpServerCount": mcp_names.len(),
+                            "mcpStatus": if mcp_names.is_empty() { "none" } else { "active" },
+                        });
+                        for (src, dst) in
+                            [("version", "version"), ("description", "description")]
+                        {
+                            if let Some(v) = p.get(src) {
+                                entry[dst] = v.clone();
+                            }
+                        }
+                        if let Some(marketplace) = p.get("marketplace").and_then(Value::as_str) {
+                            entry["marketplaceSource"] = json!(marketplace);
+                        }
+                        entry
+                    })
+                    .collect();
+                let body = json!({"result": {"plugins": plugins}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize plugins list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Plugin enable/disable/reload from the Plugins tab.
+            "x.ai/plugins/action" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let action = params.get("action").cloned().unwrap_or(json!({}));
+                let action_type = action.get("type").and_then(Value::as_str).unwrap_or("");
+                let (cwd, kernel) = self.session_cwd_and_kernel(&id)?;
+                let outcome = match action_type {
+                    "enable" | "disable" => {
+                        let plugin_id = action
+                            .get("pluginId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        kernel
+                            .call(
+                                "plugins/setEnabled",
+                                json!({
+                                    "workspace": {"workspaceKey": cwd, "workspacePath": cwd},
+                                    "pluginId": plugin_id,
+                                    "enabled": action_type == "enable",
+                                    "scope": "user",
+                                }),
+                            )
+                            .await
+                            .map(|_| json!({
+                                "status": "success",
+                                "message": format!("plugin {plugin_id} {}", action_type),
+                                "requiresReload": true,
+                                "requiresRestart": false,
+                            }))
+                            .map_err(|e| {
+                                acp::Error::internal_error().data(format!(
+                                    "plugins/setEnabled failed: {e}"
+                                ))
+                            })?
+                    }
+                    // The kernel IS the plugin host — nothing to reload
+                    // client-side; the next plugins/list reads live state.
+                    "reload" => json!({
+                        "status": "success",
+                        "message": "plugin state lives in the zcode kernel",
+                        "requiresReload": true,
+                        "requiresRestart": false,
+                    }),
+                    other => {
+                        return Err(acp::Error::method_not_found().data(format!(
+                            "plugins action {other:?} not bridged yet"
+                        )));
+                    }
+                };
+                let body = json!({"result": outcome});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize plugins action");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
             // Mid-turn "send now": the pager queues a follow-up client-side

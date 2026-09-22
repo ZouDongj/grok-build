@@ -283,6 +283,81 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- plugins: list + enable/disable round-trip ---
+            let plug_resp = acp_send(
+                acp::ExtRequest::new(
+                    "x.ai/plugins/list",
+                    serde_json::value::to_raw_value(&serde_json::json!({"sessionId": sid.0.as_ref()}))
+                        .expect("serialize plugins list params")
+                        .into(),
+                ),
+                &client.tx,
+            )
+            .await;
+            let mut plug_detail = String::new();
+            let mut toggle_ok = false;
+            if let Ok(r) = &plug_resp {
+                let v: serde_json::Value =
+                    serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                let inner = v.get("result").unwrap_or(&v);
+                let plugins = inner
+                    .get("plugins")
+                    .and_then(|p| p.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                plug_detail = format!("plugins={}", plugins.len());
+                if let Some(first) = plugins.iter().find(|p| {
+                    p.get("id").and_then(|x| x.as_str()).is_some_and(|s| !s.is_empty())
+                }) {
+                    let pid = first.get("id").and_then(|x| x.as_str()).unwrap().to_string();
+                    let was_enabled = first.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
+                    for want in [!was_enabled, was_enabled] {
+                        let act = if want { "enable" } else { "disable" };
+                        let toggle = acp_send(
+                            acp::ExtRequest::new(
+                                "x.ai/plugins/action",
+                                serde_json::value::to_raw_value(&serde_json::json!({
+                                    "sessionId": sid.0.as_ref(),
+                                    "action": {"type": act, "pluginId": pid},
+                                }))
+                                .expect("serialize toggle")
+                                .into(),
+                            ),
+                            &client.tx,
+                        )
+                        .await;
+                        if let Ok(tr) = &toggle {
+                            let tv: serde_json::Value =
+                                serde_json::from_str(tr.0.get()).unwrap_or(serde_json::json!({}));
+                            let status = tv
+                                .pointer("/result/status")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("");
+                            toggle_ok = status == "success";
+                        }
+                        if !toggle_ok {
+                            break;
+                        }
+                    }
+                }
+            } else if let Err(e) = &plug_resp {
+                plug_detail = format!("err={e}");
+            }
+            check(
+                "plugins-list-bridge",
+                plug_resp.is_ok() && plug_detail.starts_with("plugins="),
+                plug_detail.clone(),
+                &mut summary,
+                &mut fail,
+            );
+            check(
+                "plugins-toggle-roundtrip",
+                toggle_ok,
+                format!("(restore via same toggle) {plug_detail}"),
+                &mut summary,
+                &mut fail,
+            );
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();
