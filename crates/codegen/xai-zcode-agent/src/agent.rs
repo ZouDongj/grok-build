@@ -1591,6 +1591,15 @@ async fn handle_plan_approval(
                     kernel::set_mode_params(&interaction.session_id, "build"),
                 )
                 .await;
+            // The kernel switched modes server-side, but the pager's composer
+            // tracks the client-side mode from CurrentModeUpdate only — without
+            // this it stays "plan" after approval.
+            let _ = gateway.forward_fire_and_forget(acp::SessionNotification::new(
+                acp::SessionId::new(interaction.session_id.clone()),
+                acp::SessionUpdate::CurrentModeUpdate(acp::CurrentModeUpdate::new(
+                    acp::SessionModeId::new("build"),
+                )),
+            ));
             queue_continuation(Some("Proceed with the approved plan.".to_string()));
         }
         "cancelled" => {
