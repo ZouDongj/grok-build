@@ -19,3 +19,9 @@ regex = { workspace = true }
 # app-server protocol has no delete method. Same pinned version as
 # xai-grok-dashboard-store (bundled = self-contained SQLite).
 rusqlite = { version = "0.37", features = ["bundled"] }
+# Shared credential store values are sealed as `enc:v1:<iv>.<tag>.<cipher>`
+# (AES-256-GCM, key = sha256 of ZCODE_CREDENTIAL_SECRET or the kernel's
+# deterministic machine fallback) — decrypt before handing keys to the kernel.
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"

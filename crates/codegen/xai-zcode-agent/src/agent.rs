@@ -622,18 +622,66 @@ fn coding_plan_api_key(provider_id: &str) -> Option<String> {
         .or(oauth_minted)
         .or(direct_configured)
         .or(any)
-        .map(strip_credential_scheme)
+        .map(decrypt_credential)
 }
 
-/// The credential store persists scheme-prefixed values
-/// ("<prefix>.<raw-key>"); strip the prefix — raw keys carry exactly one dot.
-fn strip_credential_scheme(value: &str) -> String {
-    let parts: Vec<&str> = value.split('.').collect();
-    if parts.len() == 3 {
-        format!("{}.{}", parts[1], parts[2])
-    } else {
-        value.to_string()
+/// Shared credential store values are sealed by the kernel as
+/// `enc:v1:<iv>.<tag>.<cipher>` — AES-256-GCM with the key derived from
+/// `ZCODE_CREDENTIAL_SECRET` (if set) or the kernel's deterministic fallback
+/// `zcode-credential-fallback:<platform>:<homedir>:<username>`. Values without
+/// the marker are already plaintext. Feeding the sealed form to the kernel
+/// looks like a valid one-dot credential to its parser but is ciphertext
+/// garbage, which the server rejects as 身份验证失败.
+fn decrypt_credential(value: &str) -> String {
+    const MARKER: &str = "enc:v1:";
+    let Some(sealed) = value.strip_prefix(MARKER) else {
+        return value.to_string();
+    };
+    let mut parts = sealed.split('.');
+    let (Some(iv), Some(tag), Some(cipher), None) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return value.to_string();
+    };
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use sha2::Digest;
+
+    let decode = |s: &str| URL_SAFE_NO_PAD.decode(s).ok();
+    let (Some(iv), Some(tag), Some(cipher)) = (decode(iv), decode(tag), decode(cipher)) else {
+        return value.to_string();
+    };
+    let secret = match std::env::var("ZCODE_CREDENTIAL_SECRET") {
+        Ok(explicit) if !explicit.trim().is_empty() => explicit.trim().to_string(),
+        _ => {
+            let username = std::env::var("USER")
+                .or_else(|_| std::env::var("LOGNAME"))
+                .unwrap_or_else(|_| "unknown".to_string());
+            format!(
+                "zcode-credential-fallback:{}:{}:{}",
+                std::env::consts::OS,
+                home_dir_string(),
+                username
+            )
+        }
+    };
+    let key = sha2::Sha256::digest(secret.as_bytes());
+    let Ok(aes) = Aes256Gcm::new_from_slice(&key) else {
+        return value.to_string();
+    };
+    let mut payload = cipher;
+    payload.extend_from_slice(&tag);
+    match aes.decrypt(Nonce::from_slice(&iv), payload.as_ref()) {
+        Ok(plain) => String::from_utf8(plain).unwrap_or_else(|_| value.to_string()),
+        Err(_) => {
+            debug_log("credential decrypt failed (key mismatch?), passing raw value");
+            value.to_string()
+        }
     }
+}
+
+fn home_dir_string() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
 
 /// setModel with a short retry: 0.16.9 materializes account entitlements
