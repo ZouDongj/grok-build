@@ -577,35 +577,87 @@ fn coding_plan_api_key(provider_id: &str) -> Option<String> {
     )
     .ok()?;
     let creds: Value = serde_json::from_str(&raw).ok()?;
+    // Resolve like the kernel's standalone chain: the identity entry names the
+    // account the key must belong to (account uid for OAuth, key-hash for a
+    // directly configured key) — with several api-key entries present an
+    // arbitrary pick answers with a stale key.
+    let identity_key = format!("account-provider:{provider_id}:identity");
+    let identity = creds
+        .get(&identity_key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
     let prefix = format!("account-provider:coding-plan:{provider_id}:account:");
     let suffix = ":api-key";
-    let mut dotted: Option<&str> = None;
-    let mut plain: Option<&str> = None;
+    let mut identity_match: Option<&str> = None;
+    let mut direct_configured: Option<&str> = None;
+    let mut oauth_minted: Option<&str> = None;
+    let mut any: Option<&str> = None;
     if let Some(map) = creds.as_object() {
         for (key, value) in map {
-            if key.starts_with(&prefix)
-                && key.ends_with(suffix)
-                && key.len() > prefix.len() + suffix.len()
-            {
-                if let Some(text) = value.as_str().filter(|v| !v.trim().is_empty()) {
-                    // V4 client signing needs the "id.secret" format; stale
-                    // dotless keys may coexist for the same provider.
-                    if text.contains('.') {
-                        dotted = Some(text);
-                    } else {
-                        plain = Some(text);
-                    }
-                }
+            if !key.starts_with(&prefix) || !key.ends_with(suffix) {
+                continue;
             }
+            let Some(text) = value.as_str().filter(|v| !v.trim().is_empty()) else {
+                continue;
+            };
+            let uid = &key[prefix.len()..key.len() - suffix.len()];
+            if identity.as_deref() == Some(uid) {
+                identity_match = Some(text);
+            }
+            // "key-<hash>" uids mark DIRECTLY configured keys;
+            // account-digit uids mark OAuth-minted ones (desktop's pick).
+            if uid.starts_with("key-") {
+                direct_configured = Some(text);
+            } else if uid.chars().all(|c| c.is_ascii_digit()) && !uid.is_empty() {
+                oauth_minted = Some(text);
+            }
+            any = Some(text);
         }
     }
-    dotted.or(plain).map(str::to_string)
+    // The desktop host resolves the OAuth-minted key (account-uid entry) via
+    // the user profile id — match that pick.
+    identity_match
+        .or(oauth_minted)
+        .or(direct_configured)
+        .or(any)
+        .map(strip_credential_scheme)
+}
+
+/// The credential store persists scheme-prefixed values
+/// ("<prefix>.<raw-key>"); strip the prefix — raw keys carry exactly one dot.
+fn strip_credential_scheme(value: &str) -> String {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() == 3 {
+        format!("{}.{}", parts[1], parts[2])
+    } else {
+        value.to_string()
+    }
+}
+
+/// setModel with a short retry: 0.16.9 materializes account entitlements
+/// asynchronously after kernel start, and a first-touch setModel for an
+/// account provider can race that ("Provider Registry 中不存在 Model").
+async fn set_model_with_retry(kernel: &Kernel, session_id: &str, provider: &str, model: &str) {
+    for attempt in 0..6 {
+        match kernel
+            .call("session/setModel", kernel::set_model_params(session_id, provider, model))
+            .await
+        {
+            Ok(_) => return,
+            Err(error) if attempt == 5 => {
+                debug_log(&format!("setModel {provider}/{model} failed: {error}"));
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(400)).await,
+        }
+    }
 }
 
 /// The model ids the KERNEL's own builtin registry declares for an account
 /// provider: resolve the desktop package the launcher selects (highest
-/// version under ~/.local/opt/zcode), read providerConfigRules.providerRules.
-/// Pushing ids the kernel does not know poisons the provider entry.
+/// version under ~/.local/opt/zcode). Pushing ids the kernel does not know
+/// poisons the provider entry.
 fn kernel_builtin_model_ids(home: &std::path::Path, provider: &str) -> Vec<String> {
     let packages: Vec<std::path::PathBuf> = std::fs::read_dir(home.join(".local/opt/zcode"))
         .into_iter()
@@ -614,10 +666,7 @@ fn kernel_builtin_model_ids(home: &std::path::Path, provider: &str) -> Vec<Strin
         .map(|e| e.path().join("opt/ZCode/resources/config/provider/zcode-builtin.json"))
         .filter(|p| p.is_file())
         .collect();
-    let chosen = packages
-        .into_iter()
-        .max_by_key(|p| version_of(p));
-    let Some(path) = chosen else {
+    let Some(path) = packages.into_iter().max_by_key(|p| version_of(p)) else {
         return Vec::new();
     };
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -641,36 +690,26 @@ fn kernel_builtin_model_ids(home: &std::path::Path, provider: &str) -> Vec<Strin
         .unwrap_or_default()
 }
 
-/// Extract a leading dotted-version segment from a package registry path
-/// (~/.local/opt/zcode/<ver>/opt/...) for highest-version selection.
+/// Highest dotted-version path segment (~/.local/opt/zcode/<ver>/opt/...).
 fn version_of(path: &std::path::Path) -> Vec<u64> {
-    path.components()
-        .find_map(|c| c.as_os_str().to_str())
-        .and_then(|_| {
-            // components() yields the whole path; walk ancestors instead
-            None::<Vec<u64>>
-        })
-        .unwrap_or_else(|| {
-            let mut best = Vec::new();
-            for comp in path.components() {
-                if let Some(seg) = comp.as_os_str().to_str() {
-                    let parsed: Vec<u64> = seg
-                        .split('.')
-                        .map(|p| p.parse::<u64>().ok())
-                        .collect::<Option<Vec<_>>>()
-                        .unwrap_or_default();
-                    if !parsed.is_empty() && parsed.len() >= 2 {
-                        best = parsed;
-                    }
-                }
+    let mut best = Vec::new();
+    for comp in path.components() {
+        if let Some(seg) = comp.as_os_str().to_str() {
+            let parsed: Vec<u64> = seg
+                .split('.')
+                .map(|p| p.parse::<u64>().ok())
+                .collect::<Option<Vec<_>>>()
+                .unwrap_or_default();
+            if parsed.len() >= 2 {
+                best = parsed;
             }
-            best
-        })
+        }
+    }
+    best
 }
 
 /// The kernel's live builtin registry revision, e.g. "zcode-builtin:30:<hash>",
-/// as last reported in its unified log. The pushed account snapshot must be
-/// based on exactly this or the kernel drops it on reconciliation.
+/// as reported by its own provider_registry.ready log line at/after boot.
 fn kernel_builtin_revision(boot_epoch_ms: u128) -> String {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return "host".to_string();
@@ -688,8 +727,6 @@ fn kernel_builtin_revision(boot_epoch_ms: u128) -> String {
     }
 }
 
-/// Newest "zcode-builtin:<n>:<hash>" from provider_registry.ready log lines
-/// whose entry timestamp is at/after `since_epoch_ms` (metadata only).
 fn newest_builtin_revision_since(log_dir: &std::path::Path, since_epoch_ms: u128) -> Option<String> {
     let mut files: Vec<_> = std::fs::read_dir(log_dir)
         .ok()?
@@ -698,8 +735,7 @@ fn newest_builtin_revision_since(log_dir: &std::path::Path, since_epoch_ms: u128
         .filter(|p| p.to_string_lossy().ends_with(".jsonl"))
         .collect();
     files.sort();
-    let newest = files.last()?;
-    let raw = std::fs::read_to_string(newest).ok()?;
+    let raw = std::fs::read_to_string(files.last()?).ok()?;
     let mut found: Option<(u128, String)> = None;
     for line in raw.lines() {
         if !line.contains("provider_registry.ready") {
@@ -717,9 +753,6 @@ fn newest_builtin_revision_since(log_dir: &std::path::Path, since_epoch_ms: u128
         if let Some(start) = line.find("zcode-builtin:") {
             let rest = &line[start..];
             if let Some(end) = rest.find('"') {
-                // The log embeds the revision inside a JSON string: strip the
-                // trailing escape backslash or the pushed basedOn never
-                // matches and the kernel reconciles the snapshot away.
                 let candidate = rest[..end].trim_end_matches('\\').to_string();
                 if found.as_ref().map(|(t, _)| ts >= *t).unwrap_or(true) {
                     found = Some((ts, candidate));
@@ -730,13 +763,8 @@ fn newest_builtin_revision_since(log_dir: &std::path::Path, since_epoch_ms: u128
     found.map(|(_, revision)| revision)
 }
 
-/// RFC3339 UTC timestamp -> epoch ms (no chrono dependency; the log format is
-/// fixed "YYYY-MM-DDTHH:MM:SS.sssZ", civil-from-days over UTC days).
+/// RFC3339 UTC -> epoch ms (fixed "YYYY-MM-DDTHH:MM:SS.sssZ").
 fn chrono_like_epoch_ms(t: &str) -> Option<u128> {
-    let bytes = t.as_bytes();
-    if bytes.len() < 20 {
-        return None;
-    }
     let year: i64 = t.get(0..4)?.parse().ok()?;
     let month: i64 = t.get(5..7)?.parse().ok()?;
     let day: i64 = t.get(8..10)?.parse().ok()?;
@@ -744,7 +772,6 @@ fn chrono_like_epoch_ms(t: &str) -> Option<u128> {
     let minute: i64 = t.get(14..16)?.parse().ok()?;
     let second: i64 = t.get(17..19)?.parse().ok()?;
     let millis: i64 = t.get(20..23).and_then(|m| m.parse().ok()).unwrap_or(0);
-    // days from civil (Howard Hinnant's days_from_civil)
     let y = if month <= 2 { year - 1 } else { year };
     let era = y.div_euclid(400);
     let yoe = y - era * 400;
@@ -754,24 +781,6 @@ fn chrono_like_epoch_ms(t: &str) -> Option<u128> {
     let days = era * 146_097 + doe - 719_468;
     let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
     Some((secs * 1000 + millis).max(0) as u128)
-}
-
-/// setModel with a short retry: 0.16.9 materializes account entitlements
-/// asynchronously after kernel start, and a first-touch setModel for an
-/// account provider can race that ("Provider Registry 中不存在 Model").
-async fn set_model_with_retry(kernel: &Kernel, session_id: &str, provider: &str, model: &str) {
-    for attempt in 0..6 {
-        match kernel
-            .call("session/setModel", kernel::set_model_params(session_id, provider, model))
-            .await
-        {
-            Ok(_) => return,
-            Err(error) if attempt == 5 => {
-                debug_log(&format!("setModel {provider}/{model} failed: {error}"));
-            }
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(400)).await,
-        }
-    }
 }
 
 /// Epoch-ms → RFC3339 (UTC) without a chrono dependency. The resume picker
