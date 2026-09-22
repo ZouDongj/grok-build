@@ -1293,6 +1293,12 @@ impl acp::Agent for ZcodeAgent {
         }
         let initial_models = self.shared.state.borrow().catalog.clone();
         self.push_model_state(&kernel, &session_id).await;
+        // Prime the context meter from the ledger so the bar shows real
+        // numbers right after resume, instead of waiting for the first
+        // completed turn.
+        if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id).cloned() {
+            push_context_usage(&self.gateway, &self.shared, &state, &args.session_id);
+        }
         tracing::info!(%session_id, "zcode session resumed");
         let mut response = acp::LoadSessionResponse::new();
         response.models = initial_models;
