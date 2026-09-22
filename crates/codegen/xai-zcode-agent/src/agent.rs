@@ -1027,6 +1027,23 @@ impl acp::Agent for ZcodeAgent {
 
     async fn prompt(&self, args: acp::PromptRequest) -> acp::Result<acp::PromptResponse> {
         debug_log("acp: prompt");
+        // Instant prompt acknowledgment. The pager arms a 120s prompt-ack
+        // watchdog when it sends the prompt and disarms it on the first live
+        // session/update stamped with the awaited prompt id. A ZCode turn can
+        // legitimately exceed that before its first streamed event (kernel
+        // cold boot, or a giant-context prefill taking minutes) — grok-shell
+        // acks in under a second via its queue rail; we carry the prompt id
+        // on an empty thought chunk, which the renderer drops by design.
+        if let Some(prompt_id) = args.meta.as_ref().and_then(|m| m.get("promptId")) {
+            let mut ack_meta = acp::Meta::new();
+            ack_meta.insert("promptId".to_string(), prompt_id.clone());
+            let mut ack = acp::SessionNotification::new(
+                args.session_id.clone(),
+                acp::SessionUpdate::AgentThoughtChunk(text_chunk("")),
+            );
+            ack.meta = Some(ack_meta);
+            self.gateway.forward_fire_and_forget(ack);
+        }
         let kernel = self.kernel()?;
         let state = self
             .shared

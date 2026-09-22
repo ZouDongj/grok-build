@@ -16,6 +16,8 @@ const MARKER: &str = "暗号紫色河马ZK9173";
 
 #[derive(Default)]
 struct Seen {
+    prompt_sent_at: Option<std::time::Instant>,
+    ack_arrival_ms: Option<u128>,
     plan_approval_ext: bool,
     plan_outcome_sent: Option<String>,
     permissions_answered: usize,
@@ -101,6 +103,20 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             AcpClientMessage::SessionNotification(u) => {
+                                if let acp::SessionUpdate::AgentThoughtChunk(c) = &u.update {
+                                    if let acp::ContentBlock::Text(t) = &c.content {
+                                        let is_ack = t.text.is_empty()
+                                            && u.meta.as_ref().and_then(|m| m.get("promptId")).is_some()
+                                            && seen.borrow().ack_arrival_ms.is_none();
+                                        if is_ack {
+                                            let t0 = seen.borrow().prompt_sent_at;
+                                            if let Some(t0) = t0 {
+                                                seen.borrow_mut().ack_arrival_ms =
+                                                    Some(t0.elapsed().as_millis());
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(mode) = mode_name(&u.update) {
                                     seen.borrow_mut().mode_updates.push(mode.clone());
                                     println!("[verify] MODE UPDATE: {mode}");
@@ -143,16 +159,17 @@ async fn main() -> anyhow::Result<()> {
             println!("[verify] session {}", sid.0);
 
             // --- turn 1: establish a context marker for the resume check ---
-            let t1 = acp_send(
-                acp::PromptRequest::new(
-                    sid.clone(),
-                    vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
-                        "请记住这个暗号，之后我会考你：{MARKER}。只回复：记住了"
-                    )))],
-                ),
-                &client.tx,
-            )
-            .await;
+            seen.borrow_mut().prompt_sent_at = Some(std::time::Instant::now());
+            let mut prompt1 = acp::PromptRequest::new(
+                sid.clone(),
+                vec![acp::ContentBlock::Text(acp::TextContent::new(format!(
+                    "请记住这个暗号，之后我会考你：{MARKER}。只回复：记住了"
+                )))],
+            );
+            let mut p1meta = acp::Meta::new();
+            p1meta.insert("promptId".to_string(), serde_json::json!("verify-pid-1"));
+            prompt1.meta = Some(p1meta);
+            let t1 = acp_send(prompt1, &client.tx).await;
             check(
                 "turn1-marker",
                 matches!(&t1, Ok(r) if r.stop_reason == acp::StopReason::EndTurn),
@@ -220,6 +237,15 @@ async fn main() -> anyhow::Result<()> {
                 "plan-permissions-answered",
                 seen.borrow().permissions_answered > 0,
                 format!("answered={}", seen.borrow().permissions_answered),
+                &mut summary,
+                &mut fail,
+            );
+
+            let ack_ms = seen.borrow().ack_arrival_ms;
+            check(
+                "prompt-ack-immediate",
+                ack_ms.is_some_and(|ms| ms < 5000),
+                format!("first promptId ack after {ack_ms:?}ms (pager watchdog is 120s)"),
                 &mut summary,
                 &mut fail,
             );
