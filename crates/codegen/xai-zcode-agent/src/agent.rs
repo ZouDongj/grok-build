@@ -523,6 +523,91 @@ fn write_summary_stub(session_id: &str, cwd: &str) {
 /// child table (schema varies across kernel versions), but the session row
 /// itself must delete (an absent id is already-deleted = success). WAL +
 /// busy timeout coexist with live kernels.
+/// Map a kernel plugin-operation call result onto the pager's
+/// PluginsActionResponse outcome shape.
+fn kernel_action_outcome(
+    result: Result<Value, String>,
+    success_message: String,
+) -> Value {
+    match result {
+        Ok(_) => json!({
+            "status": "success",
+            "message": success_message,
+            "requiresReload": true,
+            "requiresRestart": false,
+        }),
+        Err(error) => json!({
+            "status": "internal_error",
+            "message": error,
+            "requiresReload": false,
+            "requiresRestart": false,
+        }),
+    }
+}
+
+/// The kernel's prompt ledger for the composer's up-arrow recall.
+fn input_history_prompts(session_id: &str) -> Vec<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let mut stmt = match con.prepare(
+        "SELECT text FROM input_history WHERE session_id = ?1 ORDER BY time_created",
+    ) {
+        Ok(stmt) => stmt,
+        Err(_) => return Vec::new(),
+    };
+    stmt.query_map([session_id], |row| row.get::<_, String>(0))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
+}
+
+/// Session token totals aggregated from the kernel's per-turn usage ledger,
+/// in the pager's PromptUsage wire shape.
+fn session_usage_totals(session_id: &str) -> Value {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
+    let empty = json!({
+        "usage": {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "cached_read_tokens": 0, "cache_creation_tokens": 0,
+            "reasoning_tokens": 0, "model_calls": 0, "api_duration_ms": 0,
+            "numTurns": 0,
+        }
+    });
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return empty;
+    };
+    let Ok(row) = con.query_row(
+        "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),          COALESCE(SUM(computed_total_tokens),0), COALESCE(SUM(cache_read_input_tokens),0),          COALESCE(SUM(cache_creation_input_tokens),0), COALESCE(SUM(reasoning_tokens),0),          COUNT(*) FROM turn_usage WHERE session_id = ?1",
+        [session_id],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+            ))
+        },
+    ) else {
+        return empty;
+    };
+    json!({
+        "usage": {
+            "input_tokens": row.0, "output_tokens": row.1, "total_tokens": row.2,
+            "cached_read_tokens": row.3, "cache_creation_tokens": row.4,
+            "reasoning_tokens": row.5, "model_calls": row.6, "api_duration_ms": 0,
+            "numTurns": row.6,
+        }
+    })
+}
+
 fn delete_kernel_session(session_id: &str, cwd: &str) -> Result<(), String> {
     use rusqlite::Connection;
 
@@ -1415,6 +1500,77 @@ impl acp::Agent for ZcodeAgent {
                         "requiresReload": true,
                         "requiresRestart": false,
                     }),
+                    "install" | "add" => {
+                        let source = action
+                            .get("source")
+                            .or_else(|| action.get("path"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        kernel_action_outcome(
+                            kernel
+                                .call(
+                                    "plugins/marketplace/add",
+                                    json!({
+                                        "workspace": {"workspaceKey": cwd, "workspacePath": cwd},
+                                        "source": source,
+                                    }),
+                                )
+                                .await,
+                            format!("installed from {source}"),
+                        )
+                    }
+                    "uninstall" => {
+                        let plugin_id = action
+                            .get("pluginId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        kernel_action_outcome(
+                            kernel
+                                .call(
+                                    "plugins/uninstall",
+                                    json!({
+                                        "workspace": {"workspaceKey": cwd, "workspacePath": cwd},
+                                        "pluginId": plugin_id,
+                                    }),
+                                )
+                                .await,
+                            format!("uninstalled {plugin_id}"),
+                        )
+                    }
+                    "update" => {
+                        let plugin_id = action.get("pluginId").and_then(Value::as_str);
+                        let mut payload = json!({
+                            "workspace": {"workspaceKey": cwd, "workspacePath": cwd},
+                        });
+                        if let Some(plugin_id) = plugin_id {
+                            payload["pluginId"] = json!(plugin_id);
+                        }
+                        kernel_action_outcome(
+                            kernel.call("plugins/update", payload).await,
+                            "updated".to_string(),
+                        )
+                    }
+                    "remove" => {
+                        let path = action
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        kernel_action_outcome(
+                            kernel
+                                .call(
+                                    "plugins/marketplace/remove",
+                                    json!({
+                                        "workspace": {"workspaceKey": cwd, "workspacePath": cwd},
+                                        "marketplace": path,
+                                    }),
+                                )
+                                .await,
+                            format!("removed {path}"),
+                        )
+                    }
                     other => {
                         return Err(acp::Error::method_not_found().data(format!(
                             "plugins action {other:?} not bridged yet"
@@ -1623,6 +1779,148 @@ impl acp::Agent for ZcodeAgent {
                 let body = json!({"result": {"sources": sources}});
                 let raw = serde_json::value::to_raw_value(&body)
                     .expect("serialize marketplace list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Subscription poll (every ~60s): the coding-plan channel has no
+            // grok subscription concept — acknowledge so the poll stops
+            // erroring; billing mirrors that with a stable tier label.
+            "x.ai/auth/check_subscription" => {
+                let raw = serde_json::value::to_raw_value(&json!({ "meta": {} }))
+                    .expect("serialize check_subscription");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            "x.ai/billing" => {
+                let body = json!({"result": {
+                    "onDemandEnabled": false,
+                    "subscriptionTier": "GLM Coding Plan",
+                }});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize billing");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Session-load queries: metadata for the header/feedback flow.
+            "x.ai/session/info" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let session = acp::SessionId::new(id.clone());
+                let cwd = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&session)
+                    .map(|s| s.cwd.borrow().clone())
+                    .unwrap_or_default();
+                let model = self
+                    .shared
+                    .state
+                    .borrow()
+                    .catalog
+                    .as_ref()
+                    .map(|c| c.current_model_id.0.to_string())
+                    .unwrap_or_else(|| "GLM-5.3".to_string());
+                let body = json!({"result": {
+                    "sessionId": id,
+                    "cwd": cwd,
+                    "agentName": "zcode",
+                    "model": model,
+                    "modelDisplayName": model,
+                    "resolvedModelId": model,
+                    "modelFingerprint": null,
+                    "turns": 0,
+                }});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize session info");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Composer up-arrow recall: the kernel persists every prompt in
+            // its input_history store.
+            "x.ai/prompt_history" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .or_else(|| params.get("session_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let prompts = input_history_prompts(&id);
+                let body = json!({"result": {"prompts": prompts}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize prompt history");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Token usage for the session — aggregated straight from the
+            // kernel's turn_usage ledger.
+            "x.ai/session/usage" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let usage = session_usage_totals(&id);
+                let body = json!(usage);
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize session usage");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // /compact: the kernel folds the transcript itself.
+            "x.ai/compact_conversation" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let kernel = self.kernel()?;
+                let mut payload = json!({"sessionId": id});
+                if let Some(ctx) = params.get("userContext").and_then(Value::as_str) {
+                    payload["instructions"] = json!(ctx);
+                }
+                kernel
+                    .call("session/compact", payload)
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("compact failed: {e}"))
+                    })?;
+                let raw = serde_json::value::to_raw_value(&json!({}))
+                    .expect("serialize compact ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Session fork: kernel sessionFork clones at the latest checkpoint.
+            "x.ai/session/fork" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sourceSessionId")
+                    .or_else(|| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let kernel = self.kernel()?;
+                let result = kernel
+                    .call("session/fork", json!({"sessionId": id}))
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("fork failed: {e}"))
+                    })?;
+                let body = json!({"result": result});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize fork result");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
             // Mid-turn "send now": the pager queues a follow-up client-side

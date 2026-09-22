@@ -429,6 +429,64 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // --- misc wiring: subscription poll, billing, session info,
+            // prompt history, session usage ---
+            for (method, params, probe) in [
+                ("x.ai/auth/check_subscription", serde_json::json!({}), "meta"),
+                ("x.ai/billing", serde_json::json!({}), "result"),
+                ("x.ai/session/info", serde_json::json!({"sessionId": sid.0.as_ref()}), "result"),
+                ("x.ai/prompt_history", serde_json::json!({"sessionId": sid.0.as_ref()}), "prompts"),
+                ("x.ai/session/usage", serde_json::json!({"sessionId": sid.0.as_ref()}), "usage"),
+            ] {
+                let resp = acp_send(
+                    acp::ExtRequest::new(
+                        method,
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize misc params")
+                            .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let ok = matches!(&resp, Ok(r) if {
+                    let v: serde_json::Value =
+                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                    v.pointer(&format!("/result/{probe}")).or_else(|| v.get(probe)).is_some()
+                });
+                check(
+                    &format!("wire-{}", method.strip_prefix("x.ai/").unwrap_or(method)),
+                    ok,
+                    format!("{:?}", resp.as_ref().map(|_| "ok").map_err(|e| e.to_string())),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+            // prompt_history must contain the turn-1 marker prompt.
+            let hist = acp_send(
+                acp::ExtRequest::new(
+                    "x.ai/prompt_history",
+                    serde_json::value::to_raw_value(&serde_json::json!({"sessionId": sid.0.as_ref()}))
+                        .expect("serialize history params")
+                        .into(),
+                ),
+                &client.tx,
+            )
+            .await;
+            let hist_has = matches!(&hist, Ok(r) if {
+                let v: serde_json::Value = serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                v.pointer("/result/prompts").and_then(|p| p.as_array())
+                    .is_some_and(|a| a.iter().any(|x| {
+                        x.as_str().is_some_and(|t| t.contains("暗号紫色河马"))
+                    }))
+            });
+            check(
+                "prompt-history-has-marker",
+                hist_has,
+                "up-arrow recall sees turn-1 text".to_string(),
+                &mut summary,
+                &mut fail,
+            );
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();

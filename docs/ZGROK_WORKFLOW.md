@@ -47,8 +47,13 @@ zgrok = xAI grok-build TUI（前端 100% 原生）+ ZCode 内核（0.16.9+，app
 | MCP Servers | ✅ x.ai/mcp/list → mcp/list(mode:status) |
 | Plugins | ✅ 列表 + enable/disable → plugins/setEnabled |
 | Skills | ✅ x.ai/skills/list → skills/referenceCatalog |
-| Marketplace | ✅ x.ai/marketplace/list → plugins/overview（市场源+安装状态；安装动作待接 plugins/install） |
+| Marketplace | ✅ 列表 + 安装/卸载/更新动作（plugins/marketplace/add 等） |
 | Hooks | ✅ 空列表（grok-shell 专属体系，内核无对应；标签正常打开） |
 | Workflows | ✅ x.ai/workflows/list → workflows/list（project scope） |
 
 模型侧（技能调用、斜杠直呼、MCP 工具、图片输入）全部原生可用——管理面只是 UI。
+
+其他已接线：auth/check_subscription、billing（订阅轮询静默化）、session/info、
+prompt_history（上箭头召回，读内核 input_history 表）、session/usage（turn_usage 聚合）、
+compact_conversation（/compact → session/compact）、session/fork、interject、
+plugins enable/disable/install/uninstall/update。
