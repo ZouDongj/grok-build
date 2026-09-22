@@ -22,6 +22,10 @@ pub struct ZcodeAgent {
 struct Shared {
     kernel_bin: String,
     state: RefCell<AgentState>,
+    /// provider/updateAccountConfig pushed once per kernel boot: the kernel
+    /// re-asserts its account state internally, and re-pushing with the
+    /// boot-time builtin revision clobbers the newer state.
+    account_pushed: std::cell::Cell<bool>,
 }
 
 #[derive(Default)]
@@ -86,6 +90,7 @@ impl ZcodeAgent {
             shared: Rc::new(Shared {
                 kernel_bin: kernel_bin.into(),
                 state: RefCell::new(AgentState::default()),
+                account_pushed: std::cell::Cell::new(false),
             }),
         }
     }
@@ -265,6 +270,10 @@ impl ZcodeAgent {
     /// to supply request auth (`interaction/requestProviderRuntimeHeaders`).
     /// On 0.16.5 the method does not exist and the push is ignored.
     async fn push_account_config(&self, kernel: &Kernel) {
+        if self.shared.account_pushed.get() {
+            return;
+        }
+        self.shared.account_pushed.set(true);
         let provider = DEFAULT_PROVIDER;
         let revision = format!(
             "host:{}",
@@ -273,15 +282,28 @@ impl ZcodeAgent {
                 .map(|d| d.as_millis())
                 .unwrap_or(0)
         );
+        // The kernel reconciles pushed account snapshots against its CURRENT
+        // builtin revision and drops mismatches — the revision is per-boot, so
+        // wait for THIS kernel's own provider_registry.ready log entry.
+        let based_on = kernel_builtin_revision(kernel.boot_epoch_ms());
+        // The pushed provider entry carries its model list too (zod allows
+        // builtinModelIds beside access) — without it the kernel only knows
+        // the session's current model. The list MUST match what the kernel's
+        // own builtin registry declares (the desktop package the launcher
+        // picks), or unknown ids poison the whole entry.
+        let model_ids: Vec<String> = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .map(|home| kernel_builtin_model_ids(&home, provider))
+            .unwrap_or_default();
         let params = json!({
             "revision": revision,
-            "basedOnZCodeBuiltinRevision": "host",
+            "basedOnZCodeBuiltinRevision": based_on,
             "providers": {
                 provider: {
+                    "builtinModelIds": model_ids,
+                    // zod-strict: access accepts exactly {type, entitled}.
                     "access": {
                         "type": "zhipu-account",
-                        "mode": "individual-coding-plan",
-                        "accountType": "bigmodel",
                         "entitled": true,
                     }
                 }
@@ -294,8 +316,14 @@ impl ZcodeAgent {
                 }
             },
         });
+        debug_log(&format!(
+            "account push payload: models={model_ids:?} basedOn={based_on}"
+        ));
         match kernel.call("provider/updateAccountConfig", params).await {
-            Ok(_) => debug_log("account config pushed"),
+            Ok(result) => debug_log(&format!(
+                "account config pushed: {}",
+                serde_json::to_string(&result).unwrap_or_default()
+            )),
             Err(error) => debug_log(&format!("account config push skipped: {error}")),
         }
     }
@@ -391,6 +419,7 @@ impl ZcodeAgent {
             // The kernel is gone: unhang every open turn (its `prompt()`
             // future parks on turn_done) and drop the dead handle so the next
             // `ensure_kernel` respawns a fresh kernel.
+            pump_shared.account_pushed.set(false);
             let mut state = pump_shared.state.borrow_mut();
             state.kernel = None;
             for (session, session_state) in state.sessions.iter() {
@@ -545,7 +574,8 @@ fn coding_plan_api_key(provider_id: &str) -> Option<String> {
     let creds: Value = serde_json::from_str(&raw).ok()?;
     let prefix = format!("account-provider:coding-plan:{provider_id}:account:");
     let suffix = ":api-key";
-    let mut best: Option<&str> = None;
+    let mut dotted: Option<&str> = None;
+    let mut plain: Option<&str> = None;
     if let Some(map) = creds.as_object() {
         for (key, value) in map {
             if key.starts_with(&prefix)
@@ -553,12 +583,190 @@ fn coding_plan_api_key(provider_id: &str) -> Option<String> {
                 && key.len() > prefix.len() + suffix.len()
             {
                 if let Some(text) = value.as_str().filter(|v| !v.trim().is_empty()) {
-                    best = Some(text);
+                    // V4 client signing needs the "id.secret" format; stale
+                    // dotless keys may coexist for the same provider.
+                    if text.contains('.') {
+                        dotted = Some(text);
+                    } else {
+                        plain = Some(text);
+                    }
                 }
             }
         }
     }
-    best.map(str::to_string)
+    dotted.or(plain).map(str::to_string)
+}
+
+/// The model ids the KERNEL's own builtin registry declares for an account
+/// provider: resolve the desktop package the launcher selects (highest
+/// version under ~/.local/opt/zcode), read providerConfigRules.providerRules.
+/// Pushing ids the kernel does not know poisons the provider entry.
+fn kernel_builtin_model_ids(home: &std::path::Path, provider: &str) -> Vec<String> {
+    let packages: Vec<std::path::PathBuf> = std::fs::read_dir(home.join(".local/opt/zcode"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path().join("opt/ZCode/resources/config/provider/zcode-builtin.json"))
+        .filter(|p| p.is_file())
+        .collect();
+    let chosen = packages
+        .into_iter()
+        .max_by_key(|p| version_of(p));
+    let Some(path) = chosen else {
+        return Vec::new();
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    value
+        .pointer("/config/providerConfigRules/providerRules")
+        .and_then(Value::as_array)
+        .map(|rules| {
+            rules
+                .iter()
+                .filter(|rule| rule.get("providerId").and_then(Value::as_str) == Some(provider))
+                .filter_map(|rule| rule.pointer("/config/builtinModelIds").and_then(Value::as_array))
+                .flat_map(|ids| ids.iter().filter_map(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Extract a leading dotted-version segment from a package registry path
+/// (~/.local/opt/zcode/<ver>/opt/...) for highest-version selection.
+fn version_of(path: &std::path::Path) -> Vec<u64> {
+    path.components()
+        .find_map(|c| c.as_os_str().to_str())
+        .and_then(|_| {
+            // components() yields the whole path; walk ancestors instead
+            None::<Vec<u64>>
+        })
+        .unwrap_or_else(|| {
+            let mut best = Vec::new();
+            for comp in path.components() {
+                if let Some(seg) = comp.as_os_str().to_str() {
+                    let parsed: Vec<u64> = seg
+                        .split('.')
+                        .map(|p| p.parse::<u64>().ok())
+                        .collect::<Option<Vec<_>>>()
+                        .unwrap_or_default();
+                    if !parsed.is_empty() && parsed.len() >= 2 {
+                        best = parsed;
+                    }
+                }
+            }
+            best
+        })
+}
+
+/// The kernel's live builtin registry revision, e.g. "zcode-builtin:30:<hash>",
+/// as last reported in its unified log. The pushed account snapshot must be
+/// based on exactly this or the kernel drops it on reconciliation.
+fn kernel_builtin_revision(boot_epoch_ms: u128) -> String {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return "host".to_string();
+    };
+    let log_dir = home.join(".zcode/cli/log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(revision) = newest_builtin_revision_since(&log_dir, boot_epoch_ms) {
+            return revision;
+        }
+        if std::time::Instant::now() > deadline {
+            return "host".to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
+/// Newest "zcode-builtin:<n>:<hash>" from provider_registry.ready log lines
+/// whose entry timestamp is at/after `since_epoch_ms` (metadata only).
+fn newest_builtin_revision_since(log_dir: &std::path::Path, since_epoch_ms: u128) -> Option<String> {
+    let mut files: Vec<_> = std::fs::read_dir(log_dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(".jsonl"))
+        .collect();
+    files.sort();
+    let newest = files.last()?;
+    let raw = std::fs::read_to_string(newest).ok()?;
+    let mut found: Option<(u128, String)> = None;
+    for line in raw.lines() {
+        if !line.contains("provider_registry.ready") {
+            continue;
+        }
+        let ts = line
+            .split("\"timestamp\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('\"').next())
+            .and_then(|t| chrono_like_epoch_ms(t))
+            .unwrap_or(0);
+        if ts < since_epoch_ms {
+            continue;
+        }
+        if let Some(start) = line.find("zcode-builtin:") {
+            let rest = &line[start..];
+            if let Some(end) = rest.find('"') {
+                // The log embeds the revision inside a JSON string: strip the
+                // trailing escape backslash or the pushed basedOn never
+                // matches and the kernel reconciles the snapshot away.
+                let candidate = rest[..end].trim_end_matches('\\').to_string();
+                if found.as_ref().map(|(t, _)| ts >= *t).unwrap_or(true) {
+                    found = Some((ts, candidate));
+                }
+            }
+        }
+    }
+    found.map(|(_, revision)| revision)
+}
+
+/// RFC3339 UTC timestamp -> epoch ms (no chrono dependency; the log format is
+/// fixed "YYYY-MM-DDTHH:MM:SS.sssZ", civil-from-days over UTC days).
+fn chrono_like_epoch_ms(t: &str) -> Option<u128> {
+    let bytes = t.as_bytes();
+    if bytes.len() < 20 {
+        return None;
+    }
+    let year: i64 = t.get(0..4)?.parse().ok()?;
+    let month: i64 = t.get(5..7)?.parse().ok()?;
+    let day: i64 = t.get(8..10)?.parse().ok()?;
+    let hour: i64 = t.get(11..13)?.parse().ok()?;
+    let minute: i64 = t.get(14..16)?.parse().ok()?;
+    let second: i64 = t.get(17..19)?.parse().ok()?;
+    let millis: i64 = t.get(20..23).and_then(|m| m.parse().ok()).unwrap_or(0);
+    // days from civil (Howard Hinnant's days_from_civil)
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some((secs * 1000 + millis).max(0) as u128)
+}
+
+/// setModel with a short retry: 0.16.9 materializes account entitlements
+/// asynchronously after kernel start, and a first-touch setModel for an
+/// account provider can race that ("Provider Registry 中不存在 Model").
+async fn set_model_with_retry(kernel: &Kernel, session_id: &str, provider: &str, model: &str) {
+    for attempt in 0..6 {
+        match kernel
+            .call("session/setModel", kernel::set_model_params(session_id, provider, model))
+            .await
+        {
+            Ok(_) => return,
+            Err(error) if attempt == 5 => {
+                debug_log(&format!("setModel {provider}/{model} failed: {error}"));
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(400)).await,
+        }
+    }
 }
 
 /// Epoch-ms → RFC3339 (UTC) without a chrono dependency. The resume picker
@@ -643,11 +851,12 @@ impl acp::Agent for ZcodeAgent {
             .await
             .map_err(|e| acp::Error::internal_error().data(format!("session/subscribe failed: {e}")))?;
         // Best-effort model preference (same file zcode-tui persists); the
-        // kernel default is fine when absent.
+        // kernel default is fine when absent. 0.16.9 loads account
+        // entitlements asynchronously at startup — an immediate setModel can
+        // race that and fail, leaving the session on the default provider,
+        // so retry briefly.
         if let Some((provider, model)) = load_model_preference() {
-            let _ = kernel
-                .call("session/setModel", kernel::set_model_params(&session_id, &provider, &model))
-                .await;
+            set_model_with_retry(&kernel, &session_id, &provider, &model).await;
         }
         let acp_session = acp::SessionId::new(session_id.clone());
         self.shared
@@ -683,9 +892,7 @@ impl acp::Agent for ZcodeAgent {
         // Resume restores the conversation but not the model runtime —
         // revive it or the first send fails with ZCODE_RUNTIME_MODEL_UNAVAILABLE.
         if let Some((provider, model)) = load_model_preference() {
-            let _ = kernel
-                .call("session/setModel", kernel::set_model_params(&session_id, &provider, &model))
-                .await;
+            set_model_with_retry(&kernel, &session_id, &provider, &model).await;
         }
         self.shared
             .state
@@ -772,6 +979,9 @@ impl acp::Agent for ZcodeAgent {
         *state.turn_done.borrow_mut() = Some(tx);
         state.cancelled.set(false);
         state.streamed_text.set(false);
+        // The host-pushed account snapshot decays when the kernel re-asserts
+        // its registry against the builtin revision — re-push before sends.
+        self.push_account_config(&kernel).await;
         kernel
             .request("session/send", kernel::send_params(&args.session_id.0, &text))
             .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
@@ -847,13 +1057,27 @@ impl acp::Agent for ZcodeAgent {
         let model = &*args.model_id.0;
         let provider = load_model_preference().map(|(p, _)| p).unwrap_or(DEFAULT_PROVIDER.to_string());
         debug_log(&format!("set_session_model: setModel {provider}/{model}"));
-        kernel
-            .call("session/setModel", kernel::set_model_params(&args.session_id.0, &provider, model))
-            .await
-            .map_err(|e| {
-                debug_log(&format!("set_session_model: setModel FAILED: {e}"));
-                acp::Error::internal_error().data(format!("setModel failed: {e}"))
-            })?;
+        let mut switched = false;
+        for attempt in 0..3 {
+            match kernel
+                .call("session/setModel", kernel::set_model_params(&args.session_id.0, &provider, model))
+                .await
+            {
+                Ok(_) => {
+                    switched = true;
+                    break;
+                }
+                Err(error) => {
+                    debug_log(&format!("set_session_model: setModel FAILED (attempt {}): {error}", attempt + 1));
+                    // Registry-miss usually means the pushed account snapshot
+                    // decayed — re-push before retrying.
+                    self.push_account_config(&kernel).await;
+                }
+            }
+        }
+        if !switched {
+            return Err(acp::Error::internal_error().data("setModel failed after retries"));
+        }
         debug_log("set_session_model: setModel ok");
         // Reasoning effort (grok's /effort and the picker's [effort] arg)
         // rides the request meta as `reasoningEffort` — forward to the

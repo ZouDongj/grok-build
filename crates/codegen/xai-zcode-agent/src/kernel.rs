@@ -106,6 +106,9 @@ pub struct Kernel {
     child: Arc<Mutex<Child>>,
     writer: std::sync::mpsc::Sender<String>,
     pending: Arc<Pending>,
+    /// Wall-clock epoch ms just before the child spawned: lets callers wait
+    /// for THIS kernel's own log entries (the per-boot builtin revision).
+    boot_ms: u128,
 }
 
 struct Pending {
@@ -267,9 +270,17 @@ impl Kernel {
                 child: Arc::new(Mutex::new(child)),
                 writer: write_tx,
                 pending,
+                boot_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
             },
             rx,
         ))
+    }
+
+    pub fn boot_epoch_ms(&self) -> u128 {
+        self.boot_ms
     }
 
     pub fn is_alive(&self) -> bool {
