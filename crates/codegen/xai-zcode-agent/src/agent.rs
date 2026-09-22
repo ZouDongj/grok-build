@@ -59,6 +59,10 @@ struct SessionState {
     /// Session workspace path — workspace-scoped kernel calls (mcp/list,
     /// plugins/list, …) key off it.
     cwd: RefCell<String>,
+    /// The kernel session currently backing this ACP session. Equals the
+    /// ACP id until an in-place rewind forks the conversation at an earlier
+    /// message; the forked id takes over while the pager keeps its id.
+    kernel_id: RefCell<String>,
 }
 
 impl SessionState {
@@ -72,6 +76,7 @@ impl SessionState {
             pending_continuation: RefCell::new(None),
             fail_grace_cancel: RefCell::new(None),
             cwd: RefCell::new(String::new()),
+            kernel_id: RefCell::new(String::new()),
         }
     }
 
@@ -82,6 +87,18 @@ impl SessionState {
 }
 
 impl ZcodeAgent {
+/// The kernel session id currently backing an ACP session (may differ from
+/// the ACP id after an in-place rewind forked the conversation).
+fn session_kernel_id(&self, session: &acp::SessionId) -> String {
+    self.shared
+        .state
+        .borrow()
+        .sessions
+        .get(session)
+        .map(|s| s.kernel_id.borrow().clone())
+        .unwrap_or_else(|| session.0.to_string())
+}
+
 /// Session lookup shared by the workspace-scoped ext bridges: the session's
 /// cwd (for workspace-keyed kernel calls) plus the live kernel handle.
 fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kernel)> {
@@ -543,6 +560,90 @@ fn kernel_action_outcome(
             "requiresRestart": false,
         }),
     }
+}
+
+/// Rewind points: every real user message in the kernel's ledger, oldest
+/// first, with a text preview from its first part.
+fn rewind_points(session_id: &str) -> Vec<Value> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = con.prepare(
+        "SELECT m.id, m.time_created, (SELECT p.data FROM part p WHERE p.message_id = m.id \
+         AND p.data LIKE '%\"text\"%' ORDER BY p.sequence LIMIT 1) \
+         FROM message m WHERE m.session_id = ?1 AND m.data LIKE '%\"role\":\"user\"%' \
+         ORDER BY m.sequence",
+    ) else {
+        return Vec::new();
+    };
+    let rows = stmt
+        .query_map([session_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+        .unwrap_or_default();
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, (id, created, preview))| {
+            let preview = preview
+                .and_then(|data| {
+                    serde_json::from_str::<Value>(&data)
+                        .ok()
+                        .and_then(|j| j.get("text").and_then(Value::as_str).map(str::to_string))
+                })
+                .unwrap_or_default();
+            json!({
+                "promptIndex": index,
+                "createdAt": ms_to_rfc3339(created),
+                "numFileSnapshots": 0,
+                "promptPreview": preview.chars().take(160).collect::<String>(),
+                "hasFileChanges": false,
+                "messageId": id,
+            })
+        })
+        .collect()
+}
+
+/// The kernel message id of the Nth real user message, if present.
+fn rewind_message_id(session_id: &str, target_prompt_index: usize) -> Option<String> {
+    rewind_points(session_id)
+        .into_iter()
+        .nth(target_prompt_index)
+        .and_then(|p| p.get("messageId").and_then(Value::as_str).map(str::to_string))
+}
+
+/// Identity headers for official MCP connectors, mirroring the desktop's
+/// buildOfficialMcpAuthHeaders: `Authorization` carries the ZCode JWT,
+/// `X-Bigmodel-Authorization` the coding-plan maas JWT (the bigmodel OAuth
+/// access token). Team-scope headers only apply to team plans — omitted.
+fn official_mcp_auth_headers() -> Option<Value> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let path = std::path::Path::new(&home).join(".zcode/v2/credentials.json");
+    let store: Value = serde_json::from_str(
+        &std::fs::read_to_string(path).ok()?,
+    )
+    .ok()?;
+    let jwt = decrypt_credential(store.get("zcodejwttoken")?.as_str()?);
+    let maas = decrypt_credential(store.get("oauth:bigmodel:access_token")?.as_str()?);
+    if jwt.is_empty() || maas.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "ok": true,
+        "headers": {
+            "Authorization": format!("Bearer {jwt}"),
+            "X-Bigmodel-Authorization": format!("Bearer {maas}"),
+        },
+    }))
 }
 
 /// The kernel's prompt ledger for the composer's up-arrow recall.
@@ -1029,6 +1130,7 @@ impl acp::Agent for ZcodeAgent {
         let acp_session = acp::SessionId::new(session_id.clone());
         let state = Rc::new(SessionState::new());
         *state.cwd.borrow_mut() = cwd.to_string_lossy().to_string();
+        *state.kernel_id.borrow_mut() = session_id.clone();
         self.shared
             .state
             .borrow_mut()
@@ -1071,6 +1173,7 @@ impl acp::Agent for ZcodeAgent {
             .insert(args.session_id.clone(), {
                 let state = Rc::new(SessionState::new());
                 *state.cwd.borrow_mut() = args.cwd.to_string_lossy().to_string();
+                *state.kernel_id.borrow_mut() = args.session_id.0.to_string();
                 state
             });
         let cwd_text = args.cwd.to_string_lossy().to_string();
@@ -1180,7 +1283,7 @@ impl acp::Agent for ZcodeAgent {
         kernel
             .request(
                 "session/send",
-                kernel::send_params_with_attachments(&args.session_id.0, &text, &attachments),
+                kernel::send_params_with_attachments(&state.kernel_id.borrow(), &text, &attachments),
             )
             .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
         let stop = rx.await.unwrap_or(acp::StopReason::EndTurn);
@@ -1219,7 +1322,9 @@ impl acp::Agent for ZcodeAgent {
         if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id) {
             state.cancelled.set(true);
         }
-        let _ = kernel.request("session/stop", kernel::stop_params(&args.session_id.0));
+        if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id) {
+            let _ = kernel.request("session/stop", kernel::stop_params(&state.kernel_id.borrow()));
+        }
         Ok(())
     }
 
@@ -1234,7 +1339,7 @@ impl acp::Agent for ZcodeAgent {
         let kernel = self.kernel()?;
         let kernel_mode = if args.mode_id.0.as_ref() == "plan" { "plan" } else { "build" };
         kernel
-            .call("session/setMode", kernel::set_mode_params(&args.session_id.0, kernel_mode))
+            .call("session/setMode", kernel::set_mode_params(&self.session_kernel_id(&args.session_id), kernel_mode))
             .await
             .map_err(|e| acp::Error::internal_error().data(format!("setMode failed: {e}")))?;
         self.gateway.forward_fire_and_forget(acp::SessionNotification::new(
@@ -1258,7 +1363,7 @@ impl acp::Agent for ZcodeAgent {
         let mut switched = false;
         for attempt in 0..3 {
             match kernel
-                .call("session/setModel", kernel::set_model_params(&args.session_id.0, &provider, model))
+                .call("session/setModel", kernel::set_model_params(&self.session_kernel_id(&args.session_id), &provider, model))
                 .await
             {
                 Ok(_) => {
@@ -1290,7 +1395,7 @@ impl acp::Agent for ZcodeAgent {
             if let Err(error) = kernel
                 .call(
                     "session/setThoughtLevel",
-                    kernel::set_thought_params(&args.session_id.0, effort),
+                    kernel::set_thought_params(&self.session_kernel_id(&args.session_id), effort),
                 )
                 .await
             {
@@ -1298,7 +1403,7 @@ impl acp::Agent for ZcodeAgent {
             }
         }
         debug_log("set_session_model: session/read");
-        self.push_model_state(&kernel, &args.session_id.0).await;
+        self.push_model_state(&kernel, &self.session_kernel_id(&args.session_id)).await;
         debug_log("set_session_model: done");
         Ok(acp::SetSessionModelResponse::default())
     }
@@ -1923,6 +2028,39 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize fork result");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // Checkpoint rewind (Esc): points from the kernel's message
+            // ledger; execute forks the conversation at the target user
+            // message and swaps the fork in behind the same ACP session id,
+            // so the pager rewinds in place.
+            "x.ai/rewind/points" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let kernel_sid = self.session_kernel_id(&acp::SessionId::new(id.clone()));
+                let points = rewind_points(&kernel_sid);
+                let body = json!({"result": {"rewindPoints": points}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize rewind points");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            "x.ai/rewind/execute" => {
+                // The kernel's wire surface exposes no conversation-
+                // truncating rewind: session/fork (message/turn targets)
+                // was verified empirically to retain the full message
+                // ledger, so the forked model still sees post-target turns.
+                // The real rewindToMessage is an internal runtime command
+                // without an app-server method. Until a ledger-surgery
+                // implementation lands, answer explicitly instead of
+                // pretending.
+                let _ = args.params.get();
+                return Err(acp::Error::method_not_found().data(
+                    "rewind execute: kernel exposes no truncating rewind (fork keeps the full ledger); tracked for ledger-surgery implementation",
+                ));
+            }
             // Mid-turn "send now": the pager queues a follow-up client-side
             // and force-sends it via this method. The kernel's sendText has
             // startNow (preempt) / queue delivery modes, but preempting a
@@ -2263,7 +2401,8 @@ fn drain_pending_continuation(shared: &Rc<Shared>, session: &acp::SessionId) {
     };
     debug_log(&format!("plan continuation: {} chars", text.len()));
     state.streamed_text.set(false);
-    if let Err(error) = kernel.request("session/send", kernel::send_params(&session.0, &text)) {
+    let kernel_sid = state.kernel_id.borrow().clone();
+    if let Err(error) = kernel.request("session/send", kernel::send_params(&kernel_sid, &text)) {
         tracing::warn!(%error, "plan continuation send failed");
     }
 }
@@ -2297,6 +2436,17 @@ async fn handle_server_request(
                 "errorMessage": "no coding-plan credential for provider",
             }),
         };
+        if let Some(kernel) = shared.state.borrow().kernel.clone() {
+            let _ = kernel.reply(envelope_id, reply);
+        }
+        return;
+    }
+    // Official MCP connectors (zcode_official auth) ask their host for the
+    // identity headers the connector service validates — the desktop sends
+    // the ZCode JWT plus the coding-plan maas JWT (oauth access token).
+    if method == "interaction/requestOfficialMcpAuthHeaders" {
+        let reply = official_mcp_auth_headers()
+            .unwrap_or_else(|| json!({"ok": false, "reason": "official_auth_unavailable"}));
         if let Some(kernel) = shared.state.borrow().kernel.clone() {
             let _ = kernel.reply(envelope_id, reply);
         }

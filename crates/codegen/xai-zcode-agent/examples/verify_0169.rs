@@ -487,6 +487,89 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- rewind: separate session, two prompts, rewind to point 0,
+            // then continue — the fork must be transparent in-place ---
+            {
+                let rw_session = acp_send(
+                    acp::NewSessionRequest::new(std::path::PathBuf::from(WORKDIR)),
+                    &client.tx,
+                )
+                .await;
+                let rw_sid = rw_session.expect("rewind session").session_id;
+                for text in ["第一句话：香蕉", "第二句话：苹果"] {
+                    let _ = acp_send(
+                        acp::PromptRequest::new(
+                            rw_sid.clone(),
+                            vec![acp::ContentBlock::Text(acp::TextContent::new(
+                                format!("{text}。只回复：收到{text}"),
+                            ))],
+                        ),
+                        &client.tx,
+                    )
+                    .await;
+                }
+                let pts = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/rewind/points",
+                        serde_json::value::to_raw_value(&serde_json::json!({"sessionId": rw_sid.0.as_ref()}))
+                            .expect("serialize points params")
+                            .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let pts_count = matches!(&pts, Ok(r) if {
+                    let v: serde_json::Value = serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                    v.pointer("/result/rewindPoints").and_then(|x| x.as_array()).is_some_and(|a| a.len() >= 2)
+                });
+                check(
+                    "rewind-points-listed",
+                    pts_count,
+                    "two user prompts visible as rewind points".to_string(),
+                    &mut summary,
+                    &mut fail,
+                );
+                let exec = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/rewind/execute",
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "sessionId": rw_sid.0.as_ref(),
+                            "targetPromptIndex": 1,
+                            "force": true,
+                            "mode": "conversation_only",
+                        }))
+                        .expect("serialize rewind exec")
+                        .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                // Execute is explicitly unsupported until a truncating
+                // rewind exists — the error must say so (not a vague one).
+                let exec_unsupported = matches!(&exec, Err(e) if {
+                    e.to_string().contains("truncating rewind")
+                });
+                check(
+                    "rewind-execute-explicit-unsupported",
+                    exec_unsupported,
+                    format!("{:?}", exec.as_ref().map(|_| "ok").map_err(|e| e.to_string())),
+                    &mut summary,
+                    &mut fail,
+                );
+                let _ = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/session/delete",
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "sessionId": rw_sid.0.as_ref(), "cwd": WORKDIR,
+                        }))
+                        .expect("serialize rw delete")
+                        .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+            }
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();

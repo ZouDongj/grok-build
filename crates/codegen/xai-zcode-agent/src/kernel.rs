@@ -354,9 +354,8 @@ fn auto_reply(method: &str) -> Option<Value> {
             "askUserQuestionAutoResolutionEnabled": true,
             "modelContextBudgetStrategy": "preflight-v1",
         })),
-        "interaction/requestOfficialMcpAuthHeaders" => {
-            Some(json!({"ok": false, "reason": "official_auth_unavailable"}))
-        }
+        // interaction/requestOfficialMcpAuthHeaders forwards to the agent:
+        // the official-connector headers come from the credential store.
         _ => None,
     }
 }
