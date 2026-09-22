@@ -391,6 +391,44 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- hooks / workflows / marketplace tabs ---
+            for (method, params, probe) in [
+                ("x.ai/hooks/list", serde_json::json!({"sessionId": sid.0.as_ref()}), "hooks"),
+                ("x.ai/workflows/list", serde_json::json!({"sessionId": sid.0.as_ref()}), "workflows"),
+                ("x.ai/marketplace/list", serde_json::json!({"sessionId": sid.0.as_ref()}), "sources"),
+            ] {
+                let resp = acp_send(
+                    acp::ExtRequest::new(
+                        method,
+                        serde_json::value::to_raw_value(&params)
+                            .expect("serialize tab params")
+                            .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let detail = match &resp {
+                    Ok(r) => {
+                        let v: serde_json::Value =
+                            serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                        let inner = v.get("result").unwrap_or(&v);
+                        let n = inner.get(probe).and_then(|x| x.as_array()).map(|a| a.len());
+                        match n {
+                            Some(n) => format!("{probe}={n}"),
+                            None => format!("{probe}=missing"),
+                        }
+                    }
+                    Err(e) => format!("err={e}"),
+                };
+                check(
+                    &format!("tab-{}", method.strip_prefix("x.ai/").unwrap_or(method)),
+                    resp.is_ok() && !detail.contains("missing") && !detail.starts_with("err"),
+                    detail,
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();

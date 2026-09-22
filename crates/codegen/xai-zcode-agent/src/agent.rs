@@ -1494,6 +1494,137 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize skills list");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // Hooks tab: grok-shell hooks are a shell-side lifecycle system
+            // the zcode kernel does not have — answer with a valid empty
+            // listing so the tab opens instead of erroring.
+            "x.ai/hooks/list" => {
+                let body = json!({"result": {"hooks": [], "projectTrusted": true, "loadErrors": []}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize hooks list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Workflows tab: kernel workflows/list (project scope) entries.
+            "x.ai/workflows/list" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let (cwd, kernel) = self.session_cwd_and_kernel(&id)?;
+                let result = kernel
+                    .call(
+                        "workflows/list",
+                        json!({
+                            "workspace": {"workspaceKey": cwd, "workspacePath": cwd},
+                            "scope": "project",
+                        }),
+                    )
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!(
+                            "workflows/list failed: {e}"
+                        ))
+                    })?;
+                let workflows: Vec<Value> = result
+                    .get("workflows")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|w| {
+                        json!({
+                            "name": w.get("name").cloned().unwrap_or(Value::Null),
+                            "description": w
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                            "when_to_use": w.get("whenToUse").cloned().unwrap_or(Value::Null),
+                            "source": w.get("scope").and_then(Value::as_str).unwrap_or("project"),
+                            "path": w.get("path").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect();
+                let body = json!({"result": {"workflows": workflows}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize workflows list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Marketplace tab: kernel plugins/overview carries marketplaces
+            // plus per-marketplace available plugins with install state.
+            "x.ai/marketplace/list" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let (cwd, kernel) = self.session_cwd_and_kernel(&id)?;
+                let result = kernel
+                    .call(
+                        "plugins/overview",
+                        json!({"workspace": {"workspaceKey": cwd, "workspacePath": cwd}}),
+                    )
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!(
+                            "plugins/overview failed: {e}"
+                        ))
+                    })?;
+                let marketplaces = result
+                    .get("marketplaces")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let available = result
+                    .get("availablePlugins")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let sources: Vec<Value> = marketplaces
+                    .iter()
+                    .map(|m| {
+                        let m_name = m.get("name").and_then(Value::as_str).unwrap_or("");
+                        let m_id = m.get("id").and_then(Value::as_str).unwrap_or("");
+                        let plugins: Vec<Value> = available
+                            .iter()
+                            .filter(|p| {
+                                p.get("marketplace")
+                                    .and_then(Value::as_str)
+                                    .map(|mp| mp == m_name || mp == m_id)
+                                    .unwrap_or(false)
+                            })
+                            .map(|p| {
+                                json!({
+                                    "name": p.get("name").cloned().unwrap_or(Value::Null),
+                                    "version": p.get("version").cloned().unwrap_or(Value::Null),
+                                    "description": p.get("description").cloned().unwrap_or(Value::Null),
+                                    "relativePath": p.get("id").and_then(Value::as_str).unwrap_or(""),
+                                    "skillCount": 0,
+                                    "hasHooks": false,
+                                    "hasAgents": false,
+                                    "hasMcp": false,
+                                    "installStatus": if p.get("installed").and_then(Value::as_bool).unwrap_or(false)
+                                        { "installed" } else { "not_installed" },
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "sourceName": m_name,
+                            "sourceKind": "marketplace",
+                            "sourceUrlOrPath": m.get("source").and_then(Value::as_str).unwrap_or(""),
+                            "plugins": plugins,
+                            "error": m.get("refreshFailure").cloned().unwrap_or(Value::Null),
+                        })
+                    })
+                    .collect();
+                let body = json!({"result": {"sources": sources}});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize marketplace list");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // Mid-turn "send now": the pager queues a follow-up client-side
             // and force-sends it via this method. The kernel's sendText has
             // startNow (preempt) / queue delivery modes, but preempting a
