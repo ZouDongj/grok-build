@@ -19,6 +19,7 @@ struct Seen {
     prompt_sent_at: Option<std::time::Instant>,
     ack_arrival_ms: Option<u128>,
     usage_updates: std::cell::RefCell<Vec<(u64, u64)>>,
+    subagent_events: std::cell::RefCell<Vec<String>>,
     plan_approval_ext: bool,
     plan_outcome_sent: Option<String>,
     permissions_answered: usize,
@@ -137,6 +138,17 @@ async fn main() -> anyhow::Result<()> {
                                 if let acp::SessionUpdate::AgentMessageChunk(c) = &u.update {
                                     if let acp::ContentBlock::Text(t) = &c.content {
                                         seen.borrow().current_text.borrow_mut().push_str(&t.text);
+                                    }
+                                }
+                            }
+                            AcpClientMessage::ExtNotification(n) => {
+                                if &*n.method == "x.ai/session/update" {
+                                    let v: serde_json::Value =
+                                        serde_json::from_str(n.params.get()).unwrap_or(serde_json::json!({}));
+                                    if let Some(kind) = v.pointer("/update/sessionUpdate").and_then(|k| k.as_str()) {
+                                        if kind.starts_with("subagent_") {
+                                            seen.borrow_mut().subagent_events.borrow_mut().push(kind.to_string());
+                                        }
                                     }
                                 }
                             }
@@ -584,6 +596,30 @@ async fn main() -> anyhow::Result<()> {
                 "context-usage-updates",
                 usage_ok,
                 format!("{:?}", usages.last()),
+                &mut summary,
+                &mut fail,
+            );
+
+            // --- subagent lifecycle visualization ---
+            seen.borrow_mut().subagent_events.borrow_mut().clear();
+            let sub_turn = acp_send(
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "请使用 Agent 工具派一个子代理执行命令 echo subviz-ok 并把输出返回。".to_string(),
+                    ))],
+                ),
+                &client.tx,
+            )
+            .await;
+            let events = seen.borrow().subagent_events.borrow().clone();
+            let saw_spawn = events.iter().any(|e| e == "subagent_spawned");
+            let saw_finish = events.iter().any(|e| e == "subagent_finished");
+            check(
+                "subagent-lifecycle-visualized",
+                matches!(&sub_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn)
+                    && saw_spawn && saw_finish,
+                format!("events={:?}", events),
                 &mut summary,
                 &mut fail,
             );

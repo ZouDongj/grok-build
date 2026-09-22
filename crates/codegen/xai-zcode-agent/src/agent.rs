@@ -63,6 +63,10 @@ struct SessionState {
     /// ACP id until an in-place rewind forks the conversation at an earlier
     /// message; the forked id takes over while the pager keeps its id.
     kernel_id: RefCell<String>,
+    /// Subagent lifecycle broadcast state: child id -> (spawn_announced,
+    /// finished_announced). The kernel's child events don't reach our
+    /// subscription, so the poller diffs session/subagents instead.
+    subagents: RefCell<HashMap<String, (bool, bool)>>,
 }
 
 impl SessionState {
@@ -77,6 +81,7 @@ impl SessionState {
             fail_grace_cancel: RefCell::new(None),
             cwd: RefCell::new(String::new()),
             kernel_id: RefCell::new(String::new()),
+            subagents: RefCell::new(HashMap::new()),
         }
     }
 
@@ -710,6 +715,224 @@ fn context_window_tokens(shared: &Rc<Shared>) -> u64 {
         .and_then(|meta| meta.get("totalContextTokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0)
+}
+
+fn emit_subagent_update(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    parent: &acp::SessionId,
+    update: Value,
+) {
+    let payload = json!({"sessionId": parent.0, "update": update});
+    if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/session/update",
+            raw.into(),
+        ));
+    }
+}
+
+/// One session/subagents diff pass: announce new children as spawned,
+/// refresh running ones with a progress tick, and finish the ones that
+/// dropped out of `running` (ended items carry the authoritative status).
+async fn poll_subagents_once(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    kernel: &Kernel,
+    state: &Rc<SessionState>,
+    parent: &acp::SessionId,
+    final_pass: bool,
+) {
+    let kernel_sid = state.kernel_id.borrow().clone();
+    let Ok(snapshot) = kernel
+        .call("session/subagents", json!({"sessionId": kernel_sid}))
+        .await
+    else {
+        return;
+    };
+    let arr = |pointer: &str| {
+        snapshot
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let running = arr("/running");
+    let ended = arr("/ended/items");
+    let children = arr("/childSessionIds");
+    fn str_of<'a>(v: &'a Value, k: &str) -> &'a str {
+        v.get(k).and_then(Value::as_str).unwrap_or("")
+    }
+    let id_of = |v: &Value| {
+        v.as_str()
+            .map(str::to_string)
+            .or_else(|| v.get("childSessionId").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default()
+    };
+    let running_ids: std::collections::HashSet<String> =
+        running.iter().map(&id_of).collect();
+    let all_ids: std::collections::HashSet<String> = children
+        .iter()
+        .chain(running.iter())
+        .chain(ended.iter())
+        .map(&id_of)
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    // Spawn announcements for children we haven't seen.
+    let mut announced_spawn: Vec<String> = Vec::new();
+    {
+        let mut subs = state.subagents.borrow_mut();
+        for id in &all_ids {
+            if !subs.contains_key(id) {
+                let meta = running
+                    .iter()
+                    .chain(ended.iter())
+                    .find(|v| id_of(v) == *id)
+                    .cloned()
+                    .unwrap_or(json!({}));
+                let subagent_type = if str_of(&meta, "agentId").is_empty() {
+                    "general-purpose"
+                } else {
+                    str_of(&meta, "agentId")
+                };
+                emit_subagent_update(
+                    gateway,
+                    parent,
+                    json!({
+                        "sessionUpdate": "subagent_spawned",
+                        "subagent_id": id,
+                        "parent_session_id": parent.0,
+                        "child_session_id": id,
+                        "subagent_type": subagent_type,
+                        "description": str_of(&meta, "title"),
+                    }),
+                );
+                subs.insert(id.clone(), (true, false));
+                announced_spawn.push(id.clone());
+            }
+        }
+    }
+    let _ = announced_spawn;
+
+    // Progress ticks for running children.
+    for meta in &running {
+        let id = id_of(meta);
+        if state
+            .subagents
+            .borrow()
+            .get(&id)
+            .is_some_and(|(_, done)| !*done)
+        {
+            let started = meta
+                .get("startedAt")
+                .and_then(Value::as_i64)
+                .unwrap_or_else(|| std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0));
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let duration = (now_ms - started).max(0) as u64;
+            emit_subagent_update(
+                gateway,
+                parent,
+                json!({
+                    "sessionUpdate": "subagent_progress",
+                    "subagent_id": id,
+                    "parent_session_id": parent.0,
+                    "child_session_id": id,
+                    "duration_ms": duration,
+                    "turn_count": 0,
+                    "tool_call_count": 0,
+                    "tokens_used": 0,
+                    "context_window_tokens": 0,
+                    "context_usage_pct": 0,
+                    "tools_used": [],
+                    "error_count": 0,
+                }),
+            );
+        }
+    }
+
+    // Finishes: authoritative from ended items; on the final pass anything
+    // spawned-but-not-running closes out as completed.
+    for meta in &ended {
+        let id = id_of(meta);
+        let status = if str_of(meta, "status").is_empty() {
+            "completed"
+        } else {
+            str_of(meta, "status")
+        };
+        let mut subs = state.subagents.borrow_mut();
+        if let Some(entry @ (true, false)) = subs.get_mut(&id) {
+            entry.1 = true;
+            drop(subs);
+            emit_subagent_update(
+                gateway,
+                parent,
+                json!({
+                    "sessionUpdate": "subagent_finished",
+                    "subagent_id": id,
+                    "child_session_id": id,
+                    "status": status,
+                    "tool_calls": 0,
+                    "turns": 0,
+                    "duration_ms": 0,
+                    "tokens_used": 0,
+                }),
+            );
+        }
+    }
+    if final_pass {
+        let ids: Vec<String> = state
+            .subagents
+            .borrow()
+            .iter()
+            .filter(|(id, (spawn, done))| *spawn && !*done && !running_ids.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            if let Some(entry @ (true, false)) = state.subagents.borrow_mut().get_mut(&id) {
+                entry.1 = true;
+            }
+            emit_subagent_update(
+                gateway,
+                parent,
+                json!({
+                    "sessionUpdate": "subagent_finished",
+                    "subagent_id": id,
+                    "child_session_id": id,
+                    "status": "completed",
+                    "tool_calls": 0,
+                    "turns": 0,
+                    "duration_ms": 0,
+                    "tokens_used": 0,
+                }),
+            );
+        }
+    }
+}
+
+/// While a turn runs, diff the kernel's subagent registry every few seconds
+/// and translate changes into the pager's lifecycle notifications.
+fn spawn_subagent_poller(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    kernel: Kernel,
+    state: Rc<SessionState>,
+    parent: acp::SessionId,
+) {
+    let gateway = gateway.clone();
+    tokio::task::spawn_local(async move {
+        loop {
+            if state.turn_done.borrow().is_none() {
+                break;
+            }
+            poll_subagents_once(&gateway, &kernel, &state, &parent, false).await;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        }
+        poll_subagents_once(&gateway, &kernel, &state, &parent, true).await;
+    });
 }
 
 /// Emit the pager's context meter update for a session.
@@ -1347,6 +1570,7 @@ impl acp::Agent for ZcodeAgent {
         *state.turn_done.borrow_mut() = Some(tx);
         state.cancelled.set(false);
         state.streamed_text.set(false);
+        spawn_subagent_poller(&self.gateway, kernel.clone(), state.clone(), args.session_id.clone());
         // The host-pushed account snapshot decays when the kernel re-asserts
         // its registry against the builtin revision — re-push before sends.
         self.push_account_config(&kernel).await;
