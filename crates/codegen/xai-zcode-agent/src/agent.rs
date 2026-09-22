@@ -56,6 +56,9 @@ struct SessionState {
     /// turn.failed for a failed ATTEMPT and then retries, so termination must
     /// wait to see whether the turn actually continues.
     fail_grace_cancel: RefCell<Option<oneshot::Sender<()>>>,
+    /// Session workspace path — workspace-scoped kernel calls (mcp/list,
+    /// plugins/list, …) key off it.
+    cwd: RefCell<String>,
 }
 
 impl SessionState {
@@ -68,6 +71,7 @@ impl SessionState {
             next_tool: std::cell::Cell::new(0),
             pending_continuation: RefCell::new(None),
             fail_grace_cancel: RefCell::new(None),
+            cwd: RefCell::new(String::new()),
         }
     }
 
@@ -921,11 +925,13 @@ impl acp::Agent for ZcodeAgent {
             set_model_with_retry(&kernel, &session_id, &provider, &model).await;
         }
         let acp_session = acp::SessionId::new(session_id.clone());
+        let state = Rc::new(SessionState::new());
+        *state.cwd.borrow_mut() = cwd.to_string_lossy().to_string();
         self.shared
             .state
             .borrow_mut()
             .sessions
-            .insert(acp_session.clone(), Rc::new(SessionState::new()));
+            .insert(acp_session.clone(), state);
         // Resumable through the pager's local-store gate from the start.
         write_summary_stub(&session_id, &cwd.to_string_lossy());
         // The OFFICIAL session-scoped model channel: NewSessionResponse.models.
@@ -960,7 +966,11 @@ impl acp::Agent for ZcodeAgent {
             .state
             .borrow_mut()
             .sessions
-            .insert(args.session_id.clone(), Rc::new(SessionState::new()));
+            .insert(args.session_id.clone(), {
+                let state = Rc::new(SessionState::new());
+                *state.cwd.borrow_mut() = args.cwd.to_string_lossy().to_string();
+                state
+            });
         let cwd_text = args.cwd.to_string_lossy().to_string();
         write_summary_stub(&session_id, &cwd_text);
 
@@ -1197,6 +1207,82 @@ impl acp::Agent for ZcodeAgent {
             // Resume picker (singular) and dashboard roster (plural).
             "x.ai/session/list" | "x.ai/sessions/list" => {
                 return self.sessions_list(args.method.as_ref()).await;
+            }
+            // Extensions modal → MCP servers tab. The kernel's workspace-
+            // scoped `mcp/list` (mode "status" = read-only, no connecting)
+            // reports live per-server state; translate to the pager's
+            // session-shaped entries.
+            "x.ai/mcp/list" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let session = acp::SessionId::new(id);
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&session)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let cwd = state.cwd.borrow().clone();
+                let kernel = self.kernel()?;
+                let result = kernel
+                    .call(
+                        "mcp/list",
+                        json!({"workspace": {"workspaceKey": cwd, "workspacePath": cwd}, "mode": "status"}),
+                    )
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("mcp/list failed: {e}"))
+                    })?;
+                let statuses = result
+                    .get("statuses")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                let servers: Vec<Value> = statuses
+                    .iter()
+                    .map(|(name, st)| {
+                        let kernel_status =
+                            st.get("status").and_then(Value::as_str).unwrap_or("disconnected");
+                        let tool_count =
+                            st.get("toolCount").and_then(Value::as_u64).unwrap_or(0);
+                        // Pager status strings: ready / initializing; anything
+                        // else lands on Unavailable, which is honest for
+                        // failed/disconnected/untrusted. `disabled` config
+                        // rows report enabled=false instead.
+                        let enabled = kernel_status != "disabled";
+                        let session_status = match kernel_status {
+                            "connected" => "ready",
+                            "connecting" => "initializing",
+                            _ => "",
+                        };
+                        let auth_required = st.get("authorization").is_some();
+                        let tools: Vec<Value> = (0..tool_count)
+                            .map(|_| json!({"name": "", "enabled": true}))
+                            .collect();
+                        json!({
+                            "name": name,
+                            "session": {
+                                "enabled": enabled,
+                                "status": session_status,
+                                "tools": tools,
+                                "authRequired": auth_required,
+                            },
+                        })
+                    })
+                    .collect();
+                let body = json!({
+                    "result": {"servers": servers, "sessionMcpResolved": true},
+                });
+                let raw =
+                    serde_json::value::to_raw_value(&body).expect("serialize mcp list");
+                return Ok(acp::ExtResponse::new(raw.into()));
             }
             // Mid-turn "send now": the pager queues a follow-up client-side
             // and force-sends it via this method. The kernel's sendText has

@@ -250,6 +250,39 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // --- mcp/list bridge: the extensions modal's MCP tab ---
+            tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+            let mcp_resp = acp_send(
+                acp::ExtRequest::new(
+                    "x.ai/mcp/list",
+                    serde_json::value::to_raw_value(&serde_json::json!({"sessionId": sid.0.as_ref(), "cache": true}))
+                        .expect("serialize mcp list params")
+                        .into(),
+                ),
+                &client.tx,
+            )
+            .await;
+            let mcp_detail = match &mcp_resp {
+                Ok(r) => {
+                    let v: serde_json::Value =
+                        serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                    let inner = v.get("result").unwrap_or(&v);
+                    let servers = inner.get("servers").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+                    let ready = servers.iter().filter(|s| {
+                        s.pointer("/session/status").and_then(|x| x.as_str()) == Some("ready")
+                    }).count();
+                    format!("servers={} ready={}", servers.len(), ready)
+                }
+                Err(e) => format!("err={e}"),
+            };
+            check(
+                "mcp-list-bridge",
+                mcp_resp.is_ok() && mcp_detail.starts_with("servers=") && !mcp_detail.contains("servers=0 "),
+                mcp_detail,
+                &mut summary,
+                &mut fail,
+            );
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();
