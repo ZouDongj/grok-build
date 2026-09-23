@@ -747,6 +747,63 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
+            // --- /compact: ext must wait for the REAL compaction turn ---
+            // session/compact only accepts (instant {state:"accepted"}) and
+            // runs "/compact" as a background prompt turn; during it the
+            // kernel rejects session/send with -32010. A prompt fired 1s in
+            // must be queued and answered AFTER compaction — not lost and
+            // not "answered" by the kernel's "Compacted" text.
+            {
+                seen.borrow_mut().current_text.borrow_mut().clear();
+                let cx_tx = client.tx.clone();
+                let cx_sid = sid.clone();
+                let compact_task = tokio::task::spawn_local(async move {
+                    let t0 = std::time::Instant::now();
+                    let resp = acp_send(
+                        acp::ExtRequest::new(
+                            "x.ai/compact_conversation",
+                            serde_json::value::to_raw_value(&serde_json::json!({
+                                "sessionId": cx_sid.0,
+                            }))
+                            .expect("serialize compact verify req")
+                            .into(),
+                        ),
+                        &cx_tx,
+                    )
+                    .await;
+                    (t0.elapsed(), resp.is_ok())
+                });
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let queued_turn = acp_send(
+                    acp::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "1+1等于几？只回答阿拉伯数字。".to_string(),
+                        ))],
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let (compact_elapsed, compact_ok) = compact_task.await.unwrap_or_default();
+                let text_after = seen.borrow().current_text.borrow().clone();
+                check(
+                    "compact-waits-for-real-completion",
+                    compact_ok && compact_elapsed.as_secs() >= 5,
+                    format!("compact ext returned after {compact_elapsed:?} (ok={compact_ok}) — must be the real turn, not the instant accept"),
+                    &mut summary,
+                    &mut fail,
+                );
+                check(
+                    "compact-mid-prompt-queued-and-answered",
+                    matches!(&queued_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn)
+                        && text_after.contains("Compacted")
+                        && text_after.contains('2'),
+                    format!("queued turn end={:?}, captured text: {:?}", queued_turn.as_ref().map(|r| format!("{:?}", r.stop_reason)).map_err(|e| e.to_string()), &text_after[..text_after.len().min(60)]),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
             let ij_tx = client.tx.clone();

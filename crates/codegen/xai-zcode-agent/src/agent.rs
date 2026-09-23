@@ -63,6 +63,17 @@ struct SessionState {
     /// ACP id until an in-place rewind forks the conversation at an earlier
     /// message; the forked id takes over while the pager keeps its id.
     kernel_id: RefCell<String>,
+    /// True while a kernel compaction turn runs. session/compact only
+    /// ACCEPTS the job (returns {state:"accepted"} instantly) and runs
+    /// "/compact" as a background prompt turn; during it the kernel
+    /// rejects session/send with -32010 "A prompt is already running".
+    compacting: std::cell::Cell<bool>,
+    /// Turn id of the running compaction turn (turn.started with
+    /// input "/compact" and inputVisibility "model-only").
+    compact_turn_id: RefCell<Option<String>>,
+    /// Resolved when the compaction turn ends — x.ai/compact_conversation
+    /// awaits this so the pager's "compaction complete" is real.
+    compact_wait: RefCell<Option<oneshot::Sender<Result<(), String>>>>,
     /// Subagent lifecycle broadcast state: child id -> (spawn_announced,
     /// finished_announced). Driven natively by the kernel's
     /// `subagent.lifecycle` events on the parent stream; the
@@ -89,6 +100,9 @@ impl SessionState {
             next_tool: std::cell::Cell::new(0),
             pending_continuation: RefCell::new(None),
             fail_grace_cancel: RefCell::new(None),
+            compacting: std::cell::Cell::new(false),
+            compact_turn_id: RefCell::new(None),
+            compact_wait: RefCell::new(None),
             cwd: RefCell::new(String::new()),
             kernel_id: RefCell::new(String::new()),
             subagents: RefCell::new(HashMap::new()),
@@ -1691,21 +1705,68 @@ impl acp::Agent for ZcodeAgent {
         if !attachments.is_empty() {
             debug_log(&format!("prompt: {} image attachment(s)", attachments.len()));
         }
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         *state.turn_done.borrow_mut() = Some(tx);
         state.cancelled.set(false);
         state.streamed_text.set(false);
-        spawn_subagent_poller(&self.gateway, kernel.clone(), state.clone(), args.session_id.clone());
-        // The host-pushed account snapshot decays when the kernel re-asserts
-        // its registry against the builtin revision — re-push before sends.
-        self.push_account_config(&kernel).await;
-        kernel
-            .request(
-                "session/send",
-                kernel::send_params_with_attachments(&state.kernel_id.borrow(), &text, &attachments),
-            )
-            .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
-        let stop = rx.await.unwrap_or(acp::StopReason::EndTurn);
+        // Compaction in flight: the kernel rejects concurrent sends with
+        // -32010 "A prompt is already running" (the compact turn IS a
+        // prompt). Queue as a continuation — it is sent the moment the
+        // compaction turn ends (handle_event drains it). One queued prompt
+        // only: a second would overwrite the first's armed turn_done.
+        let stop = if state.compacting.get() {
+            if state.pending_continuation.borrow().is_some() {
+                *state.turn_done.borrow_mut() = None;
+                return Err(acp::Error::invalid_request().data(
+                    "another prompt is already queued behind the running compaction",
+                ));
+            }
+            if !attachments.is_empty() {
+                *state.turn_done.borrow_mut() = None;
+                return Err(acp::Error::invalid_request()
+                    .data("compaction in progress; resend the image afterwards"));
+            }
+            debug_log("prompt: queued behind running compaction");
+            *state.pending_continuation.borrow_mut() = Some(text);
+            rx.await.unwrap_or(acp::StopReason::EndTurn)
+        } else {
+            spawn_subagent_poller(&self.gateway, kernel.clone(), state.clone(), args.session_id.clone());
+            // The host-pushed account snapshot decays when the kernel re-asserts
+            // its registry against the builtin revision — re-push before sends.
+            self.push_account_config(&kernel).await;
+            let send_rx = kernel
+                .request(
+                    "session/send",
+                    kernel::send_params_with_attachments(&state.kernel_id.borrow(), &text, &attachments),
+                )
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            // The send RPC answers only at turn end — EXCEPT when the kernel
+            // rejects it outright (-32010 during compaction, bad state). Watch
+            // both channels concurrently: an early rejection fails this turn
+            // explicitly (the old code dropped the receiver and parked until
+            // an unrelated turn's completion event resolved it, losing the
+            // prompt).
+            tokio::select! {
+                sent = send_rx => match sent {
+                    Ok(Err(rejection)) => {
+                        *state.turn_done.borrow_mut() = None;
+                        notify(
+                            &self.gateway,
+                            &args.session_id,
+                            acp::SessionUpdate::AgentMessageChunk(text_chunk(format!(
+                                "prompt rejected by kernel: {rejection}"
+                            ))),
+                        );
+                        return Err(acp::Error::internal_error().data(rejection));
+                    }
+                    // RPC resolved at turn end — the turn.completed event (or
+                    // a sibling) fires turn_done; fall through to it for the
+                    // real stop reason, with a direct resolve as backstop.
+                    _ => rx.await.unwrap_or(acp::StopReason::EndTurn),
+                },
+                stop = &mut rx => stop.unwrap_or(acp::StopReason::EndTurn),
+            }
+        };
         debug_log(&format!("acp: prompt done stop={stop:?}"));
         // Turn-end broadcast (MvpAgent parity): the pager's queue rail
         // finalizes a running turn from `x.ai/session/prompt_complete`, not
@@ -2460,7 +2521,12 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize session messages");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
-            // /compact: the kernel folds the transcript itself.
+            // /compact: the kernel folds the transcript itself — but
+            // session/compact only ACCEPTS the job ({state:"accepted"} in
+            // ~300ms) and runs "/compact" as a background prompt turn that
+            // can take minutes. Await the turn's real completion so the
+            // pager's "compaction complete" banner and elapsed time are
+            // honest; a send rejection would be a lie (the old bug).
             "x.ai/compact_conversation" => {
                 let params: Value =
                     serde_json::from_str(args.params.get()).unwrap_or(json!({}));
@@ -2469,6 +2535,15 @@ impl acp::Agent for ZcodeAgent {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+                let acp_sid = acp::SessionId::new(id.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&acp_sid)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
                 if !id.starts_with("sess_") {
                     return Err(acp::Error::invalid_params().data("bad sessionId"));
                 }
@@ -2477,15 +2552,59 @@ impl acp::Agent for ZcodeAgent {
                 if let Some(ctx) = params.get("userContext").and_then(Value::as_str) {
                     payload["instructions"] = json!(ctx);
                 }
-                kernel
+                // Register the waiter BEFORE calling: the kernel fires the
+                // background turn before the RPC response lands, and an
+                // instant compaction could complete inside that window.
+                let (wtx, wrx) = oneshot::channel::<Result<(), String>>();
+                state.compacting.set(true);
+                *state.compact_wait.borrow_mut() = Some(wtx);
+                let result = kernel
                     .call("session/compact", payload)
                     .await
                     .map_err(|e| {
+                        state.compacting.set(false);
+                        *state.compact_wait.borrow_mut() = None;
                         acp::Error::internal_error().data(format!("compact failed: {e}"))
                     })?;
-                let raw = serde_json::value::to_raw_value(&json!({}))
-                    .expect("serialize compact ack");
-                return Ok(acp::ExtResponse::new(raw.into()));
+                let accepted = result
+                    .pointer("/compact/state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("accepted")
+                    == "accepted"
+                    || result
+                        .pointer("/compact/state")
+                        .and_then(Value::as_str)
+                        == Some("already_running");
+                if !accepted {
+                    state.compacting.set(false);
+                    *state.compact_wait.borrow_mut() = None;
+                    let raw = serde_json::value::to_raw_value(&json!({}))
+                        .expect("serialize compact ack");
+                    return Ok(acp::ExtResponse::new(raw.into()));
+                }
+                return match tokio::time::timeout(
+                    std::time::Duration::from_secs(300),
+                    wrx,
+                )
+                .await
+                {
+                    Ok(Ok(Ok(()))) => {
+                        let raw = serde_json::value::to_raw_value(&json!({}))
+                            .expect("serialize compact ack");
+                        Ok(acp::ExtResponse::new(raw.into()))
+                    }
+                    Ok(Ok(Err(msg))) => Err(acp::Error::internal_error()
+                        .data(format!("compaction failed: {msg}"))),
+                    Ok(Err(_)) => Err(acp::Error::internal_error()
+                        .data("compaction state lost (session closed?)")),
+                    Err(_) => {
+                        // Timed out: clear the flag so prompts stop queueing;
+                        // a late completion falls through to normal handling.
+                        state.compacting.set(false);
+                        Err(acp::Error::internal_error()
+                            .data("compaction timed out after 300s"))
+                    }
+                }
             }
             // Session fork: kernel sessionFork clones at the latest checkpoint.
             "x.ai/session/fork" => {
@@ -2984,6 +3103,60 @@ fn handle_event(
         handle_subagent_lifecycle(gateway, &state, &acp_session, payload);
         return;
     }
+    // Compaction turns (manual session/compact OR kernel-initiated) start as
+    // normal-looking turns whose input is "/compact" with model-only
+    // visibility. Track them so their completion can't be mistaken for the
+    // user's turn and prompts sent meanwhile can be queued.
+    if event.kind == "turn.started" {
+        if event
+            .input
+            .as_deref()
+            .is_some_and(|input| input.starts_with("/compact"))
+        {
+            state.compacting.set(true);
+            *state.compact_turn_id.borrow_mut() = event.turn_id.clone();
+            debug_log(&format!(
+                "compaction turn started: {:?}",
+                event.turn_id.as_deref().map(|t| &t[..t.len().min(24)])
+            ));
+        }
+        return;
+    }
+    // End of a compaction turn: fire the compact waiter, refresh the context
+    // meter (usage drops), and drain any prompt queued while compacting.
+    // Never finish_turn here — no user turn is in flight (prompts sent during
+    // compaction are queued, and the kernel rejects concurrent sends with
+    // -32010), so resolving one would fake an answer like the old bug did.
+    let is_compact_turn_end = state.compacting.get()
+        && event.turn_id.is_some()
+        && (event.turn_id == *state.compact_turn_id.borrow()
+            || (state.compact_turn_id.borrow().is_none()
+                && state.turn_done.borrow().is_none()));
+    if is_compact_turn_end && (event.kind == "turn.completed" || event.kind == "turn.failed") {
+        state.compacting.set(false);
+        *state.compact_turn_id.borrow_mut() = None;
+        let outcome = if event.kind == "turn.completed" {
+            Ok(())
+        } else {
+            Err(event.output.clone().unwrap_or_else(|| "compaction failed".into()))
+        };
+        if let Some(waiter) = state.compact_wait.borrow_mut().take() {
+            let _ = waiter.send(outcome);
+        }
+        if event.kind == "turn.completed" {
+            // The kernel's final "Compacted" text lands as a normal message.
+            if let Some(response) = event.output.as_deref().filter(|t| !t.is_empty()) {
+                notify(
+                    gateway,
+                    &acp_session,
+                    acp::SessionUpdate::AgentMessageChunk(text_chunk(response)),
+                );
+            }
+            push_context_usage(gateway, shared, &state, &acp_session);
+            drain_pending_continuation(shared, &acp_session);
+        }
+        return;
+    }
     // Any activity after a turn.failed means the kernel is retrying the turn:
     // cancel the pending grace termination.
     if let Some(cancel) = state.fail_grace_cancel.borrow_mut().take() {
@@ -3109,8 +3282,17 @@ fn drain_pending_continuation(shared: &Rc<Shared>, session: &acp::SessionId) {
     debug_log(&format!("plan continuation: {} chars", text.len()));
     state.streamed_text.set(false);
     let kernel_sid = state.kernel_id.borrow().clone();
-    if let Err(error) = kernel.request("session/send", kernel::send_params(&kernel_sid, &text)) {
-        tracing::warn!(%error, "plan continuation send failed");
+    match kernel.request("session/send", kernel::send_params(&kernel_sid, &text)) {
+        Ok(mut rx) => {
+            tokio::task::spawn_local(async move {
+                if let Ok(Err(rejection)) = rx.await {
+                    debug_log(&format!("continuation send rejected: {rejection}"));
+                }
+            });
+        }
+        Err(error) => {
+            tracing::warn!(%error, "plan continuation send failed");
+        }
     }
 }
 

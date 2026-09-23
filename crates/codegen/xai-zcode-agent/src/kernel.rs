@@ -73,6 +73,11 @@ pub struct TurnEvent {
     pub tool_name: Option<String>,
     pub output: Option<String>,
     pub success: Option<bool>,
+    /// Turn attribution (lifted from params level for turn-level events) —
+    /// lets handlers tell a background /compact turn from the user's turn.
+    pub turn_id: Option<String>,
+    /// The literal input that started the turn ("/compact" for compaction).
+    pub input: Option<String>,
 }
 
 impl TurnEvent {
@@ -94,6 +99,8 @@ impl TurnEvent {
                 .map(str::to_string)
                 .or_else(|| str_field("response")),
             success: payload.pointer("/result/success").and_then(Value::as_bool),
+            turn_id: str_field("turnId"),
+            input: str_field("input"),
         })
     }
 }
@@ -211,6 +218,15 @@ impl Kernel {
                                 .unwrap_or_else(|| serde_json::json!({}));
                             if payload.get("kind").is_none() {
                                 payload["kind"] = Value::String(kind.clone());
+                            }
+                            // Turn-level events (turn.started/completed) carry
+                            // their turnId at params level — lift it into the
+                            // payload so handlers can attribute events to
+                            // specific turns (e.g. background /compact turns).
+                            if payload.get("turnId").is_none() {
+                                if let Some(turn_id) = params.get("turnId") {
+                                    payload["turnId"] = turn_id.clone();
+                                }
                             }
                             let send = tx.send(KernelMessage::Event {
                                 session_id: params
