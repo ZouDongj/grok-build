@@ -32,6 +32,15 @@ zgrok = xAI grok-build TUI（前端 100% 原生）+ ZCode 内核（0.16.9+，app
 - 每内核启动会实时拉 V4 签名门控；凭据解密失败会以"身份验证失败"形式出现在握手层
   （agent 的 decrypt_credential 负责 enc:v1 AES-GCM 解封）。
 
+## /compact 的真实语义（2026-09-23 修复）
+
+内核 `session/compact` 是**异步受理**：~300ms 返回 `{state:"accepted"}`，真正的压缩
+作为后台 prompt 回合（`turn.started` 带 `input:"/compact"`、model-only 可见性）跑几秒
+到几分钟；期间 `session/send` 被拒 `-32010 "A prompt is already running"`。zgrok 侧：
+ext 等待压缩回合真实完成才回 Ok；压缩中的 prompt 排队为 continuation，压缩结束自动
+发出；send 的早期拒绝显式报错（不再吞掉让压缩回合冒充回答）。识别依据 turnId
+（pump 已把 params.turnId 提升进事件 payload）。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
