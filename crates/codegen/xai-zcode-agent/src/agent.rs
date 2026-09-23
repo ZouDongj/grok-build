@@ -76,6 +76,24 @@ struct SessionState {
     /// terminal event can't be mistaken for ours.
     v4_awaiting_turn_start: std::cell::Cell<bool>,
     v4_owned_turn: RefCell<Option<String>>,
+    /// v4 conversation projection: latest snapshot revision + logEpoch
+    /// (CAS tokens for editUserQuery and other row-targeting commands).
+    v4_revision: std::cell::Cell<u64>,
+    v4_log_epoch: RefCell<Option<String>>,
+    /// Bumped on every v4 snapshot frame — lets callers await freshness.
+    v4_snapshot_count: std::cell::Cell<u64>,
+    /// realUser userInput rows in conversation order: (rowId, entityId,
+    /// turnId, text) — rewind targets.
+    v4_user_rows: RefCell<Vec<(i64, String, String, String)>>,
+    /// assistantText rows in order: (rowId, entityId, turnId, state) —
+    /// forkAssistant targets for deep rewind.
+    v4_assistant_rows: RefCell<Vec<(i64, String, String, String)>>,
+    /// Kernel-authoritative queue state from the v4 projection (raw items).
+    v4_queue_items: RefCell<Vec<(String, String)>>,
+    /// True when the RUNNING compaction turn was started by our
+    /// x.ai/compact_conversation ext (the pager already shows its Command
+    /// state — banners are only for KERNEL-initiated auto compaction).
+    compact_by_ext: std::cell::Cell<bool>,
     /// True while a kernel compaction turn runs. session/compact only
     /// ACCEPTS the job (returns {state:"accepted"} instantly) and runs
     /// "/compact" as a background prompt turn; during it the kernel
@@ -116,8 +134,15 @@ impl SessionState {
             turn_epoch: std::cell::Cell::new(0),
             v4_awaiting_turn_start: std::cell::Cell::new(false),
             v4_owned_turn: RefCell::new(None),
+            v4_revision: std::cell::Cell::new(0),
+            v4_log_epoch: RefCell::new(None),
+            v4_snapshot_count: std::cell::Cell::new(0),
+            v4_user_rows: RefCell::new(Vec::new()),
+            v4_assistant_rows: RefCell::new(Vec::new()),
+            v4_queue_items: RefCell::new(Vec::new()),
             fail_grace_cancel: RefCell::new(None),
             compacting: std::cell::Cell::new(false),
+            compact_by_ext: std::cell::Cell::new(false),
             compact_turn_id: RefCell::new(None),
             compact_wait: RefCell::new(None),
             cwd: RefCell::new(String::new()),
@@ -469,6 +494,31 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                         handle_server_request(&pump_gateway, &pump_shared, &id, &method, params)
                             .await;
                         debug_log(&format!("pump: server request {method} answered"));
+                    }
+                    KernelMessage::V4Frame(params) => {
+                        // Wire envelope: {wireVersion, kind, frame: {topic,
+                        // payload: {kind: snapshot|deltas, ...}}} — unwrap.
+                        let frame = params.get("frame").unwrap_or(&params);
+                        if let Some(acp_sid) = frame
+                            .get("topic")
+                            .and_then(Value::as_str)
+                            .and_then(|t| t.strip_prefix("conversation/"))
+                        {
+                            let session_key = acp::SessionId::new(acp_sid.to_string());
+                            let state = pump_shared.state.borrow().sessions.get(&session_key).cloned();
+                            if let Some(state) = state {
+                                let queue_before = state.v4_queue_items.borrow().clone();
+                                update_v4_projection(&state, frame);
+                                let queue_after = state.v4_queue_items.borrow().clone();
+                                if queue_before != queue_after {
+                                    let rows: Vec<(String, &str, String)> = queue_after
+                                        .iter()
+                                        .map(|(id, text)| (id.clone(), "prompt", text.clone()))
+                                        .collect();
+                                    broadcast_queue(&pump_gateway, acp_sid, &rows, None);
+                                }
+                            }
+                        }
                     }
                     KernelMessage::StateUpdated(params) => {
                         // The full model catalog (all official models, not
@@ -1574,6 +1624,9 @@ impl acp::Agent for ZcodeAgent {
         let state = Rc::new(SessionState::new());
         *state.cwd.borrow_mut() = cwd.to_string_lossy().to_string();
         *state.kernel_id.borrow_mut() = session_id.clone();
+        // v4 conversation projection: CAS tokens + rows for editUserQuery
+        // (rewind) and the kernel-authoritative queue.
+        v4_subscribe(&kernel, &session_id);
         self.shared
             .state
             .borrow_mut()
@@ -1609,6 +1662,7 @@ impl acp::Agent for ZcodeAgent {
         if let Some((provider, model)) = load_model_preference() {
             set_model_with_retry(&kernel, &session_id, &provider, &model).await;
         }
+        v4_subscribe(&kernel, &session_id);
         self.shared
             .state
             .borrow_mut()
@@ -1827,24 +1881,35 @@ impl acp::Agent for ZcodeAgent {
                 return Err(acp::Error::invalid_request()
                     .data("compaction in progress; resend the image afterwards"));
             }
+            // The kernel queue (v4 sendText queue) WEDGES when the running
+            // turn is a COMPACTION turn (empirically verified: the queued
+            // item never drains and the compact completion stalls) — the
+            // official compact-reentry route is the runtime-internal
+            // steerTurn. Use the agent-local continuation slot here; the
+            // kernel queue stays available for regular turns.
+            {
+            let kernel_queue = false;
             debug_log("prompt: queued behind running compaction");
             *state.pending_continuation.borrow_mut() = Some(text.clone());
             // Server-queue snapshot: the queued row must be visible to the
             // pager (and reconciled away when delivered).
-            let prompt_id = args
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("promptId"))
-                .and_then(Value::as_str)
-                .unwrap_or("queued-prompt")
-                .to_string();
-            broadcast_queue(
-                &self.gateway,
-                &args.session_id.0,
-                &[(prompt_id, "prompt", text)],
-                None,
-            );
+            if !kernel_queue {
+                let prompt_id = args
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("promptId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("queued-prompt")
+                    .to_string();
+                broadcast_queue(
+                    &self.gateway,
+                    &args.session_id.0,
+                    &[(prompt_id, "prompt", text)],
+                    None,
+                );
+            }
             rx.await.unwrap_or(acp::StopReason::EndTurn)
+            }
         } else {
             spawn_subagent_poller(&self.gateway, kernel.clone(), state.clone(), args.session_id.clone());
             // The host-pushed account snapshot decays when the kernel re-asserts
@@ -2714,6 +2779,93 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize session messages");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // Session-level followup delivery default (v4): queue or
+            // guide — how mid-turn inputs are admitted by default.
+            "x.ai/session/set_followup_mode" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                let mode = params.get("mode").and_then(Value::as_str).unwrap_or("guide").to_string();
+                let acp_sid = acp::SessionId::new(id.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&acp_sid)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let kernel = self.kernel()?;
+                let kernel_sid = state.kernel_id.borrow().clone();
+                let cas = Some((
+                    state.v4_revision.get(),
+                    state.v4_log_epoch.borrow().clone().unwrap_or_else(|| "unknown".to_string()),
+                ));
+                let ack = v4_command(&kernel, &kernel_sid, "setFollowupMode", json!({"mode": mode}), cas)
+                    .await
+                    .map_err(|e| acp::Error::internal_error().data(format!("setFollowupMode failed: {e}")))?;
+                let body = json!({"status": ack.get("status"), "mode": mode});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize followup ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Diagnostic: the agent's v4 conversation projection (rows,
+            // CAS tokens) — used by probes and troubleshooting.
+            "x.ai/v4/projection" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let refresh = params.get("refresh").and_then(Value::as_bool).unwrap_or(false);
+                let id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                let acp_sid = acp::SessionId::new(id.clone());
+                if refresh {
+                    if let (Some(state), Some(kernel)) = (
+                        self.shared.state.borrow().sessions.get(&acp_sid).cloned(),
+                        self.shared.state.borrow().kernel.clone(),
+                    ) {
+                        let kernel_sid = state.kernel_id.borrow().clone();
+                        let before = state.v4_snapshot_count.get();
+                        v4_subscribe(&kernel, &kernel_sid);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(3);
+                        while state.v4_snapshot_count.get() <= before
+                            && std::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&acp_sid)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let users: Vec<Value> = state
+                    .v4_user_rows
+                    .borrow()
+                    .iter()
+                    .map(|(rid, eid, tid, text)| json!({"rowId": rid, "entityId": eid, "turnId": tid, "text": text.chars().take(40).collect::<String>()}))
+                    .collect();
+                let assistants: Vec<Value> = state
+                    .v4_assistant_rows
+                    .borrow()
+                    .iter()
+                    .map(|(rid, eid, tid, st)| json!({"rowId": rid, "entityId": eid, "turnId": tid, "state": st}))
+                    .collect();
+                let body = json!({
+                    "sessionId": id,
+                    "revision": state.v4_revision.get(),
+                    "logEpoch": state.v4_log_epoch.borrow().clone(),
+                    "userRows": users,
+                    "assistantRows": assistants,
+                    "queueItems": state.v4_queue_items.borrow().len(),
+                });
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize projection");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // v4/command passthrough: the kernel ships a parallel v4
             // command surface (sendText with requestedDelivery
             // startNow/queue/guide, editUserQuery rewind, queue ops) on
@@ -2769,6 +2921,7 @@ impl acp::Agent for ZcodeAgent {
                 // instant compaction could complete inside that window.
                 let (wtx, wrx) = oneshot::channel::<Result<(), String>>();
                 state.compacting.set(true);
+                state.compact_by_ext.set(true);
                 *state.compact_wait.borrow_mut() = Some(wtx);
                 let result = kernel
                     .call("session/compact", payload)
@@ -2863,18 +3016,164 @@ impl acp::Agent for ZcodeAgent {
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
             "x.ai/rewind/execute" => {
-                // The kernel's wire surface exposes no conversation-
-                // truncating rewind: session/fork (message/turn targets)
-                // was verified empirically to retain the full message
-                // ledger, so the forked model still sees post-target turns.
-                // The real rewindToMessage is an internal runtime command
-                // without an app-server method. Until a ledger-surgery
-                // implementation lands, answer explicitly instead of
-                // pretending.
-                let _ = args.params.get();
-                return Err(acp::Error::method_not_found().data(
-                    "rewind execute: kernel exposes no truncating rewind (fork keeps the full ledger); tracked for ledger-surgery implementation",
-                ));
+                // Truncating rewind on the v4 surface. The pager contract:
+                // truncate server-side to BEFORE the target prompt, do NOT
+                // re-run anything (the pager truncates its own scrollback,
+                // prefills the composer from promptText, the user resends).
+                //
+                // Mapping (kernel primitives): target N >= 1 forks at the
+                // assistant row ending turn N-1 — the fork contains exactly
+                // prompts 0..N-1 with their responses (verified: post-target
+                // turns absent). target 0 starts a fresh empty session.
+                // Both swap kernel_id behind the same ACP session id.
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let target_index = params
+                    .get("targetPromptIndex")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let acp_sid = acp::SessionId::new(id.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&acp_sid)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let kernel = self.kernel()?;
+                // Fresh projection (CAS tokens + rows).
+                let kernel_sid = state.kernel_id.borrow().clone();
+                {
+                    let before = state.v4_snapshot_count.get();
+                    v4_subscribe(&kernel, &kernel_sid);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while state.v4_snapshot_count.get() <= before
+                        && std::time::Instant::now() < deadline
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                let user_rows = state.v4_user_rows.borrow().clone();
+                let Some((_row_id, _entity, _turn, target_text)) = user_rows.get(target_index).cloned() else {
+                    let body = json!({
+                        "success": false,
+                        "targetPromptIndex": target_index,
+                        "mode": "conversation_only",
+                        "error": format!("rewind target {} not found ({} user rows)", target_index, user_rows.len()),
+                    });
+                    let raw = serde_json::value::to_raw_value(&body)
+                        .expect("serialize rewind miss");
+                    return Ok(acp::ExtResponse::new(raw.into()));
+                };
+                let new_kernel_sid: String = if target_index == 0 {
+                    // Rewind to the very start: a fresh empty session in the
+                    // same workspace.
+                    let cwd = state.cwd.borrow().clone();
+                    let created = kernel
+                        .call("session/create", kernel::create_params(std::path::Path::new(&cwd)))
+                        .await
+                        .map_err(|e| acp::Error::internal_error().data(format!("rewind fresh create failed: {e}")))?;
+                    let fresh_sid = kernel::session_id_from(&created).unwrap_or_default();
+                    kernel
+                        .call("session/subscribe", kernel::subscribe_params(&fresh_sid))
+                        .await
+                        .map_err(|e| acp::Error::internal_error().data(format!("rewind fresh subscribe failed: {e}")))?;
+                    fresh_sid
+                } else {
+                    // Fork at the last assistant row of turn N-1.
+                    let prev_turn = user_rows.get(target_index - 1).map(|(_, _, tid, _)| tid.clone()).unwrap_or_default();
+                    let fork_target = state
+                        .v4_assistant_rows
+                        .borrow()
+                        .iter()
+                        .filter(|(_, _, tid, _)| *tid == prev_turn)
+                        .next_back()
+                        .map(|(rid, eid, _, _)| (*rid, eid.clone()));
+                    let Some((row_id, entity_id)) = fork_target else {
+                        let body = json!({
+                            "success": false,
+                            "targetPromptIndex": target_index,
+                            "mode": "conversation_only",
+                            "error": "no assistant row before the rewind target",
+                        });
+                        let raw = serde_json::value::to_raw_value(&body)
+                            .expect("serialize rewind miss");
+                        return Ok(acp::ExtResponse::new(raw.into()));
+                    };
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let envelope = json!({
+                        "commandId": format!("zgrok-rewind-{now_ms}"),
+                        "clientId": "zgrok",
+                        "sessionId": kernel_sid,
+                        "baseRevision": state.v4_revision.get(),
+                        "baseLogEpoch": state.v4_log_epoch.borrow().clone().unwrap_or_else(|| "unknown".to_string()),
+                        "type": "forkAssistant",
+                        "payload": {"target": {"rowId": row_id, "entityId": entity_id}},
+                        "issuedAt": now_ms,
+                    });
+                    let ack = kernel
+                        .call("v4/command", envelope)
+                        .await
+                        .map_err(|e| acp::Error::internal_error().data(format!("forkAssistant failed: {e}")))?;
+                    if ack.get("status").and_then(Value::as_str) != Some("accepted") {
+                        let body = json!({
+                            "success": false,
+                            "targetPromptIndex": target_index,
+                            "mode": "conversation_only",
+                            "error": format!("forkAssistant {}: {}", ack.get("status").and_then(Value::as_str).unwrap_or("?"), ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?")),
+                        });
+                        let raw = serde_json::value::to_raw_value(&body)
+                            .expect("serialize rewind miss");
+                        return Ok(acp::ExtResponse::new(raw.into()));
+                    }
+                    let fork_sid = ack
+                        .pointer("/result/sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    // The fork needs its own legacy event subscription too
+                    // (turn events ride session/event per session).
+                    if fork_sid.starts_with("sess_") {
+                        let _ = kernel
+                            .call("session/subscribe", kernel::subscribe_params(&fork_sid))
+                            .await;
+                    }
+                    fork_sid
+                };
+                if !new_kernel_sid.starts_with("sess_") {
+                    return Err(acp::Error::internal_error().data("rewind swap got no session id"));
+                }
+                // Swap the kernel session behind the same ACP id and re-arm
+                // the v4 projection on the new topic.
+                *state.kernel_id.borrow_mut() = new_kernel_sid.clone();
+                *state.v4_log_epoch.borrow_mut() = None;
+                *state.v4_user_rows.borrow_mut() = Vec::new();
+                *state.v4_assistant_rows.borrow_mut() = Vec::new();
+                state.v4_revision.set(0);
+                v4_subscribe(&kernel, &new_kernel_sid);
+                write_summary_stub(&new_kernel_sid, &state.cwd.borrow());
+                debug_log(&format!("rewind execute idx={target_index} -> {new_kernel_sid}"));
+                let body = json!({
+                    "success": true,
+                    "targetPromptIndex": target_index,
+                    "mode": "conversation_only",
+                    "promptText": target_text,
+                });
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize rewind result");
+                return Ok(acp::ExtResponse::new(raw.into()));
             }
             // Mid-turn "send now": the pager queues a follow-up client-side
             // and force-sends it via this method. The kernel's sendText has
@@ -3003,6 +3302,74 @@ impl acp::Agent for ZcodeAgent {
             _ => {}
         }
         Err(acp::Error::method_not_found())
+    }
+
+    /// Fire-and-forget pager notifications. The queue pane's edit
+    /// operations ride x.ai/queue/* notifications (no response expected)
+    /// and map 1:1 onto the kernel's v4 queue commands.
+    async fn ext_notification(&self, args: acp::ExtNotification) -> acp::Result<()> {
+        let params: Value = serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+        let Some(session_id) = params.get("sessionId").and_then(Value::as_str).map(str::to_string) else {
+            return Ok(());
+        };
+        let acp_sid = acp::SessionId::new(session_id.clone());
+        let Some(state) = self.shared.state.borrow().sessions.get(&acp_sid).cloned() else {
+            return Ok(());
+        };
+        let Some(kernel) = self.shared.state.borrow().kernel.clone() else {
+            return Ok(());
+        };
+        let kernel_sid = state.kernel_id.borrow().clone();
+        match args.method.as_ref() {
+            "x.ai/queue/remove" => {
+                let Some(id) = params.get("id").and_then(Value::as_str) else { return Ok(()) };
+                let _ = v4_command(&kernel, &kernel_sid, "deleteQueueItem", json!({"queueItemId": id}), None).await;
+            }
+            "x.ai/queue/edit" => {
+                let (Some(id), Some(text)) = (
+                    params.get("id").and_then(Value::as_str),
+                    params.get("newText").and_then(Value::as_str),
+                ) else {
+                    return Ok(());
+                };
+                let _ = v4_command(&kernel, &kernel_sid, "editQueueItem", json!({"queueItemId": id, "newText": text}), None).await;
+            }
+            "x.ai/queue/reorder" => {
+                let Some(ordered) = params.get("orderedIds").and_then(Value::as_array) else { return Ok(()) };
+                // Rebuild the order by moving each item to the end in the
+                // desired sequence (beforeQueueItemId=null → tail).
+                for id in ordered {
+                    let Some(id) = id.as_str() else { continue };
+                    let _ = v4_command(&kernel, &kernel_sid, "reorderQueueItem", json!({"queueItemId": id, "beforeQueueItemId": null}), None).await;
+                }
+            }
+            "x.ai/queue/clear" => {
+                let ids: Vec<String> = state
+                    .v4_queue_items
+                    .borrow()
+                    .iter()
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in ids {
+                    let _ = v4_command(&kernel, &kernel_sid, "deleteQueueItem", json!({"queueItemId": id}), None).await;
+                }
+            }
+            "x.ai/queue/interject" => {
+                // Insert a new queued prompt (after-positioning degrades to
+                // append; the kernel queue delivers when the turn ends).
+                let text = params
+                    .get("newText")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !text.trim().is_empty() {
+                    let _ = v4_send_text(&kernel, &kernel_sid, &text, "queue").await;
+                }
+            }
+            // Local edit locks (hold/release) have no kernel counterpart.
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -3159,6 +3526,35 @@ fn broadcast_queue(
     }
 }
 
+/// Submit one v4/command envelope. Returns the ack object.
+async fn v4_command(
+    kernel: &Kernel,
+    session_id: &str,
+    command_type: &str,
+    payload: Value,
+    cas: Option<(u64, String)>,
+) -> Result<Value, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    static COMMAND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COMMAND_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let mut envelope = json!({
+        "commandId": format!("zgrok-{now_ms}-{seq}"),
+        "clientId": "zgrok",
+        "sessionId": session_id,
+        "type": command_type,
+        "payload": payload,
+        "issuedAt": now_ms,
+    });
+    if let Some((revision, log_epoch)) = cas {
+        envelope["baseRevision"] = json!(revision);
+        envelope["baseLogEpoch"] = json!(log_epoch);
+    }
+    kernel.call("v4/command", envelope).await
+}
+
 /// Build a v4/command sendText envelope and submit it. The kernel's v4
 /// surface accepts requestedDelivery startNow (atomic preempt of the
 /// running turn), queue (deliver after the turn) and guide (inject into
@@ -3170,24 +3566,179 @@ async fn v4_send_text(
     text: &str,
     requested_delivery: &str,
 ) -> Result<Value, String> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    static COMMAND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let seq = COMMAND_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    let envelope = json!({
-        "commandId": format!("zgrok-{now_ms}-{seq}"),
-        "clientId": "zgrok",
-        "sessionId": session_id,
-        "type": "sendText",
-        "payload": {
+    v4_command(
+        kernel,
+        session_id,
+        "sendText",
+        json!({
             "text": text,
             "requestedDelivery": requested_delivery,
-        },
-        "issuedAt": now_ms,
-    });
-    kernel.call("v4/command", envelope).await
+        }),
+        None,
+    )
+    .await
+}
+
+/// Fold one v4 conversation frame (snapshot or deltas) into the session's
+/// projection state. Snapshots are authoritative; deltas opportunistically
+/// refresh the CAS tokens and queue — anything unparsed keeps the last
+/// snapshot's values (rewind re-subscribes for freshness anyway).
+fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
+    let payload = frame.pointer("/payload").unwrap_or(&Value::Null);
+    match payload.get("kind").and_then(Value::as_str) {
+        Some("snapshot") => {
+            let Some(snapshot) = payload.get("snapshot") else { return };
+            if let Some(rev) = snapshot.get("revision").and_then(Value::as_u64) {
+                state.v4_revision.set(rev);
+            }
+            if let Some(epoch) = snapshot.get("logEpoch").and_then(Value::as_str) {
+                *state.v4_log_epoch.borrow_mut() = Some(epoch.to_string());
+            }
+            state.v4_snapshot_count.set(state.v4_snapshot_count.get() + 1);
+            let mut rows = Vec::new();
+            if let Some(arr) = snapshot.pointer("/rows/window").and_then(Value::as_array) {
+                for row in arr {
+                    if row.get("kind").and_then(Value::as_str) != Some("userInput") {
+                        continue;
+                    }
+                    if row.get("origin").and_then(Value::as_str) != Some("realUser") {
+                        continue;
+                    }
+                    let Some(row_id) = row.get("rowId").and_then(Value::as_i64) else { continue };
+                    let entity_id = row
+                        .get("entityId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let turn_id = row.get("turnId").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let text = row.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+                    rows.push((row_id, entity_id, turn_id, text));
+                }
+            }
+            *state.v4_user_rows.borrow_mut() = rows;
+            let mut assistant_rows = Vec::new();
+            if let Some(arr) = snapshot.pointer("/rows/window").and_then(Value::as_array) {
+                for row in arr {
+                    if row.get("kind").and_then(Value::as_str) != Some("assistantText") {
+                        continue;
+                    }
+                    let Some(row_id) = row.get("rowId").and_then(Value::as_i64) else { continue };
+                    let entity_id = row.get("entityId").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let turn_id = row.get("turnId").and_then(Value::as_str).unwrap_or_default().to_string();
+                    let st = row.get("state").and_then(Value::as_str).unwrap_or("complete").to_string();
+                    assistant_rows.push((row_id, entity_id, turn_id, st));
+                }
+            }
+            *state.v4_assistant_rows.borrow_mut() = assistant_rows;
+            let mut items = Vec::new();
+            if let Some(arr) = snapshot.pointer("/queue/items").and_then(Value::as_array) {
+                for item in arr {
+                    let id = item
+                        .get("queueItemId")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let text = item
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !id.is_empty() {
+                        items.push((id, text));
+                    }
+                }
+            }
+            *state.v4_queue_items.borrow_mut() = items;
+        }
+        Some("deltas") => {
+            let Some(deltas) = payload.get("deltas").and_then(Value::as_array) else {
+                return;
+            };
+            for delta in deltas {
+                let op = delta.get("op").and_then(Value::as_str).unwrap_or_default();
+                match op {
+                    "row.appended" | "row.upserted" => {
+                        let Some(row) = delta.get("row") else { continue };
+                        let Some(row_id) = row.get("rowId").and_then(Value::as_i64) else { continue };
+                        let entity_id = row
+                            .get("entityId")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        match row.get("kind").and_then(Value::as_str) {
+                            Some("userInput") if row.get("origin").and_then(Value::as_str) == Some("realUser") => {
+                                let turn_id = row.get("turnId").and_then(Value::as_str).unwrap_or_default().to_string();
+                                let text = row
+                                    .get("text")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let mut rows = state.v4_user_rows.borrow_mut();
+                                rows.retain(|(rid, _, _, _)| *rid != row_id);
+                                let pos = rows.iter().position(|(rid, _, _, _)| *rid > row_id).unwrap_or(rows.len());
+                                rows.insert(pos, (row_id, entity_id, turn_id, text));
+                            }
+                            Some("assistantText") => {
+                                let turn_id = row.get("turnId").and_then(Value::as_str).unwrap_or_default().to_string();
+                                let st = row.get("state").and_then(Value::as_str).unwrap_or("complete").to_string();
+                                let mut rows = state.v4_assistant_rows.borrow_mut();
+                                rows.retain(|(rid, _, _, _)| *rid != row_id);
+                                let pos = rows.iter().position(|(rid, _, _, _)| *rid > row_id).unwrap_or(rows.len());
+                                rows.insert(pos, (row_id, entity_id, turn_id, st));
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Truncation: the branch cut removes this row and every
+                    // later one (edit/retry rewinds).
+                    "row.removed" => {
+                        if let Some(from) = delta.get("fromRowId").and_then(Value::as_i64) {
+                            state.v4_user_rows.borrow_mut().retain(|(rid, _, _, _)| *rid < from);
+                            state.v4_assistant_rows.borrow_mut().retain(|(rid, _, _, _)| *rid < from);
+                        }
+                    }
+                    "state.updated" => {
+                        let Some(patch) = delta.get("patch") else { continue };
+                        if let Some(rev) = patch.get("revision").and_then(Value::as_u64) {
+                            state.v4_revision.set(rev);
+                        }
+                        if let Some(items) = patch.pointer("/queue/items").and_then(Value::as_array) {
+                            let mut queue = Vec::new();
+                            for item in items {
+                                let id = item
+                                    .get("queueItemId")
+                                    .or_else(|| item.get("id"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let text = item.get("text").and_then(Value::as_str).unwrap_or_default().to_string();
+                                if !id.is_empty() {
+                                    queue.push((id, text));
+                                }
+                            }
+                            *state.v4_queue_items.borrow_mut() = queue;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// (Re)subscribe the v4 conversation topic for a session; the snapshot
+/// frame lands asynchronously and refreshes the projection state.
+fn v4_subscribe(kernel: &Kernel, kernel_sid: &str) {
+    let _ = kernel.request(
+        "v4/conversation/subscribe",
+        json!({
+            "topic": format!("conversation/{kernel_sid}"),
+            "connectionId": "zgrok-host",
+            "clientMode": "desktop-continuous",
+        }),
+    );
 }
 
 /// Broadcast `x.ai/session/interjection` — the delivery signal the pager's
@@ -3432,8 +3983,25 @@ fn handle_event(
     payload: &Value,
 ) {
     let Some(session_id) = session_id else { return };
-    let acp_session = acp::SessionId::new(session_id.to_string());
-    let Some(state) = shared.state.borrow().sessions.get(&acp_session).cloned() else {
+    let mut acp_session = acp::SessionId::new(session_id.to_string());
+    let mut state = shared.state.borrow().sessions.get(&acp_session).cloned();
+    if state.is_none() {
+        // Remap by backing kernel session: after a rewind fork swap the
+        // kernel id differs from the ACP id the pager knows.
+        let remap = {
+            let shared_state = shared.state.borrow();
+            shared_state
+                .sessions
+                .iter()
+                .find(|(_, st)| st.kernel_id.borrow().as_str() == session_id)
+                .map(|(key, _)| key.clone())
+        };
+        if let Some(key) = remap {
+            acp_session = key;
+            state = shared.state.borrow().sessions.get(&acp_session).cloned();
+        }
+    }
+    let Some(state) = state else {
         // Not one of OUR sessions — but it may be a subagent child the
         // poller announced: forward its content to the pager's subagent
         // view (thoughts, text, tool calls) without parent turn logic.
@@ -3473,6 +4041,27 @@ fn handle_event(
         {
             state.compacting.set(true);
             *state.compact_turn_id.borrow_mut() = event.turn_id.clone();
+            // Kernel-initiated auto compaction: the pager has no Command
+            // state for it — surface the official banner pair. (Ext-driven
+            // compaction keeps the pager's own /compact UI.)
+            if !state.compact_by_ext.get() {
+                let payload = json!({
+                    "sessionId": acp_session.0,
+                    "update": {
+                        "sessionUpdate": "auto_compact_started",
+                        "tokens_used": 0,
+                        "context_window": context_window_tokens(shared),
+                        "percentage": 0,
+                        "reason": "auto",
+                    },
+                });
+                if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+                    gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                        "x.ai/session_notification",
+                        raw.into(),
+                    ));
+                }
+            }
             debug_log(&format!(
                 "compaction turn started: {:?}",
                 event.turn_id.as_deref().map(|t| &t[..t.len().min(24)])
@@ -3491,8 +4080,24 @@ fn handle_event(
             || (state.compact_turn_id.borrow().is_none()
                 && state.turn_done.borrow().is_none()));
     if is_compact_turn_end && (event.kind == "turn.completed" || event.kind == "turn.failed") {
+        let was_ext_driven = state.compact_by_ext.replace(false);
         state.compacting.set(false);
         *state.compact_turn_id.borrow_mut() = None;
+        if !was_ext_driven && event.kind == "turn.completed" {
+            let payload = json!({
+                "sessionId": acp_session.0,
+                "update": {
+                    "sessionUpdate": "auto_compact_completed",
+                    "tokens_after": 0,
+                },
+            });
+            if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+                gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/session_notification",
+                    raw.into(),
+                ));
+            }
+        }
         let outcome = if event.kind == "turn.completed" {
             Ok(())
         } else {

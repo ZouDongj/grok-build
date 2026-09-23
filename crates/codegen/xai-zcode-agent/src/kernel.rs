@@ -52,6 +52,9 @@ pub enum KernelMessage {
     },
     /// `state.updated` — carries the full model catalog patch.
     StateUpdated(Value),
+    /// `v4/conversation/frame` — snapshot/deltas projection frames for a
+    /// subscribed conversation topic (revision, logEpoch, rows, queue).
+    V4Frame(Value),
 }
 
 /// The event kind: `payload.kind` for streaming payloads, else `params.type`
@@ -240,6 +243,19 @@ impl Kernel {
                                     "event send FAILED (pump gone): kind={kind}"
                                 ));
                             }
+                        }
+                        continue;
+                    }
+                    if value.get("method").and_then(Value::as_str)
+                        == Some("v4/conversation/frame")
+                    {
+                        if tx
+                            .send(KernelMessage::V4Frame(
+                                value.get("params").cloned().unwrap_or(Value::Null),
+                            ))
+                            .is_err()
+                        {
+                            debug_log_kernel("v4 frame send FAILED (pump gone)");
                         }
                         continue;
                     }

@@ -627,15 +627,43 @@ async fn main() -> anyhow::Result<()> {
                     &client.tx,
                 )
                 .await;
-                // Execute is explicitly unsupported until a truncating
-                // rewind exists — the error must say so (not a vague one).
-                let exec_unsupported = matches!(&exec, Err(e) if {
-                    e.to_string().contains("truncating rewind")
+                // Truncating rewind (v4 fork path): rewinding to prompt 1
+                // must drop everything after turn 0 — the model must NOT
+                // know 苹果 afterwards.
+                let exec_ok = matches!(&exec, Ok(r) if {
+                    let v: serde_json::Value = serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                    let res = v.get("result").cloned().unwrap_or(v);
+                    res.get("success") == Some(&serde_json::json!(true))
                 });
                 check(
-                    "rewind-execute-explicit-unsupported",
-                    exec_unsupported,
+                    "rewind-execute-accepted",
+                    exec_ok,
                     format!("{:?}", exec.as_ref().map(|_| "ok").map_err(|e| e.to_string())),
+                    &mut summary,
+                    &mut fail,
+                );
+                seen.borrow_mut().current_text.borrow_mut().clear();
+                let recall = acp_send(
+                    acp::PromptRequest::new(
+                        rw_sid.clone(),
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "你听过'第二句话：苹果'吗？只回答：听过 或 没听过。".to_string(),
+                        ))],
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let mut rw_answer = String::new();
+                for _ in 0..20 {
+                    rw_answer = seen.borrow().current_text.borrow().clone();
+                    if rw_answer.contains("过") { break; }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                check(
+                    "rewind-truncates-history",
+                    matches!(&recall, Ok(r) if r.stop_reason == acp::StopReason::EndTurn)
+                        && rw_answer.contains("没听"),
+                    format!("recall answer: {:?}", rw_answer.chars().take(30).collect::<String>()),
                     &mut summary,
                     &mut fail,
                 );
