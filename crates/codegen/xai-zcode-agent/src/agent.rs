@@ -71,6 +71,11 @@ struct SessionState {
     /// turn.started). Lets the turn.failed grace task detect that a NEW
     /// turn replaced the failed one and skip its stale finish.
     turn_epoch: std::cell::Cell<u64>,
+    /// After a v4 sendText(startNow) acceptance, the NEXT turn.started is
+    /// OUR preempting turn; its turnId is recorded so the PREEMPTED turn's
+    /// terminal event can't be mistaken for ours.
+    v4_awaiting_turn_start: std::cell::Cell<bool>,
+    v4_owned_turn: RefCell<Option<String>>,
     /// True while a kernel compaction turn runs. session/compact only
     /// ACCEPTS the job (returns {state:"accepted"} instantly) and runs
     /// "/compact" as a background prompt turn; during it the kernel
@@ -109,6 +114,8 @@ impl SessionState {
             pending_continuation: RefCell::new(None),
             pending_interjection_ids: RefCell::new(Vec::new()),
             turn_epoch: std::cell::Cell::new(0),
+            v4_awaiting_turn_start: std::cell::Cell::new(false),
+            v4_owned_turn: RefCell::new(None),
             fail_grace_cancel: RefCell::new(None),
             compacting: std::cell::Cell::new(false),
             compact_turn_id: RefCell::new(None),
@@ -1727,6 +1734,38 @@ impl acp::Agent for ZcodeAgent {
             .unwrap_or(false);
         let mut already_sent = false;
         if send_now && (state.turn_done.borrow().is_some() || state.compacting.get()) {
+            // Preferred path: the kernel's v4 command surface — sendText
+            // with requestedDelivery startNow atomically preempts the
+            // running turn (the official desktop path). Falls back to the
+            // legacy stop+retry loop on kernels without v4.
+            {
+                let kernel_sid = state.kernel_id.borrow().clone();
+                match v4_send_text(&kernel, &kernel_sid, &text, "startNow").await {
+                    Ok(ack) if ack.get("status") == Some(&json!("accepted")) => {
+                        debug_log("prompt: sendNow via v4 startNow accepted");
+                        state.v4_awaiting_turn_start.set(true);
+                        already_sent = true;
+                    }
+                    other => {
+                        debug_log(&format!(
+                            "prompt: v4 startNow unavailable ({:?}), falling back to stop+retry",
+                            other.as_ref().map(|a| a.get("status").cloned()).map_err(|e| e.clone())
+                        ));
+                    }
+                }
+            }
+            if already_sent {
+                // The preempted turn will emit its own terminal event; our
+                // turn_done below resolves when OUR v4 turn completes.
+                if let Some(old) = state.turn_done.borrow_mut().take() {
+                    let _ = old.send(acp::StopReason::Cancelled);
+                }
+                if let Some(cancel) = state.fail_grace_cancel.borrow_mut().take() {
+                    let _ = cancel.send(());
+                }
+            }
+        }
+        if send_now && !already_sent && (state.turn_done.borrow().is_some() || state.compacting.get()) {
             debug_log("prompt: sendNow — cancelling running turn");
             state.cancelled.set(true);
             {
@@ -2675,6 +2714,25 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize session messages");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // v4/command passthrough: the kernel ships a parallel v4
+            // command surface (sendText with requestedDelivery
+            // startNow/queue/guide, editUserQuery rewind, queue ops) on
+            // the same wire. The legacy session/* methods remain the old
+            // face; this exposes the v4 envelope verbatim.
+            "x.ai/v4/command" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let kernel = self.kernel()?;
+                let result = kernel
+                    .call("v4/command", params)
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("v4/command failed: {e}"))
+                    })?;
+                let raw = serde_json::value::to_raw_value(&result)
+                    .expect("serialize v4 ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // /compact: the kernel folds the transcript itself — but
             // session/compact only ACCEPTS the job ({state:"accepted"} in
             // ~300ms) and runs "/compact" as a background prompt turn that
@@ -2852,17 +2910,40 @@ impl acp::Agent for ZcodeAgent {
                     .cloned()
                     .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
                 let in_flight = state.turn_done.borrow().is_some() || state.compacting.get();
+                let interjection_id = params
+                    .get("interjectionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("interjection")
+                    .to_string();
                 if in_flight {
+                    // Preferred: v4 sendText(guide) — the kernel injects the
+                    // interjection INTO the running turn at its next safe
+                    // point (official steering). Falls back to the
+                    // turn-boundary continuation queue on kernels without v4.
+                    let kernel = self.kernel()?;
+                    let steered = match v4_send_text(&kernel, &id, &text, "guide").await {
+                        Ok(ack) if ack.get("status") == Some(&json!("accepted")) => true,
+                        other => {
+                            debug_log(&format!(
+                                "interject: v4 guide unavailable ({:?}), queueing at turn boundary",
+                                other.as_ref().map(|a| a.get("status").cloned()).map_err(|e| e.clone())
+                            ));
+                            false
+                        }
+                    };
+                    if steered {
+                        debug_log("interject: steered into running turn via v4 guide");
+                        broadcast_interjection(&self.gateway, &session.0, &text, Some(&interjection_id));
+                        let body = json!({"sessionId": id, "accepted": true, "steered": true});
+                        let raw = serde_json::value::to_raw_value(&body)
+                            .expect("serialize interject ack");
+                        return Ok(acp::ExtResponse::new(raw.into()));
+                    }
                     let mut pending = state.pending_continuation.borrow_mut();
                     match pending.as_mut() {
                         Some(existing) => existing.push_str(&format!("\n\n{text}")),
                         None => *pending = Some(text.clone()),
                     }
-                    let interjection_id = params
-                        .get("interjectionId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("interjection")
-                        .to_string();
                     state
                         .pending_interjection_ids
                         .borrow_mut()
@@ -3076,6 +3157,37 @@ fn broadcast_queue(
             params.into(),
         ));
     }
+}
+
+/// Build a v4/command sendText envelope and submit it. The kernel's v4
+/// surface accepts requestedDelivery startNow (atomic preempt of the
+/// running turn), queue (deliver after the turn) and guide (inject into
+/// the running turn at its next safe point) — the real steering the
+/// legacy session/send refuses with -32010. Returns the ack object.
+async fn v4_send_text(
+    kernel: &Kernel,
+    session_id: &str,
+    text: &str,
+    requested_delivery: &str,
+) -> Result<Value, String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    static COMMAND_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let seq = COMMAND_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let envelope = json!({
+        "commandId": format!("zgrok-{now_ms}-{seq}"),
+        "clientId": "zgrok",
+        "sessionId": session_id,
+        "type": "sendText",
+        "payload": {
+            "text": text,
+            "requestedDelivery": requested_delivery,
+        },
+        "issuedAt": now_ms,
+    });
+    kernel.call("v4/command", envelope).await
 }
 
 /// Broadcast `x.ai/session/interjection` — the delivery signal the pager's
@@ -3350,6 +3462,10 @@ fn handle_event(
         // New turn (any kind): advances the epoch so a stale turn.failed
         // grace task knows not to finish it.
         state.turn_epoch.set(state.turn_epoch.get() + 1);
+        if state.v4_awaiting_turn_start.replace(false) {
+            *state.v4_owned_turn.borrow_mut() = event.turn_id.clone();
+            debug_log("v4: claimed preempting turn as ours");
+        }
         if event
             .input
             .as_deref()
@@ -3450,7 +3566,18 @@ fn handle_event(
                 );
             }
         }
+        ("turn.completed" | "turn.failed")
+            if event.turn_id.is_some()
+                && state.v4_owned_turn.borrow().is_some()
+                && event.turn_id != *state.v4_owned_turn.borrow() =>
+        {
+            // Terminal of the turn our v4 startNow preempted — not ours.
+            debug_log("v4: ignoring preempted turn's terminal event");
+            return;
+        }
         "turn.completed" => {
+            // Our turn ended: clear the ownership marker.
+            *state.v4_owned_turn.borrow_mut() = None;
             // The authoritative final text rides `response` only when the
             // kernel batched the turn without streaming it.
             let response = event

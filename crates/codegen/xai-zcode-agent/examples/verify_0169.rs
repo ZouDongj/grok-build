@@ -859,6 +859,10 @@ async fn main() -> anyhow::Result<()> {
                 &client.tx,
             )
             .await;
+            let ij_steered = matches!(&interject, Ok(r) if {
+                let v: serde_json::Value = serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
+                v.get("steered") == Some(&serde_json::json!(true))
+            });
             let ij_ack = matches!(&interject, Ok(r) if {
                 let v: serde_json::Value = serde_json::from_str(r.0.get()).unwrap_or(serde_json::json!({}));
                 v.get("accepted") == Some(&serde_json::json!(true))
@@ -889,15 +893,19 @@ async fn main() -> anyhow::Result<()> {
             // The queue pane reconciles via x.ai/queue/changed snapshots and
             // the interjection delivery broadcast claims the echo block.
             {
+                // v4 guide steers INTO the running turn (no queue row, no
+                // boundary drain); the legacy queue path remains the
+                // fallback on kernels without v4.
                 let snapshots = seen.borrow().queue_snapshots.borrow().clone();
                 let ij_ids = seen.borrow().interjection_ids.borrow().clone();
-                let saw_queued_row = snapshots.iter().any(|(n, _)| *n >= 1);
-                let saw_empty = snapshots.iter().any(|(n, _)| *n == 0);
                 let saw_interjection = ij_ids.iter().any(|id| id == "verify-ij-1");
+                let fallback_path = snapshots.iter().any(|(n, _)| *n >= 1)
+                    && snapshots.iter().any(|(n, _)| *n == 0)
+                    && saw_interjection;
                 check(
-                    "interject-queue-and-delivery-broadcasts",
-                    saw_queued_row && saw_empty && saw_interjection,
-                    format!("snapshots={snapshots:?}, interjection ids={ij_ids:?}"),
+                    "interject-steered-mid-turn",
+                    (ij_steered && saw_interjection) || fallback_path,
+                    format!("steered={ij_steered}, interjection ids={ij_ids:?}, queue snapshots={snapshots:?}"),
                     &mut summary,
                     &mut fail,
                 );
