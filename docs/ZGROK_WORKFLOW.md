@@ -41,6 +41,22 @@ ext 等待压缩回合真实完成才回 Ok；压缩中的 prompt 排队为 cont
 发出；send 的早期拒绝显式报错（不再吞掉让压缩回合冒充回答）。识别依据 turnId
 （pump 已把 params.turnId 提升进事件 payload）。
 
+## v4 命令面（开源客户端揭示，zgrok 已接入 steer）
+
+开源客户端（/data/zdj/ZCode/zcode-oss，3.14.0，clone 需走本机 7890 代理）揭示了
+与旧 session/* 并存的 v4 协议：`v4/command` 统一入口，30 个命令。**发行版 3.14.1
+内核已实现**（probe_v4 实测 guide 转向落地）。已接入：
+- `sendText(requestedDelivery:"guide")` → x.ai/interject 回合中真转向（不打断注入）
+- `sendText(requestedDelivery:"startNow")` → meta.sendNow 原子抢占
+两者均带回退（老内核 → 回合边界队列 / stop+retry）。新增 x.ai/v4/command 透传。
+待接入（v4 均已可达）：
+- `editUserQuery`（截断式 rewind；CAS 需 baseRevision+baseLogEpoch+rowTarget，
+  需先接 v4/conversation/subscribe 的 rows/revision 模型）
+- `setFollowupMode(queue|guide)`（会话级转向默认）
+- 队列项操作（edit/reorder/delete/sendQueuedNow/setAutoDrain）
+MCP 配置写：v4 无独立命令（仅 createSession 的 mcpServers 启动期配置）——仍走
+settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深度整合的主线。
+
 ## 插话 / 强插 / 队列的真实语义（011e44c）
 
 - **强插（send now）**：pager 发普通 PromptRequest + `meta.sendNow=true`，期望 agent
