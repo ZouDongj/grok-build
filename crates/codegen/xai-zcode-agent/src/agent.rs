@@ -64,12 +64,18 @@ struct SessionState {
     /// message; the forked id takes over while the pager keeps its id.
     kernel_id: RefCell<String>,
     /// Subagent lifecycle broadcast state: child id -> (spawn_announced,
-    /// finished_announced). The kernel's child events don't reach our
-    /// subscription, so the poller diffs session/subagents instead.
+    /// finished_announced). Driven natively by the kernel's
+    /// `subagent.lifecycle` events on the parent stream; the
+    /// session/subagents poll remains as a backstop.
     subagents: RefCell<HashMap<String, (bool, bool)>>,
-    /// Per subagent child: message ids already forwarded to the pager
-    /// (content rides the message ledger, not a live event stream — the
-    /// kernel serves no subscribe channel for subagent sessions).
+    /// child session id -> agentId (agent_<uuid>): keys the transcript
+    /// directory the kernel writes under ~/.zcode/cli/agents.
+    child_agent: RefCell<HashMap<String, String>>,
+    /// child session id -> output.txt byte cursor for incremental tails.
+    child_file_pos: RefCell<HashMap<String, u64>>,
+    /// Per subagent child: message ids already forwarded to the pager —
+    /// only used by the SQL fallback when the kernel writes no transcript
+    /// files (the official client channel IS the files).
     child_seen: RefCell<HashMap<String, std::collections::HashSet<String>>>,
 }
 
@@ -86,6 +92,8 @@ impl SessionState {
             cwd: RefCell::new(String::new()),
             kernel_id: RefCell::new(String::new()),
             subagents: RefCell::new(HashMap::new()),
+            child_agent: RefCell::new(HashMap::new()),
+            child_file_pos: RefCell::new(HashMap::new()),
             child_seen: RefCell::new(HashMap::new()),
         }
     }
@@ -722,12 +730,88 @@ fn context_window_tokens(shared: &Rc<Shared>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Native `subagent.lifecycle` events ride the parent session stream —
+/// this is the kernel's own announcement channel (phase spawned/stopped
+/// with agentId, childSessionId, agentType, status). The
+/// session/subagents poll stays as a backstop for kernels without them.
+fn handle_subagent_lifecycle(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    state: &Rc<SessionState>,
+    parent: &acp::SessionId,
+    payload: &Value,
+) {
+    let str_of = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
+    let child = str_of("childSessionId");
+    if child.is_empty() {
+        return;
+    }
+    let agent_id = str_of("agentId");
+    if !agent_id.is_empty() {
+        state
+            .child_agent
+            .borrow_mut()
+            .insert(child.to_string(), agent_id.to_string());
+    }
+    match str_of("phase") {
+        "spawned" => {
+            let mut subs = state.subagents.borrow_mut();
+            if subs.contains_key(child) {
+                return;
+            }
+            subs.insert(child.to_string(), (true, false));
+            drop(subs);
+            let agent_type = if str_of("agentType").is_empty() {
+                "general-purpose"
+            } else {
+                str_of("agentType")
+            };
+            emit_subagent_update(
+                gateway,
+                parent,
+                json!({
+                    "sessionUpdate": "subagent_spawned",
+                    "subagent_id": child,
+                    "parent_session_id": parent.0,
+                    "child_session_id": child,
+                    "subagent_type": agent_type,
+                    "description": str_of("description"),
+                }),
+            );
+        }
+        "stopped" => {
+            let kernel_sid = state.kernel_id.borrow().clone();
+            let stats = subagent_metadata(&kernel_sid, agent_id);
+            let mut subs = state.subagents.borrow_mut();
+            if let Some(entry @ (true, false)) = subs.get_mut(child) {
+                entry.1 = true;
+                drop(subs);
+                emit_subagent_update(
+                    gateway,
+                    parent,
+                    json!({
+                        "sessionUpdate": "subagent_finished",
+                        "subagent_id": child,
+                        "child_session_id": child,
+                        "status": str_of("status"),
+                        "tool_calls": stats.get("totalToolUseCount").and_then(Value::as_u64).unwrap_or(0),
+                        "turns": 0,
+                        "duration_ms": stats.get("totalDurationMs").and_then(Value::as_u64).unwrap_or(0),
+                        "tokens_used": stats.pointer("/usage/totalTokens").and_then(Value::as_u64).unwrap_or(0),
+                    }),
+                );
+                flush_child_content(gateway, state, child);
+                schedule_delayed_child_flush(gateway.clone(), state.clone(), child.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 fn emit_subagent_update(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     parent: &acp::SessionId,
     update: Value,
-) {
-    let payload = json!({"sessionId": parent.0, "update": update});
+) {    let payload = json!({"sessionId": parent.0, "update": update});
     if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
         gateway.forward_fire_and_forget(acp::ExtNotification::new(
             "x.ai/session/update",
@@ -840,14 +924,20 @@ async fn poll_subagents_once(
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
             let duration = (now_ms - started).max(0) as u64;
-            // Content: the ledger is the only channel — forward new
-            // assistant reasoning/text parts to the pager's child view.
+            // Content: incremental tails of the kernel-written transcript
+            // files (the official client channel); SQL only when the kernel
+            // writes no agent directory.
             {
-                let mut seen_map = state.child_seen.borrow_mut();
-                let seen = seen_map.entry(id.clone()).or_default();
-                let fresh = child_new_messages(&id, seen);
+                let meta_agent = str_of(meta, "agentId");
+                if !meta_agent.is_empty() {
+                    state
+                        .child_agent
+                        .borrow_mut()
+                        .insert(id.clone(), meta_agent.to_string());
+                }
+                let fresh = collect_child_content(state, &id);
                 debug_log(&format!("subagent content poll {}: {} new parts", id.get(0..24).unwrap_or(&id), fresh.len()));
-                for (_, kind, text) in fresh {
+                for (kind, text) in fresh {
                     let update = if kind == "reasoning" {
                         acp::SessionUpdate::AgentThoughtChunk(text_chunk(text))
                     } else {
@@ -887,6 +977,14 @@ async fn poll_subagents_once(
         } else {
             str_of(meta, "status")
         };
+        let meta_agent = str_of(meta, "agentId");
+        if !meta_agent.is_empty() {
+            state
+                .child_agent
+                .borrow_mut()
+                .insert(id.clone(), meta_agent.to_string());
+        }
+        let finish_stats = subagent_metadata(&state.kernel_id.borrow(), meta_agent);
         let mut subs = state.subagents.borrow_mut();
         if let Some(entry @ (true, false)) = subs.get_mut(&id) {
             entry.1 = true;
@@ -901,10 +999,10 @@ async fn poll_subagents_once(
                     "subagent_id": id,
                     "child_session_id": id,
                     "status": status,
-                    "tool_calls": 0,
+                    "tool_calls": finish_stats.get("totalToolUseCount").and_then(Value::as_u64).unwrap_or(0),
                     "turns": 0,
-                    "duration_ms": 0,
-                    "tokens_used": 0,
+                    "duration_ms": finish_stats.get("totalDurationMs").and_then(Value::as_u64).unwrap_or(0),
+                    "tokens_used": finish_stats.pointer("/usage/totalTokens").and_then(Value::as_u64).unwrap_or(0),
                 }),
             );
         }
@@ -2297,6 +2395,71 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize session usage");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // Cursor-based event ledger read — unlike session/subscribe this
+            // works on subagent child sessions ("Session is not active" only
+            // rejects live subscription, not ledger reads).
+            "x.ai/session/events" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let kernel = self.kernel()?;
+                let mut payload = json!({"sessionId": id});
+                if let Some(seq) = params.get("afterSeq").and_then(Value::as_u64) {
+                    payload["afterSeq"] = json!(seq);
+                }
+                if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
+                    payload["limit"] = json!(limit);
+                }
+                let result = kernel
+                    .call("session/events", payload)
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error()
+                            .data(format!("session/events failed: {e}"))
+                    })?;
+                let raw = serde_json::value::to_raw_value(&result)
+                    .expect("serialize session events");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Message-part ledger read with an afterMessageId cursor — the
+            // client's subagentTranscripts store is fed from this family.
+            "x.ai/session/messages" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let kernel = self.kernel()?;
+                let mut payload = json!({"sessionId": id});
+                if let Some(after) = params.get("afterMessageId").and_then(Value::as_str) {
+                    payload["afterMessageId"] = json!(after);
+                }
+                if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
+                    payload["limit"] = json!(limit);
+                }
+                let result = kernel
+                    .call("session/messages", payload)
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error()
+                            .data(format!("session/messages failed: {e}"))
+                    })?;
+                let raw = serde_json::value::to_raw_value(&result)
+                    .expect("serialize session messages");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // /compact: the kernel folds the transcript itself.
             "x.ai/compact_conversation" => {
                 let params: Value =
@@ -2596,16 +2759,80 @@ fn schedule_delayed_child_flush(
     });
 }
 
-/// Forward any not-yet-delivered child content (the ledger often lands
-/// the tail of a child's messages only as the parent turn closes).
+/// The kernel writes per-agent transcript directories under
+/// `~/.zcode/cli/agents/<parent-kernel-session>/<agentId>/` — this is the
+/// official client's "subagentTranscripts" channel (its storage-cleanup
+/// categories map that exact prefix). RPC reads of child sessions are all
+/// rejected ("Session is not active"), files are the real surface.
+fn subagent_agent_dir(kernel_parent: &str, agent_id: &str) -> Option<std::path::PathBuf> {
+    if !agent_id.starts_with("agent_") || !kernel_parent.starts_with("sess_") {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    let dir = std::path::Path::new(&home)
+        .join(".zcode/cli/agents")
+        .join(kernel_parent)
+        .join(agent_id);
+    dir.is_dir().then_some(dir)
+}
+
+/// Best-effort metadata.json of a subagent run (status, tokens, duration).
+fn subagent_metadata(kernel_parent: &str, agent_id: &str) -> Value {
+    subagent_agent_dir(kernel_parent, agent_id)
+        .and_then(|dir| {
+            std::fs::read_to_string(dir.join("metadata.json"))
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+        })
+        .unwrap_or_else(|| json!({}))
+}
+
+/// New subagent content since the last poll, as (kind, text) pairs.
+/// Primary channel: incremental output.txt tails keyed by a byte cursor.
+/// Fallback (kernels that write no transcript files): message-ledger SQL.
+fn collect_child_content(state: &Rc<SessionState>, child: &str) -> Vec<(&'static str, String)> {
+    let kernel_parent = state.kernel_id.borrow().clone();
+    let agent_id = state
+        .child_agent
+        .borrow()
+        .get(child)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(dir) = subagent_agent_dir(&kernel_parent, &agent_id) {
+        let mut out = Vec::new();
+        if let Ok(bytes) = std::fs::read(dir.join("output.txt")) {
+            let mut positions = state.child_file_pos.borrow_mut();
+            let pos = positions.entry(child.to_string()).or_insert(0);
+            let start = (*pos as usize).min(bytes.len());
+            *pos = bytes.len() as u64;
+            if bytes.len() > start {
+                let text = String::from_utf8_lossy(&bytes[start..]).to_string();
+                if !text.trim().is_empty() {
+                    out.push(("text", text));
+                }
+            }
+        }
+        return out;
+    }
+    let mut seen_map = state.child_seen.borrow_mut();
+    let seen = seen_map.entry(child.to_string()).or_default();
+    child_new_messages(child, seen)
+        .into_iter()
+        .map(|(_, kind, text)| (kind, text))
+        .collect()
+}
+
+/// Forward any not-yet-delivered child content (the transcript file often
+/// lands its tail only as the parent turn closes).
 fn flush_child_content(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     state: &Rc<SessionState>,
     child_id: &str,
 ) {
-    let mut seen_map = state.child_seen.borrow_mut();
-    let Some(seen) = seen_map.get_mut(child_id) else { return };
-    for (_, kind, text) in child_new_messages(child_id, seen) {
+    if !state.subagents.borrow().contains_key(child_id) {
+        return;
+    }
+    for (kind, text) in collect_child_content(state, child_id) {
         let update = if kind == "reasoning" {
             acp::SessionUpdate::AgentThoughtChunk(text_chunk(text))
         } else {
@@ -2751,6 +2978,12 @@ fn handle_event(
         debug_log(&format!("handle_event: undecodable payload kind={:?}", payload.get("kind")));
         return;
     };
+    // Native subagent lifecycle rides the parent stream — handle before the
+    // turn-event arms (it carries no deltas, only phase metadata).
+    if event.kind == "subagent.lifecycle" {
+        handle_subagent_lifecycle(gateway, &state, &acp_session, payload);
+        return;
+    }
     // Any activity after a turn.failed means the kernel is retrying the turn:
     // cancel the pending grace termination.
     if let Some(cancel) = state.fail_grace_cancel.borrow_mut().take() {

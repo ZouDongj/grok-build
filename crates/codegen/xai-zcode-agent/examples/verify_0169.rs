@@ -20,7 +20,9 @@ struct Seen {
     ack_arrival_ms: Option<u128>,
     usage_updates: std::cell::RefCell<Vec<(u64, u64)>>,
     subagent_events: std::cell::RefCell<Vec<String>>,
+    child_sid: RefCell<Option<String>>,
     child_content: std::cell::Cell<usize>,
+    child_text: RefCell<String>,
     main_sid: RefCell<Option<String>>,
     plan_approval_ext: bool,
     plan_outcome_sent: Option<String>,
@@ -144,6 +146,15 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         _ => {}
                                     }
+                                    if let acp::SessionUpdate::AgentMessageChunk(c) = &u.update {
+                                        if let acp::ContentBlock::Text(t) = &c.content {
+                                            seen
+                                                .borrow_mut()
+                                                .child_text
+                                                .borrow_mut()
+                                                .push_str(&t.text);
+                                        }
+                                    }
                                 }
                                 if let Some(mode) = mode_name(&u.update) {
                                     seen.borrow_mut().mode_updates.push(mode.clone());
@@ -167,6 +178,15 @@ async fn main() -> anyhow::Result<()> {
                                     if let Some(kind) = v.pointer("/update/sessionUpdate").and_then(|k| k.as_str()) {
                                         if kind.starts_with("subagent_") {
                                             seen.borrow_mut().subagent_events.borrow_mut().push(kind.to_string());
+                                        }
+                                    }
+                                    if v.pointer("/update/sessionUpdate").and_then(|k| k.as_str()) == Some("subagent_spawned") {
+                                        if let Some(child) = v.pointer("/update/child_session_id").and_then(|c| c.as_str()) {
+                                            let child = child.to_string();
+                                            let mut seen_b = seen.borrow_mut();
+                                            if seen_b.child_sid.borrow().is_none() {
+                                                *seen_b.child_sid.borrow_mut() = Some(child);
+                                            }
                                         }
                                     }
                                 }
@@ -622,7 +642,9 @@ async fn main() -> anyhow::Result<()> {
 
             // --- subagent lifecycle visualization ---
             seen.borrow_mut().subagent_events.borrow_mut().clear();
+            seen.borrow_mut().child_sid.borrow_mut().take();
             seen.borrow_mut().child_content.set(0);
+            seen.borrow_mut().child_text.borrow_mut().clear();
             let sub_turn = acp_send(
                 acp::PromptRequest::new(
                     sid.clone(),
@@ -645,14 +667,85 @@ async fn main() -> anyhow::Result<()> {
                 &mut summary,
                 &mut fail,
             );
+            // Content rides the kernel's transcript files (output.txt byte
+            // tails) — the official client channel; one delta per flush.
             let child_events = seen.borrow().child_content.get();
+            let child_text = seen.borrow().child_text.borrow().clone();
             check(
                 "subagent-content-streamed",
-                child_events >= 2,
-                format!("{child_events} child thought/message/tool updates reached the pager view"),
+                child_events >= 1 && child_text.contains("subviz-ok"),
+                format!(
+                    "{child_events} child updates reached the pager view; captured child text: {:?}",
+                    &child_text[..child_text.len().min(80)]
+                ),
                 &mut summary,
                 &mut fail,
             );
+
+            // --- kernel RPC boundary on child sessions (documented) ---
+            // The official client does NOT read subagent children over RPC:
+            // it consumes native subagent.lifecycle events on the parent
+            // stream plus transcript FILES under ~/.zcode/cli/agents.
+            // session/events, session/messages, session/subscribe are all
+            // rejected with "Session is not active" for child sessions.
+            let child_sid = seen.borrow().child_sid.borrow().clone();
+            if let Some(child) = child_sid {
+                let ev_resp = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/session/events",
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "sessionId": child, "afterSeq": 0, "limit": 100,
+                        }))
+                        .expect("serialize child events req")
+                        .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let ev_err = match &ev_resp {
+                    Err(e) => format!("{:?}", e),
+                    Ok(_) => "no-error".to_string(),
+                };
+                check(
+                    "session-events-child-rejected",
+                    matches!(&ev_resp, Err(_)) && ev_err.contains("not active"),
+                    format!("child RPC read rejected as expected: {ev_err}"),
+                    &mut summary,
+                    &mut fail,
+                );
+
+                let msg_resp = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/session/messages",
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "sessionId": child, "limit": 50,
+                        }))
+                        .expect("serialize child messages req")
+                        .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let msg_err = match &msg_resp {
+                    Err(e) => format!("{:?}", e),
+                    Ok(_) => "no-error".to_string(),
+                };
+                check(
+                    "session-messages-child-rejected",
+                    matches!(&msg_resp, Err(_)) && msg_err.contains("not active"),
+                    format!("child RPC read rejected as expected: {msg_err}"),
+                    &mut summary,
+                    &mut fail,
+                );
+            } else {
+                check(
+                    "session-events-child-rejected",
+                    false,
+                    "no child session id captured".to_string(),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
 
             // --- interject: mid-turn "send now" queues as a continuation ---
             seen.borrow().current_text.borrow_mut().clear();
