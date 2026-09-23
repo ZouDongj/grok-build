@@ -1142,6 +1142,58 @@ fn spawn_subagent_poller(
 }
 
 /// Emit the pager's context meter update for a session.
+/// The kernel's TodoWrite state for a session, from its own db (the
+/// `todo` table: content/status/position). Empty when the model never
+/// used TodoWrite.
+fn kernel_todos(kernel_sid: &str) -> Vec<(String, String)> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = con.prepare(
+        "SELECT content, status FROM todo WHERE session_id = ?1 ORDER BY position",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([kernel_sid], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })
+    .map(|rows| rows.filter_map(Result::ok).collect())
+    .unwrap_or_default()
+}
+
+/// Push the model's TodoWrite list to the pager's todos pane. The pane
+/// consumes Plan-shaped entries; only sent when there ARE todos, and only
+/// when no plan is currently in flight (plan entries own the pane then).
+fn push_todos(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    state: &Rc<SessionState>,
+    session: &acp::SessionId,
+) {
+    let todos = kernel_todos(&state.kernel_id.borrow());
+    if todos.is_empty() {
+        return;
+    }
+    // Plan entries map 1:1 onto todo rows in the pager; statuses map to
+    // the entry states the pane understands.
+    let entries: Vec<acp::PlanEntry> = todos
+        .iter()
+        .map(|(content, status)| {
+            let st = match status.as_str() {
+                "completed" => acp::PlanEntryStatus::Completed,
+                "in_progress" => acp::PlanEntryStatus::InProgress,
+                _ => acp::PlanEntryStatus::Pending,
+            };
+            acp::PlanEntry::new(content.clone(), acp::PlanEntryPriority::Medium, st)
+        })
+        .collect();
+    notify(gateway, session, acp::SessionUpdate::Plan(acp::Plan::new(entries)));
+}
+
 fn push_context_usage(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     shared: &Rc<Shared>,
@@ -1663,16 +1715,51 @@ impl acp::Agent for ZcodeAgent {
             set_model_with_retry(&kernel, &session_id, &provider, &model).await;
         }
         v4_subscribe(&kernel, &session_id);
+        let state = Rc::new(SessionState::new());
+        *state.cwd.borrow_mut() = args.cwd.to_string_lossy().to_string();
+        *state.kernel_id.borrow_mut() = args.session_id.0.to_string();
+        // Seed HISTORICAL subagents (from before the resume) as already
+        // announced: session/subagents returns them under ended/children,
+        // and the poller would otherwise rebroadcast them as a fresh
+        // spawn+finish on the first prompt — surfacing as a spurious
+        // "Ran 1 subagent 1 failed" row after every resume.
+        if let Ok(snapshot) = kernel
+            .call("session/subagents", json!({"sessionId": session_id}))
+            .await
+        {
+            let ids: Vec<String> = ["/childSessionIds", "/running", "/ended/items"]
+                .iter()
+                .flat_map(|pointer| {
+                    snapshot
+                        .pointer(pointer)
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| {
+                                    v.as_str()
+                                        .map(str::to_string)
+                                        .or_else(|| {
+                                            v.get("childSessionId")
+                                                .and_then(Value::as_str)
+                                                .map(str::to_string)
+                                        })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            let mut subs = state.subagents.borrow_mut();
+            for id in ids {
+                subs.insert(id, (true, true));
+            }
+            debug_log(&format!("resume: seeded {} historical subagent(s)", subs.len()));
+        }
         self.shared
             .state
             .borrow_mut()
             .sessions
-            .insert(args.session_id.clone(), {
-                let state = Rc::new(SessionState::new());
-                *state.cwd.borrow_mut() = args.cwd.to_string_lossy().to_string();
-                *state.kernel_id.borrow_mut() = args.session_id.0.to_string();
-                state
-            });
+            .insert(args.session_id.clone(), state);
         let cwd_text = args.cwd.to_string_lossy().to_string();
         write_summary_stub(&session_id, &cwd_text);
 
@@ -2866,6 +2953,23 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize projection");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // v4/conversation/usage query — the official session-token
+            // meter (same result shape as the legacy session/usage word).
+            "x.ai/v4/usage" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                let kernel = self.kernel()?;
+                let result = kernel
+                    .call("v4/conversation/usage", json!({"sessionId": id}))
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("v4 usage failed: {e}"))
+                    })?;
+                let raw = serde_json::value::to_raw_value(&result)
+                    .expect("serialize v4 usage");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // v4/command passthrough: the kernel ships a parallel v4
             // command surface (sendText with requestedDelivery
             // startNow/queue/guide, editUserQuery rewind, queue ops) on
@@ -3291,9 +3395,26 @@ impl acp::Agent for ZcodeAgent {
                 if !id.starts_with("sess_") {
                     return Err(acp::Error::invalid_params().data("bad sessionId"));
                 }
-                delete_kernel_session(id, cwd).map_err(|e| {
-                    acp::Error::internal_error().data(format!("session delete failed: {e}"))
-                })?;
+                // Official path first: v4 deleteSession (kernel-side
+                // cleanup incl. artifacts); fall back to the db surgery
+                // on kernels without v4.
+                let mut deleted_via_v4 = false;
+                {
+                    let kernel = self.kernel()?;
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    if let Ok(ack) = v4_command(&kernel, &id, "deleteSession", json!({}), None).await {
+                        deleted_via_v4 =
+                            ack.get("status").and_then(Value::as_str) == Some("accepted");
+                    }
+                }
+                if !deleted_via_v4 {
+                    delete_kernel_session(id, cwd).map_err(|e| {
+                        acp::Error::internal_error().data(format!("session delete failed: {e}"))
+                    })?;
+                }
                 debug_log(&format!("session deleted: {id}"));
                 let body = json!({"result": {"ok": true, "sessionId": id}});
                 let raw = serde_json::value::to_raw_value(&body).expect("serialize delete ack");
@@ -4116,6 +4237,7 @@ fn handle_event(
                 );
             }
             push_context_usage(gateway, shared, &state, &acp_session);
+            push_todos(gateway, &state, &acp_session);
             drain_pending_continuation(gateway, shared, &acp_session);
         }
         return;
@@ -4202,6 +4324,7 @@ fn handle_event(
             finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
             drain_pending_continuation(gateway, shared, &acp_session);
             push_context_usage(gateway, shared, &state, &acp_session);
+            push_todos(gateway, &state, &acp_session);
         }
         "turn.failed" => {
             // 0.16.9 emits turn.failed per failed ATTEMPT and may retry the

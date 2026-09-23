@@ -31,7 +31,12 @@ struct Seen {
     replay_text: RefCell<String>,
     current_text: RefCell<String>,
     queue_snapshots: RefCell<Vec<(usize, Option<String>)>>,
+    plan_entries: RefCell<Vec<usize>>,
     interjection_ids: RefCell<Vec<String>>,
+}
+
+fn agent_session_is_replay() -> bool {
+    false
 }
 
 fn mode_name(update: &acp::SessionUpdate) -> Option<String> {
@@ -156,6 +161,11 @@ async fn main() -> anyhow::Result<()> {
                                                 .borrow_mut()
                                                 .push_str(&t.text);
                                         }
+                                    }
+                                }
+                                if let acp::SessionUpdate::Plan(plan) = &u.update {
+                                    if !agent_session_is_replay() {
+                                        seen.borrow_mut().plan_entries.borrow_mut().push(plan.entries.len());
                                     }
                                 }
                                 if let Some(mode) = mode_name(&u.update) {
@@ -850,6 +860,60 @@ async fn main() -> anyhow::Result<()> {
                         && text_after.contains("Compacted")
                         && text_after.contains('2'),
                     format!("queued turn end={:?}, captured text: {:?}", queued_turn.as_ref().map(|r| format!("{:?}", r.stop_reason)).map_err(|e| e.to_string()), &text_after[..text_after.len().min(60)]),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+
+            // --- resume must not rebroadcast historical subagents ---
+            {
+                seen.borrow_mut().subagent_events.borrow_mut().clear();
+                let _ = acp_send(
+                    acp::LoadSessionRequest::new(sid.clone(), std::path::PathBuf::from(WORKDIR)),
+                    &client.tx,
+                )
+                .await;
+                let first = acp_send(
+                    acp::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "恢复后的第一句：只回复：好的。".to_string(),
+                        ))],
+                    ),
+                    &client.tx,
+                )
+                .await;
+                let events = seen.borrow().subagent_events.borrow().clone();
+                check(
+                    "resume-no-historical-subagent-rebroadcast",
+                    events.is_empty()
+                        && matches!(&first, Ok(r) if r.stop_reason == acp::StopReason::EndTurn),
+                    format!("subagent events after resume prompt: {events:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+
+            // --- TodoWrite list surfaces in the pager's todos pane ---
+            {
+                seen.borrow_mut().plan_entries.borrow_mut().clear();
+                let todo_turn = acp_send(
+                    acp::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "请使用 TodoWrite 工具建立两个任务：'部署环境' 和 '运行测试'，然后把 '部署环境' 标记为 in_progress。不要做别的事。".to_string(),
+                        ))],
+                    ),
+                    &client.tx,
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let plans = seen.borrow().plan_entries.borrow().clone();
+                check(
+                    "todowrite-list-visible",
+                    matches!(&todo_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn)
+                        && plans.iter().any(|n| *n >= 2),
+                    format!("plan updates: {plans:?}"),
                     &mut summary,
                     &mut fail,
                 );
