@@ -41,6 +41,22 @@ ext 等待压缩回合真实完成才回 Ok；压缩中的 prompt 排队为 cont
 发出；send 的早期拒绝显式报错（不再吞掉让压缩回合冒充回答）。识别依据 turnId
 （pump 已把 params.turnId 提升进事件 payload）。
 
+## 插话 / 强插 / 队列的真实语义（011e44c）
+
+- **强插（send now）**：pager 发普通 PromptRequest + `meta.sendNow=true`，期望 agent
+  先取消运行中的回合再发。agent 现在走 session/stop → 重试 send 直到内核放行
+  （-32010 拒绝期间 250ms 间隔重试，25s 上限）→ 旧回合按 Cancelled 结算。
+  正常路径遇到 "already running" 拒绝也有同款停旧重发兜底（drain 竞态时可能撞上）。
+- **队列广播**：pager 的本地队列排水被 `server_queue_owns_next_turn` 门闩卡住——
+  服务端队列里有非运行行就永不排水。官方 shell 靠 `x.ai/queue/changed` 全量快照对账，
+  agent 现在在每个队列转换点广播（排队 continuation 为一行、接受/投递为空快照+running）。
+- **插话投递广播**：`x.ai/session/interjection`（带 interjectionId）让 pager 认领
+  乐观回显块。空闲插话改 fire-and-forget（send RPC 的 Ok 在回合结束才回来，
+  call() 的 30s 超时会误报）。
+- **真·回合中转向（steer）是内核运行时层私有能力**（steerTurn delivery guide/queue），
+  app-server RPC 无条件拒绝并发 send——RPC 面上只能做到回合边界投递。
+- turn_epoch 守卫：陈旧的 turn.failed 宽限期不再误杀新回合。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
