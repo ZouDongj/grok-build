@@ -52,6 +52,10 @@ struct SessionState {
     /// continuation: the kernel does not continue on its own after an
     /// approved or revised plan).
     pending_continuation: RefCell<Option<String>>,
+    /// interjectionIds of queued interjections, in order — used to broadcast
+    /// x.ai/session/interjection when the continuation delivers them, so the
+    /// pager can claim its optimistic echo blocks.
+    pending_interjection_ids: RefCell<Vec<String>>,
     /// Cancels the pending grace timer after a turn.failed: 0.16.9 emits
     /// turn.failed for a failed ATTEMPT and then retries, so termination must
     /// wait to see whether the turn actually continues.
@@ -63,6 +67,10 @@ struct SessionState {
     /// ACP id until an in-place rewind forks the conversation at an earlier
     /// message; the forked id takes over while the pager keeps its id.
     kernel_id: RefCell<String>,
+    /// Monotonic per-session turn counter (bumped on every kernel
+    /// turn.started). Lets the turn.failed grace task detect that a NEW
+    /// turn replaced the failed one and skip its stale finish.
+    turn_epoch: std::cell::Cell<u64>,
     /// True while a kernel compaction turn runs. session/compact only
     /// ACCEPTS the job (returns {state:"accepted"} instantly) and runs
     /// "/compact" as a background prompt turn; during it the kernel
@@ -99,6 +107,8 @@ impl SessionState {
             tools: RefCell::new(HashMap::new()),
             next_tool: std::cell::Cell::new(0),
             pending_continuation: RefCell::new(None),
+            pending_interjection_ids: RefCell::new(Vec::new()),
+            turn_epoch: std::cell::Cell::new(0),
             fail_grace_cancel: RefCell::new(None),
             compacting: std::cell::Cell::new(false),
             compact_turn_id: RefCell::new(None),
@@ -1705,6 +1715,58 @@ impl acp::Agent for ZcodeAgent {
         if !attachments.is_empty() {
             debug_log(&format!("prompt: {} image attachment(s)", attachments.len()));
         }
+        // Send-now (强插): the pager marks interrupting prompts with
+        // meta.sendNow — cancel the running kernel turn, wait for the
+        // session to free, then send ours. The kernel rejects concurrent
+        // sends with -32010, so without this the interrupt fails outright.
+        let send_now = args
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("sendNow"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut already_sent = false;
+        if send_now && (state.turn_done.borrow().is_some() || state.compacting.get()) {
+            debug_log("prompt: sendNow — cancelling running turn");
+            state.cancelled.set(true);
+            {
+                let kernel_sid = state.kernel_id.borrow().clone();
+                let _ = kernel.request("session/stop", kernel::stop_params(&kernel_sid));
+            }
+            // Retry until the kernel frees the session: -32010 rejects fast,
+            // acceptance answers fast ({status:"prompt_started"}).
+            let kernel_sid = state.kernel_id.borrow().clone();
+            let send_params = kernel::send_params_with_attachments(&kernel_sid, &text, &attachments);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+            loop {
+                match kernel.call("session/send", send_params.clone()).await {
+                    Ok(_) => {
+                        already_sent = true;
+                        break;
+                    }
+                    Err(e) if e.contains("already running") => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Settle the interrupted prompt and cancel its failure grace so
+            // neither resolves OUR turn later (the epoch guard also covers a
+            // late turn.failed from the stop).
+            if let Some(cancel) = state.fail_grace_cancel.borrow_mut().take() {
+                let _ = cancel.send(());
+            }
+            if let Some(old) = state.turn_done.borrow_mut().take() {
+                let _ = old.send(acp::StopReason::Cancelled);
+            }
+            if !already_sent {
+                return Err(acp::Error::internal_error()
+                    .data("kernel did not free the session for send-now"));
+            }
+        }
         let (tx, mut rx) = oneshot::channel();
         *state.turn_done.borrow_mut() = Some(tx);
         state.cancelled.set(false);
@@ -1727,28 +1789,120 @@ impl acp::Agent for ZcodeAgent {
                     .data("compaction in progress; resend the image afterwards"));
             }
             debug_log("prompt: queued behind running compaction");
-            *state.pending_continuation.borrow_mut() = Some(text);
+            *state.pending_continuation.borrow_mut() = Some(text.clone());
+            // Server-queue snapshot: the queued row must be visible to the
+            // pager (and reconciled away when delivered).
+            let prompt_id = args
+                .meta
+                .as_ref()
+                .and_then(|m| m.get("promptId"))
+                .and_then(Value::as_str)
+                .unwrap_or("queued-prompt")
+                .to_string();
+            broadcast_queue(
+                &self.gateway,
+                &args.session_id.0,
+                &[(prompt_id, "prompt", text)],
+                None,
+            );
             rx.await.unwrap_or(acp::StopReason::EndTurn)
         } else {
             spawn_subagent_poller(&self.gateway, kernel.clone(), state.clone(), args.session_id.clone());
             // The host-pushed account snapshot decays when the kernel re-asserts
             // its registry against the builtin revision — re-push before sends.
             self.push_account_config(&kernel).await;
-            let send_rx = kernel
-                .request(
-                    "session/send",
-                    kernel::send_params_with_attachments(&state.kernel_id.borrow(), &text, &attachments),
-                )
-                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            let send_rx = if already_sent {
+                // send-now already performed the kernel send during the
+                // cancel-wait; nothing to send again.
+                None
+            } else {
+                Some(kernel
+                    .request(
+                        "session/send",
+                        kernel::send_params_with_attachments(&state.kernel_id.borrow(), &text, &attachments),
+                    )
+                    .map_err(|e| acp::Error::internal_error().data(e.to_string()))?)
+            };
+            // Reconcile the pager's server queue: clear the send-now echo
+            // row, surface this prompt as running, keep any queued
+            // continuation visible.
+            {
+                let prompt_id = args
+                    .meta
+                    .as_ref()
+                    .and_then(|m| m.get("promptId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("kernel-turn")
+                    .to_string();
+                let queued: Vec<(String, &str, String)> = state
+                    .pending_continuation
+                    .borrow()
+                    .as_ref()
+                    .map(|t| vec![("queued-prompt".to_string(), "prompt", t.clone())])
+                    .unwrap_or_default();
+                broadcast_queue(
+                    &self.gateway,
+                    &args.session_id.0,
+                    &queued,
+                    Some((&prompt_id, &text)),
+                );
+            }
             // The send RPC answers only at turn end — EXCEPT when the kernel
             // rejects it outright (-32010 during compaction, bad state). Watch
             // both channels concurrently: an early rejection fails this turn
             // explicitly (the old code dropped the receiver and parked until
             // an unrelated turn's completion event resolved it, losing the
             // prompt).
+            let send_wait = async {
+                match send_rx {
+                    Some(mut rx) => match rx.await {
+                        Ok(Err(rejection)) => Err(rejection),
+                        _ => Ok(()),
+                    },
+                    None => Ok(()),
+                }
+            };
             tokio::select! {
-                sent = send_rx => match sent {
-                    Ok(Err(rejection)) => {
+                sent = send_wait => match sent {
+                    Err(rejection) if rejection.contains("already running") => {
+                        // An UNOWNED kernel turn is running (e.g. a just-
+                        // drained continuation no ACP prompt awaits). Cancel
+                        // it and retry our send, mirroring send-now.
+                        let kernel_sid = state.kernel_id.borrow().clone();
+                        let _ = kernel.request("session/stop", kernel::stop_params(&kernel_sid));
+                        let retry_params = kernel::send_params_with_attachments(
+                            &kernel_sid, &text, &attachments,
+                        );
+                        let mut accepted = false;
+                        let deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(25);
+                        while std::time::Instant::now() < deadline {
+                            match kernel.call("session/send", retry_params.clone()).await {
+                                Ok(_) => {
+                                    accepted = true;
+                                    break;
+                                }
+                                Err(e) if e.contains("already running") => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if accepted {
+                            rx.await.unwrap_or(acp::StopReason::EndTurn)
+                        } else {
+                            *state.turn_done.borrow_mut() = None;
+                            notify(
+                                &self.gateway,
+                                &args.session_id,
+                                acp::SessionUpdate::AgentMessageChunk(text_chunk(format!(
+                                    "prompt rejected by kernel: {rejection}"
+                                ))),
+                            );
+                            return Err(acp::Error::internal_error().data(rejection));
+                        }
+                    }
+                    Err(rejection) => {
                         *state.turn_done.borrow_mut() = None;
                         notify(
                             &self.gateway,
@@ -1762,7 +1916,7 @@ impl acp::Agent for ZcodeAgent {
                     // RPC resolved at turn end — the turn.completed event (or
                     // a sibling) fires turn_done; fall through to it for the
                     // real stop reason, with a direct resolve as backstop.
-                    _ => rx.await.unwrap_or(acp::StopReason::EndTurn),
+                    Ok(()) => rx.await.unwrap_or(acp::StopReason::EndTurn),
                 },
                 stop = &mut rx => stop.unwrap_or(acp::StopReason::EndTurn),
             }
@@ -2697,23 +2851,49 @@ impl acp::Agent for ZcodeAgent {
                     .get(&session)
                     .cloned()
                     .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
-                let in_flight = state.turn_done.borrow().is_some();
+                let in_flight = state.turn_done.borrow().is_some() || state.compacting.get();
                 if in_flight {
                     let mut pending = state.pending_continuation.borrow_mut();
                     match pending.as_mut() {
                         Some(existing) => existing.push_str(&format!("\n\n{text}")),
-                        None => *pending = Some(text),
+                        None => *pending = Some(text.clone()),
                     }
+                    let interjection_id = params
+                        .get("interjectionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("interjection")
+                        .to_string();
+                    state
+                        .pending_interjection_ids
+                        .borrow_mut()
+                        .push(interjection_id.clone());
                     debug_log("interject: queued as next-turn continuation");
+                    // Server-queue snapshot: the interjection rides as a
+                    // queued row until the turn ends and delivers it.
+                    broadcast_queue(
+                        &self.gateway,
+                        &session.0,
+                        &[(interjection_id, "prompt", text)],
+                        None,
+                    );
                 } else {
+                    // Idle: send now. Fire-and-forget — the send RPC's Ok
+                    // response arrives only at turn end, so awaiting it under
+                    // the 30s call timeout would spuriously fail while the
+                    // turn actually runs.
                     let kernel = self.kernel()?;
                     kernel
-                        .call("session/send", kernel::send_params(&id, &text))
-                        .await
+                        .request("session/send", kernel::send_params(&id, &text))
                         .map_err(|e| {
                             acp::Error::internal_error().data(format!("interject send failed: {e}"))
                         })?;
                     debug_log("interject: sent immediately (no turn in flight)");
+                    broadcast_interjection(
+                        &self.gateway,
+                        &session.0,
+                        &text,
+                        params.get("interjectionId").and_then(Value::as_str),
+                    );
                 }
                 let body = json!({"sessionId": id, "accepted": true});
                 let raw =
@@ -2857,6 +3037,65 @@ fn dirs_config_file(name: &str) -> Option<std::path::PathBuf> {
 
 fn notify(gateway: &AcpGatewaySender<acp::AgentSide>, session: &acp::SessionId, update: acp::SessionUpdate) {
     gateway.forward_fire_and_forget(acp::SessionNotification::new(session.clone(), update));
+}
+
+/// Broadcast an `x.ai/queue/changed` snapshot (camelCase QueueChanged wire).
+/// The pager replaces its server-queue pane wholesale with `entries` and —
+/// critically — its local prompt queue DRAIN is blocked while any
+/// non-running server row exists (`server_queue_owns_next_turn`), so every
+/// queue transition must reconcile to the truth: queued continuations as
+/// rows, delivery as an empty snapshot.
+fn broadcast_queue(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    session_id: &str,
+    entries: &[(String, &str, String)],
+    running: Option<(&str, &str)>,
+) {
+    let entries: Vec<Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(position, (id, kind, text))| {
+            json!({
+                "id": id,
+                "version": 0,
+                "kind": kind,
+                "text": text,
+                "position": position,
+            })
+        })
+        .collect();
+    let mut payload = json!({"sessionId": session_id, "entries": entries});
+    if let Some((running_id, running_text)) = running {
+        payload["runningPromptId"] = json!(running_id);
+        payload["runningText"] = json!(running_text);
+        payload["runningKind"] = json!("prompt");
+    }
+    if let Ok(params) = serde_json::value::to_raw_value(&payload) {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/queue/changed",
+            params.into(),
+        ));
+    }
+}
+
+/// Broadcast `x.ai/session/interjection` — the delivery signal the pager's
+/// originator pane uses to claim its optimistic interjection block.
+fn broadcast_interjection(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    session_id: &str,
+    text: &str,
+    interjection_id: Option<&str>,
+) {
+    let mut payload = json!({"sessionId": session_id, "text": text});
+    if let Some(id) = interjection_id {
+        payload["interjectionId"] = json!(id);
+    }
+    if let Ok(params) = serde_json::value::to_raw_value(&payload) {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/session/interjection",
+            params.into(),
+        ));
+    }
 }
 
 fn text_chunk(text: impl Into<String>) -> acp::ContentChunk {
@@ -3108,6 +3347,9 @@ fn handle_event(
     // visibility. Track them so their completion can't be mistaken for the
     // user's turn and prompts sent meanwhile can be queued.
     if event.kind == "turn.started" {
+        // New turn (any kind): advances the epoch so a stale turn.failed
+        // grace task knows not to finish it.
+        state.turn_epoch.set(state.turn_epoch.get() + 1);
         if event
             .input
             .as_deref()
@@ -3153,7 +3395,7 @@ fn handle_event(
                 );
             }
             push_context_usage(gateway, shared, &state, &acp_session);
-            drain_pending_continuation(shared, &acp_session);
+            drain_pending_continuation(gateway, shared, &acp_session);
         }
         return;
     }
@@ -3226,7 +3468,7 @@ fn handle_event(
                 let _ = cancel.send(());
             }
             finish_turn(&state, gateway, &acp_session, acp::StopReason::EndTurn);
-            drain_pending_continuation(shared, &acp_session);
+            drain_pending_continuation(gateway, shared, &acp_session);
             push_context_usage(gateway, shared, &state, &acp_session);
         }
         "turn.failed" => {
@@ -3245,13 +3487,21 @@ fn handle_event(
             let session = acp_session.clone();
             let gateway = gateway.clone();
             let shared = Rc::clone(shared);
+            let epoch_at_failure = state.turn_epoch.get();
             tokio::task::spawn_local(async move {
                 tokio::select! {
                     () = tokio::time::sleep(std::time::Duration::from_secs(20)) => {
                         state.fail_grace_cancel.borrow_mut().take();
+                        // A new turn already started (send-now restart, retry,
+                        // continuation): the failure belongs to the past —
+                        // finishing now would cancel the LIVE turn.
+                        if state.turn_epoch.get() != epoch_at_failure {
+                            debug_log("turn.failed grace skipped — newer turn already running");
+                            return;
+                        }
                         debug_log("turn.failed grace expired — finishing turn");
                         finish_turn(&state, &gateway, &session, acp::StopReason::EndTurn);
-                        drain_pending_continuation(&shared, &session);
+                        drain_pending_continuation(&gateway, &shared, &session);
                     }
                     _ = cancel_rx => {}
                 }
@@ -3268,18 +3518,28 @@ fn finish_turn(state: &Rc<SessionState>, _gateway: &AcpGatewaySender<acp::AgentS
     }
 }
 
-/// Send a plan-approval continuation queued for this session, if any. Runs
-/// after finish_turn so the approving turn's ACP prompt settles first.
-fn drain_pending_continuation(shared: &Rc<Shared>, session: &acp::SessionId) {
+/// Send a plan-approval/interjection continuation queued for this session,
+/// if any. Runs after finish_turn so the settling turn's ACP prompt resolves
+/// first. Broadcasts the delivered interjections and reconciles the pager's
+/// server queue (empty snapshot unblocks its local queue drain).
+fn drain_pending_continuation(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    shared: &Rc<Shared>,
+    session: &acp::SessionId,
+) {
     let state = shared.state.borrow().sessions.get(session).cloned();
     let Some(state) = state else { return };
     let Some(text) = state.pending_continuation.borrow_mut().take() else {
         return;
     };
+    let interjection_ids = std::mem::take(&mut *state.pending_interjection_ids.borrow_mut());
     let Some(kernel) = shared.state.borrow().kernel.clone() else {
         return;
     };
-    debug_log(&format!("plan continuation: {} chars", text.len()));
+    debug_log(&format!("continuation: {} chars ({} interjection(s))", text.len(), interjection_ids.len()));
+    for id in &interjection_ids {
+        broadcast_interjection(gateway, &session.0, &text, Some(id));
+    }
     state.streamed_text.set(false);
     let kernel_sid = state.kernel_id.borrow().clone();
     match kernel.request("session/send", kernel::send_params(&kernel_sid, &text)) {
@@ -3291,9 +3551,12 @@ fn drain_pending_continuation(shared: &Rc<Shared>, session: &acp::SessionId) {
             });
         }
         Err(error) => {
-            tracing::warn!(%error, "plan continuation send failed");
+            tracing::warn!(%error, "continuation send failed");
         }
     }
+    // The queued row is now the running turn — an empty server queue lets
+    // the pager's local queue drain again.
+    broadcast_queue(gateway, &session.0, &[], None);
 }
 
 /// A kernel interaction request: forward as an ACP permission request, then

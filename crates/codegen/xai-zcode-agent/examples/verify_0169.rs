@@ -30,6 +30,8 @@ struct Seen {
     mode_updates: Vec<String>,
     replay_text: RefCell<String>,
     current_text: RefCell<String>,
+    queue_snapshots: RefCell<Vec<(usize, Option<String>)>>,
+    interjection_ids: RefCell<Vec<String>>,
 }
 
 fn mode_name(update: &acp::SessionUpdate) -> Option<String> {
@@ -188,6 +190,27 @@ async fn main() -> anyhow::Result<()> {
                                                 *seen_b.child_sid.borrow_mut() = Some(child);
                                             }
                                         }
+                                    }
+                                }
+                                if &*n.method == "x.ai/queue/changed" {
+                                    let v: serde_json::Value =
+                                        serde_json::from_str(n.params.get()).unwrap_or(serde_json::json!({}));
+                                    let n_entries = v
+                                        .get("entries")
+                                        .and_then(|e| e.as_array())
+                                        .map(|a| a.len())
+                                        .unwrap_or(0);
+                                    let running = v
+                                        .get("runningPromptId")
+                                        .and_then(|r| r.as_str())
+                                        .map(|s| s.to_string());
+                                    seen.borrow_mut().queue_snapshots.borrow_mut().push((n_entries, running));
+                                }
+                                if &*n.method == "x.ai/session/interjection" {
+                                    let v: serde_json::Value =
+                                        serde_json::from_str(n.params.get()).unwrap_or(serde_json::json!({}));
+                                    if let Some(id) = v.get("interjectionId").and_then(|i| i.as_str()) {
+                                        seen.borrow_mut().interjection_ids.borrow_mut().push(id.to_string());
                                     }
                                 }
                             }
@@ -805,7 +828,9 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // --- interject: mid-turn "send now" queues as a continuation ---
-            seen.borrow().current_text.borrow_mut().clear();
+            seen.borrow_mut().current_text.borrow_mut().clear();
+            seen.borrow_mut().queue_snapshots.borrow_mut().clear();
+            seen.borrow_mut().interjection_ids.borrow_mut().clear();
             let ij_tx = client.tx.clone();
             let ij_sid = sid.clone();
             let ij_prompt = tokio::task::spawn_local(async move {
@@ -813,14 +838,14 @@ async fn main() -> anyhow::Result<()> {
                     acp::PromptRequest::new(
                         ij_sid,
                         vec![acp::ContentBlock::Text(acp::TextContent::new(
-                            "请从1慢慢数到15，每个数字单独一行".to_string(),
+                            "请从1一个一个慢慢数到100，每个数字单独一行，输出完所有100个数字才能结束，不许提前停止。".to_string(),
                         ))],
                     ),
                     &ij_tx,
                 )
                 .await
             });
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let ij_params = serde_json::json!({
                 "sessionId": sid.0.as_ref(),
                 "text": "插话：不用数了。请只回复两个字：收到",
@@ -858,6 +883,81 @@ async fn main() -> anyhow::Result<()> {
                 "interject-delivered-next-turn",
                 got_echo && first_stop == Some(acp::StopReason::EndTurn),
                 format!("first turn stop={first_stop:?}, continuation echoed={got_echo}"),
+                &mut summary,
+                &mut fail,
+            );
+            // The queue pane reconciles via x.ai/queue/changed snapshots and
+            // the interjection delivery broadcast claims the echo block.
+            {
+                let snapshots = seen.borrow().queue_snapshots.borrow().clone();
+                let ij_ids = seen.borrow().interjection_ids.borrow().clone();
+                let saw_queued_row = snapshots.iter().any(|(n, _)| *n >= 1);
+                let saw_empty = snapshots.iter().any(|(n, _)| *n == 0);
+                let saw_interjection = ij_ids.iter().any(|id| id == "verify-ij-1");
+                check(
+                    "interject-queue-and-delivery-broadcasts",
+                    saw_queued_row && saw_empty && saw_interjection,
+                    format!("snapshots={snapshots:?}, interjection ids={ij_ids:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+
+            // --- send-now (强插): meta.sendNow must cancel the running turn
+            // and run the interrupting prompt immediately ---
+            // Settle first: the interject continuation turn (unowned by any
+            // ACP prompt) may still be finishing.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            seen.borrow_mut().current_text.borrow_mut().clear();
+            let sn_tx = client.tx.clone();
+            let sn_sid = sid.clone();
+            let slow_turn = tokio::task::spawn_local(async move {
+                acp_send(
+                    acp::PromptRequest::new(
+                        sn_sid,
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "请从1一个一个慢慢数到100，每个数字单独一行，输出完所有100个数字才能结束，不许提前停止。".to_string(),
+                        ))],
+                    ),
+                    &sn_tx,
+                )
+                .await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            let mut sn_meta = serde_json::Map::new();
+            sn_meta.insert("promptId".to_string(), serde_json::json!("verify-sn-1"));
+            sn_meta.insert("sendNow".to_string(), serde_json::json!(true));
+            let sn_turn = acp_send(
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "1+1等于几？只回答阿拉伯数字。".to_string(),
+                    ))],
+                )
+                .meta(Some(sn_meta)),
+                &client.tx,
+            )
+            .await;
+            let sn_stop = sn_turn.as_ref().map(|r| format!("{:?}", r.stop_reason)).map_err(|e| e.to_string());
+            // The interrupted turn must settle (not hang).
+            let slow_settled = matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(60), slow_turn).await,
+                Ok(Ok(_))
+            );
+            let mut sn_answer = String::new();
+            for _ in 0..20 {
+                sn_answer = seen.borrow().current_text.borrow().clone();
+                if sn_answer.contains('2') {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            check(
+                "send-now-interrupts-running-turn",
+                matches!(&sn_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn)
+                    && sn_answer.contains('2')
+                    && slow_settled,
+                format!("send-now turn={sn_stop:?}, answer={:?}, interrupted turn settled={slow_settled}", &sn_answer[..sn_answer.len().min(40)]),
                 &mut summary,
                 &mut fail,
             );
