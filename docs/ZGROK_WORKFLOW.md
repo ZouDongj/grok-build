@@ -49,6 +49,16 @@ ext 等待压缩回合真实完成才回 Ok；压缩中的 prompt 排队为 cont
 - `sendText(requestedDelivery:"guide")` → x.ai/interject 回合中真转向（不打断注入）
 - `sendText(requestedDelivery:"startNow")` → meta.sendNow 原子抢占
 两者均带回退（老内核 → 回合边界队列 / stop+retry）。新增 x.ai/v4/command 透传。
+已接入（v4 订阅模型落地后）：
+- `editUserQuery` 深回滚已实现——rewind = fork 在目标前一回合的 assistant 行（fork 实测
+  只含之前历史）+ kernel_id 换轨 + pager 自截断视图；目标 0 = 新建空会话
+- 队列五操作（x.ai/queue/{edit,remove,reorder,clear,interject} 通知）→ v4 队列命令，
+  队列广播携带内核 queueItemId
+- `setFollowupMode(queue|guide)`（x.ai/session/set_followup_mode）
+- 内核自发压缩的 auto_compact_started/completed 横幅
+- v4 订阅模型：帧解包 + snapshot/delta 折叠（含 row.removed 截断）+ kernel_id 事件重映射
+- 内核怪癖：**压缩回合运行中 v4 sendText(queue) 会卡死队列排水**——压缩路径保持本地
+  continuation 槽（已实证并记录）
 待接入（v4 均已可达）：
 - `editUserQuery`（截断式 rewind；CAS 需 baseRevision+baseLogEpoch+rowTarget，
   需先接 v4/conversation/subscribe 的 rows/revision 模型）
