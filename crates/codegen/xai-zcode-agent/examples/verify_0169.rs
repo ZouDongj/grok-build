@@ -998,6 +998,9 @@ async fn main() -> anyhow::Result<()> {
                 &mut fail,
             );
 
+            // Settle: any late continuation/queue delivery from the
+            // compact section must finish before the image capture window.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             // --- image input: switch to Flash (the multimodal model), send a
             // solid-red PNG, expect a color answer that proves the pixels
             // reached the model ---
