@@ -57,3 +57,25 @@ zgrok = xAI grok-build TUI（前端 100% 原生）+ ZCode 内核（0.16.9+，app
 prompt_history（上箭头召回，读内核 input_history 表）、session/usage（turn_usage 聚合）、
 compact_conversation（/compact → session/compact）、session/fork、interject、
 plugins enable/disable/install/uninstall/update。
+
+## 子代理可视化的真实通道（edca112）
+
+ZCode 客户端看子代理**不走 RPC**——子会话的 session/subscribe、session/events、
+session/messages 一律被内核拒绝（`Session is not active`，verify_0169 有固化断言）。
+官方通道有两条，zgrok 现已都用：
+
+1. **原生 `subagent.lifecycle` 事件**：跟着父会话流下发（phase spawned/stopped，
+   带 agentId/childSessionId/agentType/status），handle_event 直接消费；
+   session/subagents 轮询降级为兜底（只负责 progress 心跳）。
+2. **转录文件**：`~/.zcode/cli/agents/<父内核会话>/agent_<id>/`（客户端的
+   subagentTranscripts 存储类就是这个前缀）。metadata.json 有状态/令牌/时长，
+   output.txt 按字节游标增量 tail 出内容；SQL 读消息账本仅作无文件内核的 fallback。
+
+教训：下"内核没暴露"结论前，先反查官方客户端（asar 的 scheduler/host 包）用的是什么。
+
+## 内核不开门清单（剩两项）
+
+| 功能 | 现状 | 出路 |
+|---|---|---|
+| rewind 执行 | fork 保留全账本，无截断式回滚 | 等内核方法或做账本手术 |
+| MCP 配置写 | 只认 settings 文件 | 写文件 + 重启提示 |
