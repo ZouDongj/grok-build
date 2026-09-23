@@ -83,6 +83,19 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   app-server RPC 无条件拒绝并发 send——RPC 面上只能做到回合边界投递。
 - turn_epoch 守卫：陈旧的 turn.failed 宽限期不再误杀新回合。
 
+## 夜班对齐记录（resume 子代理修复 + 三项对齐）
+
+- **resume 后首条消息误报 "Ran 1 subagent 1 failed"**：session/subagents 返回历史子代理，
+  轮询器误当新增播报。load_session 现预置历史 id 为已播报状态。
+- **TodoWrite 清单**：db todo 表 → ACP 原生 SessionUpdate::Plan（回合/压缩完成后推送）。
+  注意 x.ai/session_notification 的 XaiSessionUpdate 枚举没有 plan 变体，必须走 ACP 原生通道。
+- **会话删除**：优先 v4 deleteSession（内核侧清理），db 手术兜底。
+- **计量对表**：v4/conversation/usage 与 SQL 逐字段一致（x.ai/v4/usage ext 可直查）；
+  唯一口径差：cacheRead（v4 查询返 0，db 行有值）。
+- **斜杠命令**：纯文本 /goal 经 session/send 被内核解析（goal 语义生效）。
+- **视频**：ACP 通道只有 Text/Image 块，TUI 结构性不支持（内核侧就绪）。
+- **v4 createSession**：开源注释明说其 binder 调旧 create op——无迁移紧迫性。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
