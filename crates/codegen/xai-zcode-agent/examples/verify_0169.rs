@@ -32,6 +32,9 @@ struct Seen {
     current_text: RefCell<String>,
     queue_snapshots: RefCell<Vec<(usize, Option<String>)>>,
     plan_entries: RefCell<Vec<usize>>,
+    goal_updates: RefCell<Vec<String>>,
+    thought_durations_ms: RefCell<Vec<i64>>,
+    thought_first_ts: std::cell::Cell<Option<i64>>,
     interjection_ids: RefCell<Vec<String>>,
 }
 
@@ -117,6 +120,21 @@ async fn main() -> anyhow::Result<()> {
                             }
                             AcpClientMessage::SessionNotification(u) => {
                                 if let acp::SessionUpdate::AgentThoughtChunk(c) = &u.update {
+                                    if let (acp::ContentBlock::Text(t), Some(m)) = (&c.content, u.meta.as_ref()) {
+                                        if !t.text.is_empty() {
+                                            let ts = m.get("agentTimestampMs").and_then(|v| v.as_i64());
+                                            let first = seen.borrow().thought_first_ts.get();
+                                            if let (Some(a), Some(first)) = (ts, first) {
+                                                seen
+                                                    .borrow_mut()
+                                                    .thought_durations_ms
+                                                    .borrow_mut()
+                                                    .push(a - first);
+                                            } else if first.is_none() && ts.is_some() {
+                                                seen.borrow_mut().thought_first_ts.set(ts);
+                                            }
+                                        }
+                                    }
                                     if let acp::ContentBlock::Text(t) = &c.content {
                                         let is_ack = t.text.is_empty()
                                             && u.meta.as_ref().and_then(|m| m.get("promptId")).is_some()
@@ -215,6 +233,14 @@ async fn main() -> anyhow::Result<()> {
                                         .and_then(|r| r.as_str())
                                         .map(|s| s.to_string());
                                     seen.borrow_mut().queue_snapshots.borrow_mut().push((n_entries, running));
+                                }
+                                if &*n.method == "x.ai/session_notification" {
+                                    let v: serde_json::Value =
+                                        serde_json::from_str(n.params.get()).unwrap_or(serde_json::json!({}));
+                                    if v.pointer("/update/sessionUpdate").and_then(|k| k.as_str()) == Some("goal_updated") {
+                                        let status = v.pointer("/update/status").and_then(|k| k.as_str()).unwrap_or("").to_string();
+                                        seen.borrow_mut().goal_updates.borrow_mut().push(status);
+                                    }
                                 }
                                 if &*n.method == "x.ai/session/interjection" {
                                     let v: serde_json::Value =
@@ -884,11 +910,91 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await;
                 let events = seen.borrow().subagent_events.borrow().clone();
+                // Replayed thoughts carry ledger timestamps: the pager can
+                // compute real durations instead of "Thought for 0.0s".
+                let stamps = seen.borrow().thought_durations_ms.borrow().clone();
+                let replay_durations_real = stamps.len() >= 2
+                    && stamps.windows(2).any(|w| w[1] - w[0] >= 1000);
+                check(
+                    "replay-thoughts-have-real-durations",
+                    replay_durations_real,
+                    format!("thought timestamps seen: {stamps:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
                 check(
                     "resume-no-historical-subagent-rebroadcast",
                     events.is_empty()
                         && matches!(&first, Ok(r) if r.stop_reason == acp::StopReason::EndTurn),
                     format!("subagent events after resume prompt: {events:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
+            }
+
+            // --- goal mode: set via /goal text, panel updates, pause, clear ---
+            {
+                seen.borrow_mut().goal_updates.borrow_mut().clear();
+                let goal_turn = acp_send(
+                    acp::PromptRequest::new(
+                        sid.clone(),
+                        vec![acp::ContentBlock::Text(acp::TextContent::new(
+                            "/goal 目标：验证goal面板接线".to_string(),
+                        ))],
+                    ),
+                    &client.tx,
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let goals = seen.borrow().goal_updates.borrow().clone();
+                let saw_active = goals.iter().any(|g| g == "active");
+                check(
+                    "goal-panel-set-visible",
+                    matches!(&goal_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn) && saw_active,
+                    format!("goal updates: {goals:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
+                let pause = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/session/goal",
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "sessionId": sid.0, "action": "pause",
+                        }))
+                        .expect("serialize goal pause")
+                        .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let goals = seen.borrow().goal_updates.borrow().clone();
+                let saw_paused = goals.iter().any(|g| g == "user_paused");
+                check(
+                    "goal-pause-via-ext",
+                    pause.is_ok() && saw_paused,
+                    format!("goal updates: {goals:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
+                let _ = acp_send(
+                    acp::ExtRequest::new(
+                        "x.ai/session/goal",
+                        serde_json::value::to_raw_value(&serde_json::json!({
+                            "sessionId": sid.0, "action": "clear",
+                        }))
+                        .expect("serialize goal clear")
+                        .into(),
+                    ),
+                    &client.tx,
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let goals = seen.borrow().goal_updates.borrow().clone();
+                check(
+                    "goal-clear-via-ext",
+                    goals.iter().any(|g| g == "cleared"),
+                    format!("goal updates: {goals:?}"),
                     &mut summary,
                     &mut fail,
                 );

@@ -90,6 +90,10 @@ struct SessionState {
     v4_assistant_rows: RefCell<Vec<(i64, String, String, String)>>,
     /// Kernel-authoritative queue state from the v4 projection (raw items).
     v4_queue_items: RefCell<Vec<(String, String)>>,
+    /// Last-seen kernel goal state (v4 projection) for change detection.
+    v4_goal: RefCell<Option<Value>>,
+    /// Last-seen kernel background works (v4 projection).
+    v4_background_works: RefCell<Vec<Value>>,
     /// True when the RUNNING compaction turn was started by our
     /// x.ai/compact_conversation ext (the pager already shows its Command
     /// state — banners are only for KERNEL-initiated auto compaction).
@@ -140,6 +144,8 @@ impl SessionState {
             v4_user_rows: RefCell::new(Vec::new()),
             v4_assistant_rows: RefCell::new(Vec::new()),
             v4_queue_items: RefCell::new(Vec::new()),
+            v4_goal: RefCell::new(None),
+            v4_background_works: RefCell::new(Vec::new()),
             fail_grace_cancel: RefCell::new(None),
             compacting: std::cell::Cell::new(false),
             compact_by_ext: std::cell::Cell::new(false),
@@ -508,6 +514,8 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                             let state = pump_shared.state.borrow().sessions.get(&session_key).cloned();
                             if let Some(state) = state {
                                 let queue_before = state.v4_queue_items.borrow().clone();
+                                let goal_before = state.v4_goal.borrow().clone();
+                                let works_before = state.v4_background_works.borrow().clone();
                                 update_v4_projection(&state, frame);
                                 let queue_after = state.v4_queue_items.borrow().clone();
                                 if queue_before != queue_after {
@@ -516,6 +524,14 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                                         .map(|(id, text)| (id.clone(), "prompt", text.clone()))
                                         .collect();
                                     broadcast_queue(&pump_gateway, acp_sid, &rows, None);
+                                }
+                                let goal_after = state.v4_goal.borrow().clone();
+                                if goal_before != goal_after {
+                                    emit_goal_updated(&pump_gateway, acp_sid, goal_after.as_ref());
+                                }
+                                let works_after = state.v4_background_works.borrow().clone();
+                                if works_before != works_after {
+                                    emit_background_tasks(&pump_gateway, acp_sid, &works_after);
                                 }
                             }
                         }
@@ -1790,11 +1806,50 @@ impl acp::Agent for ZcodeAgent {
                     }
                 }
                 if role == "assistant" && !reasoning.trim().is_empty() {
-                    notify(
-                        &self.gateway,
-                        &args.session_id,
-                        acp::SessionUpdate::AgentThoughtChunk(text_chunk(reasoning)),
-                    );
+                    // Replay with REAL durations: the pager computes
+                    // "Thought for Xs" from chunk meta timestamps
+                    // (agentTimestampMs). One bare chunk reads as 0.0s; split
+                    // the reasoning and stamp the halves with the ledger's
+                    // message created/completed times so history shows the
+                    // true thinking span.
+                    let created = message
+                        .pointer("/info/time/created")
+                        .and_then(Value::as_u64);
+                    let completed = message
+                        .pointer("/info/time/completed")
+                        .and_then(Value::as_u64);
+                    let notify_thought = |text: String, ts: Option<u64>| {
+                        let mut notif = acp::SessionNotification::new(
+                            args.session_id.clone(),
+                            acp::SessionUpdate::AgentThoughtChunk(text_chunk(text)),
+                        );
+                        if let Some(ts) = ts {
+                            let mut meta = acp::Meta::new();
+                            meta.insert("agentTimestampMs".to_string(), json!(ts));
+                            notif.meta = Some(meta);
+                        }
+                        self.gateway.forward_fire_and_forget(notif);
+                    };
+                    match (created, completed) {
+                        (Some(created), Some(completed)) if completed > created => {
+                            // Char-safe midpoint: byte split_at would panic
+                            // inside a multi-byte character.
+                            let mut split = reasoning.len() / 2;
+                            while split < reasoning.len() && !reasoning.is_char_boundary(split) {
+                                split += 1;
+                            }
+                            let (head, tail) = reasoning.split_at(split.max(1));
+                            notify_thought(head.to_string(), Some(created));
+                            notify_thought(tail.to_string(), Some(completed));
+                        }
+                        _ => {
+                            notify(
+                                &self.gateway,
+                                &args.session_id,
+                                acp::SessionUpdate::AgentThoughtChunk(text_chunk(reasoning)),
+                            );
+                        }
+                    }
                 }
                 if !text.trim().is_empty() {
                     let update = if role == "user" {
@@ -1862,6 +1917,56 @@ impl acp::Agent for ZcodeAgent {
         let attachments = prompt_attachments(&args.prompt);
         if !attachments.is_empty() {
             debug_log(&format!("prompt: {} image attachment(s)", attachments.len()));
+        }
+        // /goal text command interception: the kernel does NOT parse slash
+        // commands from session/send (they arrive as plain text and confuse
+        // the model) — route to the structured sessionGoal RPC instead.
+        if text.trim_start().starts_with("/goal") && attachments.is_empty() {
+            let kernel_sid = state.kernel_id.borrow().clone();
+            let rest = text.trim_start()[5..].trim().to_string();
+            let mut action = "set".to_string();
+            let mut objective = rest.clone();
+            match rest.as_str() {
+                "" | "show" => action = "show".to_string(),
+                "pause" => action = "pause".to_string(),
+                "resume" => action = "resume".to_string(),
+                "clear" => action = "clear".to_string(),
+                other if other.starts_with("replace ") => {
+                    action = "replace".to_string();
+                    objective = other[8..].trim().to_string();
+                }
+                _ => {}
+            }
+            let mut payload = json!({"sessionId": kernel_sid, "action": action});
+            if action == "set" || action == "replace" {
+                if objective.is_empty() {
+                    notify(
+                        &self.gateway,
+                        &args.session_id,
+                        acp::SessionUpdate::AgentMessageChunk(text_chunk(
+                            "用法：/goal <目标> | /goal pause | /goal resume | /goal clear | /goal show",
+                        )),
+                    );
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
+                payload["objective"] = json!(objective);
+            }
+            debug_log(&format!("goal command: {action}"));
+            let result = kernel.call("session/goal", payload).await;
+            let reply = match result {
+                Ok(v) => v
+                    .get("response")
+                    .and_then(Value::as_str)
+                    .unwrap_or("目标已更新。")
+                    .to_string(),
+                Err(e) => format!("goal 命令失败: {e}"),
+            };
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+            );
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
         // Send-now (强插): the pager marks interrupting prompts with
         // meta.sendNow — cancel the running kernel turn, wait for the
@@ -2953,6 +3058,67 @@ impl acp::Agent for ZcodeAgent {
                     .expect("serialize projection");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
+            // Goal control: the kernel's session/goal RPC (show/pause/
+            // resume/clear/replace/set). /goal text prompts already parse;
+            // this is the structured control surface.
+            "x.ai/session/goal" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                let action = params.get("action").and_then(Value::as_str).unwrap_or("show").to_string();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let kernel = self.kernel()?;
+                let mut payload = json!({"sessionId": id, "action": action});
+                if let Some(objective) = params.get("objective").and_then(Value::as_str) {
+                    payload["objective"] = json!(objective);
+                }
+                let result = kernel
+                    .call("session/goal", payload)
+                    .await
+                    .map_err(|e| {
+                        acp::Error::internal_error().data(format!("session/goal failed: {e}"))
+                    })?;
+                let body = json!({
+                    "response": result.get("response").and_then(Value::as_str).unwrap_or_default(),
+                    "startedTurn": result.get("startedTurn").and_then(Value::as_bool).unwrap_or(false),
+                });
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize goal ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Kill one background work unit (bash tasks here) via the v4
+            // cancelBackgroundWork command.
+            "x.ai/task/kill" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params.get("sessionId").and_then(Value::as_str).unwrap_or_default().to_string();
+                let task_id = params
+                    .get("taskId")
+                    .or_else(|| params.get("task_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let acp_sid = acp::SessionId::new(id.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&acp_sid)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let kernel = self.kernel()?;
+                let kernel_sid = state.kernel_id.borrow().clone();
+                let ack = v4_command(&kernel, &kernel_sid, "cancelBackgroundWork", json!({"workId": task_id}), None)
+                    .await
+                    .map_err(|e| acp::Error::internal_error().data(format!("cancelBackgroundWork failed: {e}")))?;
+                let body = json!({"status": ack.get("status")});
+                let raw = serde_json::value::to_raw_value(&body)
+                    .expect("serialize kill ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // v4/conversation/usage query — the official session-token
             // meter (same result shape as the legacy session/usage word).
             "x.ai/v4/usage" => {
@@ -3771,6 +3937,12 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                 }
             }
             *state.v4_queue_items.borrow_mut() = items;
+            *state.v4_goal.borrow_mut() = snapshot.get("goal").cloned().filter(|g| !g.is_null());
+            *state.v4_background_works.borrow_mut() = snapshot
+                .get("backgroundWorks")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
         }
         Some("deltas") => {
             let Some(deltas) = payload.get("deltas").and_then(Value::as_array) else {
@@ -3840,12 +4012,115 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                             }
                             *state.v4_queue_items.borrow_mut() = queue;
                         }
+                        if let Some(goal) = patch.get("goal") {
+                            *state.v4_goal.borrow_mut() =
+                                goal.as_object().map(|_| goal.clone()).or_else(|| {
+                                    if goal.is_null() { None } else { Some(goal.clone()) }
+                                });
+                        }
+                        if let Some(works) = patch.get("backgroundWorks").and_then(Value::as_array) {
+                            *state.v4_background_works.borrow_mut() = works.clone();
+                        }
                     }
                     _ => {}
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// Translate the kernel's goal state (v4 projection) into the pager's
+/// goal_updated notification (grok goal panel). Null/absent → cleared.
+fn emit_goal_updated(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    session_id: &str,
+    goal: Option<&Value>,
+) {
+    let update = match goal {
+        Some(g) => {
+            let objective = g.get("objective").and_then(Value::as_str).unwrap_or_default();
+            let kernel_status = g.get("status").and_then(Value::as_str).unwrap_or("active");
+            let status = match kernel_status {
+                "paused" => "user_paused",
+                "verified" => "complete",
+                "notSatisfied" | "failed" => "blocked",
+                _ => "active",
+            };
+            let phase = if kernel_status == "verifying" { "executing" } else if status == "active" { "executing" } else { "idle" };
+            json!({
+                "sessionUpdate": "goal_updated",
+                "goal_id": g.get("targetId").and_then(Value::as_str).unwrap_or("kernel-goal"),
+                "objective": objective,
+                "status": status,
+                "phase": phase,
+                "elapsed_ms": g.get("timeUsedSeconds").and_then(Value::as_u64).unwrap_or(0) * 1000,
+                "tokens_used": 0,
+                "total_deliverables": 0,
+                "completed_deliverables": 0,
+                "total_worker_rounds": 0,
+                "total_verify_rounds": 0,
+            })
+        }
+        None => json!({
+            "sessionUpdate": "goal_updated",
+            "goal_id": "kernel-goal",
+            "objective": "",
+            "status": "cleared",
+            "phase": "idle",
+            "elapsed_ms": 0,
+            "total_deliverables": 0,
+            "completed_deliverables": 0,
+            "total_worker_rounds": 0,
+            "total_verify_rounds": 0,
+        }),
+    };
+    let payload = json!({"sessionId": session_id, "update": update});
+    if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/session_notification",
+            raw.into(),
+        ));
+    }
+}
+
+/// Translate the kernel's background works (v4 projection) into the
+/// pager's background_tasks snapshot. Only bash-kind works are listed as
+/// tasks — subagents already ride their own lifecycle notifications.
+fn emit_background_tasks(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    session_id: &str,
+    works: &[Value],
+) {
+    let tasks: Vec<Value> = works
+        .iter()
+        .filter(|w| w.get("kind").and_then(Value::as_str) == Some("bash"))
+        .map(|w| {
+            let kernel_status = w.get("status").and_then(Value::as_str).unwrap_or("running");
+            let status = match kernel_status {
+                "failed" => "failed",
+                "cancelled" | "resultPending" => "completed",
+                _ => "running",
+            };
+            json!({
+                "task_id": w.get("workId").and_then(Value::as_str).unwrap_or_default(),
+                "command": w.get("title").and_then(Value::as_str).unwrap_or_default(),
+                "cwd": "",
+                "kind": "bash",
+                "status": status,
+                "started_at": w.get("startedAt").and_then(Value::as_u64).unwrap_or(0),
+            })
+        })
+        .collect();
+    let payload = json!({
+        "sessionId": session_id,
+        "update": {"sessionUpdate": "background_tasks", "tasks": tasks, "truncated": false},
+    });
+    if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/session_notification",
+            raw.into(),
+        ));
     }
 }
 
