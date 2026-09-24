@@ -111,6 +111,11 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   教训：**回归检查必须复刻消费方的公式**，只验证"字段存在"不等于"渲染正确"。
 - **goal 面板**：v4 投影 goal 字段 → goal_updated 通知（active/user_paused/
   complete/blocked 映射）；/goal 文本命令 + x.ai/session/goal ext 均可控制。
+  入口可见性（5cee23d）：zcode agent 必须**广告** /goal —— initialize 的
+  `meta.availableCommands` 引导 + new/load_session 后 400ms 延迟推
+  AvailableCommandsUpdate（早于会话面板注册的会被 pager 丢弃）；AcpSlashCommand
+  走 PassThrough，即 `/goal <args>` 原样进 prompt 被拦截。设置 goal 后按 `g`
+  键打开 goal 详情面板。
 - **后台任务**：v4 投影 backgroundWorks（bash 类）→ background_tasks 通知；
   x.ai/task/kill → v4 cancelBackgroundWork。
 
