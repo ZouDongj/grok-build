@@ -118,6 +118,14 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   键打开 goal 详情面板。
 - **后台任务**：v4 投影 backgroundWorks（bash 类）→ background_tasks 通知；
   x.ai/task/kill → v4 cancelBackgroundWork。
+- **goal 状态深度映射（d0516b2）**：内核 goal schema 有独立 `verifying` 状态、
+  `verifications[]`（每轮 outcome/reason/nextAction）、`iterations[]`。映射：
+  verifying→verifying_completion 覆盖层；verifications.len→verify 轮数；
+  iterations.len→worker 轮数（面板 Rounds 行）；末轮 outcome→verdict 徽章
+  （achieved/not_achieved）；notSatisfied/failed→blocked+pause_message（验证
+  原因，Reason 块）。端到端实证（probe_goal_e2e）：设定目标→内核自主创建
+  文件并自验→active→verifying→complete(verify=1, achieved)。未映射：goal 专属
+  token 统计（内核 v4 不按 goal 分账，tokens_used 恒 0）。
 
 ## 上下文仪表实时刷新（compact 后立即回落，官方一致）
 
