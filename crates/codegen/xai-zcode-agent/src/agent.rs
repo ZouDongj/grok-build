@@ -88,6 +88,11 @@ struct SessionState {
     /// assistantText rows in order: (rowId, entityId, turnId, state) —
     /// forkAssistant targets for deep rewind.
     v4_assistant_rows: RefCell<Vec<(i64, String, String, String)>>,
+    /// turnHeader rows in order (raw JSON): file-change summaries and row
+    /// actions (canRewindFiles / editDisposition) live here.
+    v4_turn_headers: RefCell<Vec<Value>>,
+    /// Kernel workflow runs (v4 projection workflowRuns.runs, raw).
+    v4_workflow_runs: RefCell<Vec<Value>>,
     /// Kernel-authoritative queue state from the v4 projection (raw items).
     v4_queue_items: RefCell<Vec<(String, String)>>,
     /// Kernel queue autoDrain flag (v4 projection): stop() forces it false —
@@ -155,6 +160,8 @@ impl SessionState {
             v4_snapshot_count: std::cell::Cell::new(0),
             v4_user_rows: RefCell::new(Vec::new()),
             v4_assistant_rows: RefCell::new(Vec::new()),
+            v4_turn_headers: RefCell::new(Vec::new()),
+            v4_workflow_runs: RefCell::new(Vec::new()),
             v4_queue_items: RefCell::new(Vec::new()),
             v4_queue_autodrain: std::cell::Cell::new(true),
             v4_goal: RefCell::new(None),
@@ -562,6 +569,7 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                                 let queue_before = state.v4_queue_items.borrow().clone();
                                 let goal_before = state.v4_goal.borrow().clone();
                                 let works_before = state.v4_background_works.borrow().clone();
+                                let runs_before = state.v4_workflow_runs.borrow().clone();
                                 let usage_before = *state.v4_usage.borrow();
                                 update_v4_projection(&state, frame);
                                 let queue_after = state.v4_queue_items.borrow().clone();
@@ -616,6 +624,17 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                                         &pump_gateway,
                                         notify_sid.0.as_ref(),
                                         &works_after,
+                                    );
+                                }
+                                // Workflows: map the kernel's run states onto
+                                // the pager's workflow_updated rail (the same
+                                // wire the grok-native shell uses).
+                                let runs_after = state.v4_workflow_runs.borrow().clone();
+                                if runs_before != runs_after {
+                                    emit_workflow_updates(
+                                        &pump_gateway,
+                                        notify_sid.0.as_ref(),
+                                        &runs_after,
                                     );
                                 }
                                 // Real-time context meter: the kernel pushes
@@ -754,6 +773,62 @@ fn write_summary_stub(session_id: &str, cwd: &str) {
     }
 }
 
+/// Sync the kernel's auto-generated session title (session.title,
+/// title_source='generated') into the pager's summary.json so the resume
+/// list shows real titles instead of the stub's empty summary. Best-effort;
+/// read-only on the kernel db.
+fn sync_kernel_title(session_id: &str, cwd: &str) {
+    let Some(home) = std::env::var_os("GROK_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+    else {
+        return;
+    };
+    let kernel_home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&kernel_home).join(".zcode/cli/db/db.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return;
+    };
+    let Ok((title, updated)) = con.query_row(
+        "SELECT title, time_updated FROM session WHERE id = ?1",
+        [session_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+    ) else {
+        return;
+    };
+    if title.trim().is_empty() {
+        return;
+    }
+    let Some(encoded) = encode_cwd_dirname(cwd) else { return };
+    let path = home
+        .join(".grok")
+        .join("sessions")
+        .join(encoded)
+        .join(session_id)
+        .join("summary.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut summary) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    let current = summary
+        .get("session_summary")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let stamp = ms_to_rfc3339(updated);
+    if current == title
+        && summary.get("updated_at").and_then(Value::as_str) == Some(stamp.as_str())
+    {
+        return;
+    }
+    summary["session_summary"] = json!(title);
+    summary["updated_at"] = json!(stamp);
+    let _ = std::fs::write(&path, summary.to_string());
+}
+
 /// Remove one session from the kernel's store. The app-server protocol has
 /// no delete method; the desktop app edits this same db. Best-effort per
 /// child table (schema varies across kernel versions), but the session row
@@ -800,7 +875,7 @@ fn rewind_points(session_id: &str) -> Vec<Value> {
     ) else {
         return Vec::new();
     };
-    let rows = stmt
+    let mut rows = stmt
         .query_map([session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -810,22 +885,66 @@ fn rewind_points(session_id: &str) -> Vec<Value> {
         })
         .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
         .unwrap_or_default();
-    rows.into_iter()
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    // Real per-turn file-change flags: a turn spans from its user message
+    // to the next; Write/Edit tool parts inside the span mark it. The
+    // picker badges these points (the official turnHeader.fileChanges
+    // equivalent reachable from the ledger).
+    let edits: Vec<i64> = con
+        .prepare(
+            "SELECT m.sequence FROM part p JOIN message m ON m.id = p.message_id \
+             WHERE p.session_id = ?1 AND json_extract(p.data, '$.type') = 'tool' \
+             AND json_extract(p.data, '$.tool') IN ('Write','Edit') \
+             ORDER BY m.sequence",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map([session_id], |row| row.get::<_, i64>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    // Boundaries: the leading sequence of each user message.
+    let bounds: Vec<i64> = {
+        let mut b: Vec<i64> = con
+            .prepare(
+                "SELECT MIN(m.sequence) FROM message m WHERE m.session_id = ?1 \
+                 AND m.data LIKE '%\"role\":\"user\"%' GROUP BY m.id ORDER BY MIN(m.sequence)",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([session_id], |row| row.get::<_, i64>(0))
+                    .map(|rows| rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default();
+        b.push(i64::MAX);
+        b
+    };
+    rows.sort_by_key(|(_, _, _)| 0);
+    let _ = &mut rows;
+    let mark = |user_seq_bound_idx: usize| -> bool {
+        let from = bounds[user_seq_bound_idx];
+        let to = bounds[user_seq_bound_idx + 1];
+        edits.iter().any(|seq| *seq > from && *seq < to)
+    };
+    bounds[..bounds.len() - 1]
+        .iter()
         .enumerate()
-        .map(|(index, (id, created, preview))| {
+        .zip(rows.iter())
+        .map(|((idx, _), (id, created, preview))| {
             let preview = preview
+                .as_deref()
                 .and_then(|data| {
-                    serde_json::from_str::<Value>(&data)
+                    serde_json::from_str::<Value>(data)
                         .ok()
                         .and_then(|j| j.get("text").and_then(Value::as_str).map(str::to_string))
                 })
                 .unwrap_or_default();
             json!({
-                "promptIndex": index,
-                "createdAt": ms_to_rfc3339(created),
+                "promptIndex": idx,
+                "createdAt": ms_to_rfc3339(*created),
                 "numFileSnapshots": 0,
                 "promptPreview": preview.chars().take(160).collect::<String>(),
-                "hasFileChanges": false,
+                "hasFileChanges": mark(idx),
                 "messageId": id,
             })
         })
@@ -1338,11 +1457,19 @@ fn push_available_commands(gateway: &AcpGatewaySender<acp::AgentSide>, session: 
         "drain",
         "Control kernel queue auto-drain (stopped queues wait)",
     );
+    let filerewind = acp::AvailableCommand::new(
+        "filerewind",
+        "Revert the last turn's file changes (chat history kept)",
+    );
+    let retry = acp::AvailableCommand::new(
+        "retry",
+        "Re-run the last user turn (official retryTurn)",
+    );
     notify(
         gateway,
         session,
         acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![
-            cmd, rate, drain,
+            cmd, rate, drain, filerewind, retry,
         ])),
     );
 }
@@ -1824,6 +1951,15 @@ impl acp::Agent for ZcodeAgent {
                             "description": "Control kernel queue auto-drain (stopped queues wait)",
                             "input": { "hint": "on | off | (bare = status)" },
                         }),
+                        json!({
+                            "name": "filerewind",
+                            "description": "Revert the last turn's file changes (chat history kept)",
+                            "input": { "hint": "(bare = preview) | apply" },
+                        }),
+                        json!({
+                            "name": "retry",
+                            "description": "Re-run the last user turn (official retryTurn)",
+                        }),
                     ]),
                 );
                 meta
@@ -2071,6 +2207,7 @@ impl acp::Agent for ZcodeAgent {
         // completed turn.
         if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id).cloned() {
             push_context_usage(&self.gateway, &self.shared, &state, &args.session_id);
+            sync_kernel_title(state.kernel_id.borrow().as_ref(), &state.cwd.borrow());
         }
         tracing::info!(%session_id, "zcode session resumed");
         self.defer_available_commands(args.session_id.clone());
@@ -2303,6 +2440,209 @@ impl acp::Agent for ZcodeAgent {
                             n => format!("内核队列还有 {n} 条"),
                         }
                 ),
+            };
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+            );
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        // /filerewind [preview|apply] — workspace-only file revert (v4
+        // applyFileRewind): restores the files the target turn touched
+        // WITHOUT truncating the chat history. Targets the last completed
+        // assistant row; preview lists what would happen.
+        if text.trim_start().starts_with("/filerewind") && attachments.is_empty() {
+            let arg = text.trim_start()[11..].trim();
+            let kernel_sid = state.kernel_id.borrow().clone();
+            {
+                let before = state.v4_snapshot_count.get();
+                v4_subscribe(&kernel, &kernel_sid);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while state.v4_snapshot_count.get() <= before
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            // Target = the turnHeader row (canRewindFiles lives there,
+            // not on assistant rows — targeting those gets
+            // guard.actionUnavailable).
+            let target = state
+                .v4_turn_headers
+                .borrow()
+                .iter()
+                .rev()
+                .find(|h| {
+                    h.pointer("/actions/canRewindFiles").and_then(Value::as_bool) == Some(true)
+                        && h.get("state").and_then(Value::as_str) == Some("completedSuccess")
+                })
+                .and_then(|h| {
+                    Some((
+                        h.get("rowId").and_then(Value::as_i64)?,
+                        h.get("entityId").and_then(Value::as_str)?.to_string(),
+                    ))
+                });
+            let reply = match target {
+                Some((row_id, entity_id)) => {
+                    let cas = state
+                        .v4_log_epoch
+                        .borrow()
+                        .clone()
+                        .map(|epoch| (state.v4_revision.get(), epoch));
+                    if arg == "apply" {
+                        match cas {
+                            Some((rev, epoch)) => {
+                                match v4_command(
+                                    &kernel,
+                                    &kernel_sid,
+                                    "applyFileRewind",
+                                    json!({"target": {"rowId": row_id, "entityId": entity_id}}),
+                                    Some((rev, epoch)),
+                                )
+                                .await
+                                {
+                                    Ok(ack) if ack.get("status") == Some(&json!("accepted")) => {
+                                        "文件回退已执行（会话历史保留）。".to_string()
+                                    }
+                                    Ok(ack) => format!(
+                                        "文件回退未生效: {}",
+                                        ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?")
+                                    ),
+                                    Err(e) => format!("文件回退失败: {e}"),
+                                }
+                            }
+                            None => "投影尚未就绪，稍后重试。".to_string(),
+                        }
+                    } else {
+                        // Preview: read-only RPC with the same CAS tokens.
+                        match cas {
+                            Some((rev, epoch)) => {
+                                match kernel
+                                    .call(
+                                        "v4/conversation/fileRewindPreview",
+                                        json!({
+                                            "sessionId": kernel_sid,
+                                            "target": {"rowId": row_id, "entityId": entity_id},
+                                            "baseRevision": rev,
+                                            "baseLogEpoch": epoch,
+                                        }),
+                                    )
+                                    .await
+                                {
+                                    Ok(v) => {
+                                        let fmt_file = |f: &Value| {
+                                            format!(
+                                                "  {} {}（{} 次操作）",
+                                                f.get("action").and_then(Value::as_str).unwrap_or("?"),
+                                                f.get("path").and_then(Value::as_str).unwrap_or("?"),
+                                                f.get("operationCount").and_then(Value::as_u64).unwrap_or(0)
+                                            )
+                                        };
+                                        let safe: Vec<String> = v
+                                            .get("safeFiles")
+                                            .and_then(Value::as_array)
+                                            .map(|a| a.iter().map(fmt_file).collect())
+                                            .unwrap_or_default();
+                                        let unsafe_n = v
+                                            .get("unsafeFiles")
+                                            .and_then(Value::as_array)
+                                            .map(|a| a.len())
+                                            .unwrap_or(0);
+                                        if safe.is_empty() && unsafe_n == 0 {
+                                            "该回合没有可回退的文件改动。".to_string()
+                                        } else {
+                                            format!(
+                                                "将回退:\n{}\n{}（执行：/filerewind apply）",
+                                                safe.join("\n"),
+                                                if unsafe_n > 0 {
+                                                    format!("另有 {unsafe_n} 个文件无法安全回退")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            )
+                                        }
+                                    }
+                                    Err(e) => format!("预览失败: {e}"),
+                                }
+                            }
+                            None => "投影尚未就绪，稍后重试。".to_string(),
+                        }
+                    }
+                }
+                None => "没有可定位的回复行。".to_string(),
+            };
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+            );
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        // /retry — re-run the last user turn via the official v4 retryTurn
+        // (row-targeting CAS command; targets the last realUser input row).
+        if text.trim_start().starts_with("/retry") && attachments.is_empty() {
+            let kernel_sid = state.kernel_id.borrow().clone();
+            {
+                let before = state.v4_snapshot_count.get();
+                v4_subscribe(&kernel, &kernel_sid);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while state.v4_snapshot_count.get() <= before
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            // Row-targeting lesson from applyFileRewind: retryTurn targets
+            // the turnHeader row, not the input row. canRetry only rides
+            // retryable (failed/interrupted) turns — prefer it, else the
+            // last header and let the kernel's guard decide.
+            let headers = state.v4_turn_headers.borrow().clone();
+            let target = headers
+                .iter()
+                .rev()
+                .find(|h| {
+                    h.pointer("/actions/canRetry").and_then(Value::as_bool) == Some(true)
+                })
+                .or_else(|| headers.iter().rev().find(|h| !h.get("entityId").is_none()))
+                .and_then(|h| {
+                    Some((
+                        h.get("rowId").and_then(Value::as_i64)?,
+                        h.get("entityId").and_then(Value::as_str)?.to_string(),
+                    ))
+                });
+            let reply = match target {
+                Some((row_id, entity_id)) => {
+                    let cas = state
+                        .v4_log_epoch
+                        .borrow()
+                        .clone()
+                        .map(|epoch| (state.v4_revision.get(), epoch));
+                    match cas {
+                        Some((rev, epoch)) => {
+                            match v4_command(
+                                &kernel,
+                                &kernel_sid,
+                                "retryTurn",
+                                json!({"target": {"rowId": row_id, "entityId": entity_id}}),
+                                Some((rev, epoch)),
+                            )
+                            .await
+                            {
+                                Ok(ack) if ack.get("status") == Some(&json!("accepted")) => {
+                                    "已通过官方通道重试上一轮。".to_string()
+                                }
+                                Ok(ack) => format!(
+                                    "重试未生效: {}",
+                                    ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?")
+                                ),
+                                Err(e) => format!("重试失败: {e}"),
+                            }
+                        }
+                        None => "投影尚未就绪，稍后重试。".to_string(),
+                    }
+                }
+                None => "没有可重试的用户轮次。".to_string(),
             };
             notify(
                 &self.gateway,
@@ -3408,6 +3748,15 @@ impl acp::Agent for ZcodeAgent {
                     "assistantRows": assistants,
                     "queueItems": state.v4_queue_items.borrow().len(),
                     "queueAutoDrain": state.v4_queue_autodrain.get(),
+                    "workflowRuns": state.v4_workflow_runs.borrow().len(),
+                    "turnHeaders": state.v4_turn_headers.borrow().iter().rev().take(5).map(|h| json!({
+                        "rowId": h.get("rowId"),
+                        "entityId": h.get("entityId"),
+                        "state": h.get("state"),
+                        "origin": h.get("origin"),
+                        "fileChanges": h.get("fileChanges"),
+                        "actions": h.get("actions"),
+                    })).collect::<Vec<_>>(),
                     "usage": state.v4_usage.borrow().map(|(used, max)| json!({
                         "usedTokens": used,
                         "maxTokens": max,
@@ -4315,6 +4664,20 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                 }
             }
             *state.v4_assistant_rows.borrow_mut() = assistant_rows;
+            let mut headers = Vec::new();
+            if let Some(arr) = snapshot.pointer("/rows/window").and_then(Value::as_array) {
+                for row in arr {
+                    if row.get("kind").and_then(Value::as_str) == Some("turnHeader") {
+                        headers.push(row.clone());
+                    }
+                }
+            }
+            *state.v4_turn_headers.borrow_mut() = headers;
+            *state.v4_workflow_runs.borrow_mut() = snapshot
+                .pointer("/workflowRuns/runs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
             let mut items = Vec::new();
             if let Some(arr) = snapshot.pointer("/queue/items").and_then(Value::as_array) {
                 for item in arr {
@@ -4384,6 +4747,11 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                                 let pos = rows.iter().position(|(rid, _, _, _)| *rid > row_id).unwrap_or(rows.len());
                                 rows.insert(pos, (row_id, entity_id, turn_id, st));
                             }
+                            Some("turnHeader") => {
+                                let mut headers = state.v4_turn_headers.borrow_mut();
+                                headers.retain(|h| h.get("rowId").and_then(Value::as_i64) != Some(row_id));
+                                headers.push(row.clone());
+                            }
                             _ => {}
                         }
                     }
@@ -4419,6 +4787,9 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                         if let Some(ad) = patch.pointer("/queue/autoDrain").and_then(Value::as_bool) {
                             state.v4_queue_autodrain.set(ad);
                         }
+                        if let Some(runs) = patch.pointer("/workflowRuns/runs").and_then(Value::as_array) {
+                            *state.v4_workflow_runs.borrow_mut() = runs.clone();
+                        }
                         if let Some(goal) = patch.get("goal") {
                             *state.v4_goal.borrow_mut() =
                                 goal.as_object().map(|_| goal.clone()).or_else(|| {
@@ -4437,6 +4808,58 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Translate the kernel's v4 workflow runs into the pager's
+/// workflow_updated notifications (one per run on every change; the pager
+/// upserts by run_id).
+fn emit_workflow_updates(
+    gateway: &AcpGatewaySender<acp::AgentSide>,
+    session_id: &str,
+    runs: &[Value],
+) {
+    for run in runs {
+        let run_id = run.get("runId").and_then(Value::as_str).unwrap_or_default();
+        if run_id.is_empty() {
+            continue;
+        }
+        let kernel_status = run.get("status").and_then(Value::as_str).unwrap_or("running");
+        let status = match kernel_status {
+            "pending" | "running" => "active",
+            "completed" => "complete",
+            "errored" => "failed",
+            "stopped" => match run.get("stopReason").and_then(Value::as_str) {
+                Some("user") => "cancelled",
+                _ => "interrupted",
+            },
+            _ => "active",
+        };
+        let nodes = run
+            .pointer("/usage/nodesUsed")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let update = json!({
+            "sessionUpdate": "workflow_updated",
+            "run_id": run_id,
+            "name": "Workflow",
+            "objective": run.get("resultPreview").and_then(Value::as_str).unwrap_or(""),
+            "status": status,
+            "revision": 0,
+            "agents_used": nodes,
+            "agents_reserved": 0,
+            "elapsed_ms": 0,
+            "active_agents": if status == "active" { nodes as u32 } else { 0 },
+            "result_summary": run.get("resultPreview"),
+            "pause_message": run.get("error"),
+        });
+        let payload = json!({"sessionId": session_id, "update": update});
+        if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+            gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                "x.ai/session_notification",
+                raw.into(),
+            ));
+        }
     }
 }
 
@@ -4985,6 +5408,7 @@ fn handle_event(
             }
             push_context_usage(gateway, shared, &state, &acp_session);
             push_todos(gateway, &state, &acp_session);
+            sync_kernel_title(state.kernel_id.borrow().as_ref(), &state.cwd.borrow());
             drain_pending_continuation(gateway, shared, &acp_session);
         }
         return;
@@ -5072,6 +5496,7 @@ fn handle_event(
             drain_pending_continuation(gateway, shared, &acp_session);
             push_context_usage(gateway, shared, &state, &acp_session);
             push_todos(gateway, &state, &acp_session);
+            sync_kernel_title(state.kernel_id.borrow().as_ref(), &state.cwd.borrow());
         }
         "turn.failed" => {
             // 0.16.9 emits turn.failed per failed ATTEMPT and may retry the
