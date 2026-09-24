@@ -90,6 +90,9 @@ struct SessionState {
     v4_assistant_rows: RefCell<Vec<(i64, String, String, String)>>,
     /// Kernel-authoritative queue state from the v4 projection (raw items).
     v4_queue_items: RefCell<Vec<(String, String)>>,
+    /// Kernel queue autoDrain flag (v4 projection): stop() forces it false —
+    /// queued items then wait for setAutoDrain to resume draining.
+    v4_queue_autodrain: std::cell::Cell<bool>,
     /// Last-seen kernel goal state (v4 projection) for change detection.
     v4_goal: RefCell<Option<Value>>,
     /// Last-seen kernel background works (v4 projection).
@@ -153,6 +156,7 @@ impl SessionState {
             v4_user_rows: RefCell::new(Vec::new()),
             v4_assistant_rows: RefCell::new(Vec::new()),
             v4_queue_items: RefCell::new(Vec::new()),
+            v4_queue_autodrain: std::cell::Cell::new(true),
             v4_goal: RefCell::new(None),
             v4_background_works: RefCell::new(Vec::new()),
             v4_usage: RefCell::new(None),
@@ -1326,10 +1330,20 @@ fn push_available_commands(gateway: &AcpGatewaySender<acp::AgentSide>, session: 
         serde_json::from_value(goal_command_json()).unwrap_or_else(|_| {
             acp::AvailableCommand::new("goal", "Set a long-running goal")
         });
+    let rate = acp::AvailableCommand::new(
+        "rate",
+        "Rate the last assistant reply (kernel feedback)",
+    );
+    let drain = acp::AvailableCommand::new(
+        "drain",
+        "Control kernel queue auto-drain (stopped queues wait)",
+    );
     notify(
         gateway,
         session,
-        acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![cmd])),
+        acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![
+            cmd, rate, drain,
+        ])),
     );
 }
 
@@ -1798,7 +1812,19 @@ impl acp::Agent for ZcodeAgent {
                 let mut meta = acp::Meta::new();
                 meta.insert(
                     "availableCommands".to_string(),
-                    json!([goal_command_json()]),
+                    json!([
+                        goal_command_json(),
+                        json!({
+                            "name": "rate",
+                            "description": "Rate the last assistant reply (kernel feedback)",
+                            "input": { "hint": "like | dislike | clear" },
+                        }),
+                        json!({
+                            "name": "drain",
+                            "description": "Control kernel queue auto-drain (stopped queues wait)",
+                            "input": { "hint": "on | off | (bare = status)" },
+                        }),
+                    ]),
                 );
                 meta
             }))
@@ -2136,6 +2162,155 @@ impl acp::Agent for ZcodeAgent {
             );
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
+        // /rate like|dislike|clear — message feedback via the v4
+        // setAssistantFeedback command (the official desktop's thumbs).
+        // Targets the LAST assistant message: a CAS row-targeting command,
+        // so re-subscribe for a fresh revision before firing.
+        if text.trim_start().starts_with("/rate") && attachments.is_empty() {
+            let arg = text.trim_start()[5..].trim();
+            let feedback = match arg {
+                "like" | "dislike" => Some(arg),
+                "clear" | "none" => None,
+                _ => {
+                    notify(
+                        &self.gateway,
+                        &args.session_id,
+                        acp::SessionUpdate::AgentMessageChunk(text_chunk(
+                            "用法：/rate like | /rate dislike | /rate clear（作用于最后一条回复）",
+                        )),
+                    );
+                    return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                }
+            };
+            let kernel_sid = state.kernel_id.borrow().clone();
+            {
+                let before = state.v4_snapshot_count.get();
+                v4_subscribe(&kernel, &kernel_sid);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while state.v4_snapshot_count.get() <= before
+                    && std::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+            let rows = state.v4_assistant_rows.borrow().clone();
+            let target = rows
+                .iter()
+                .rev()
+                .find(|(_, _, _, st)| st != "interrupted" && st != "failed")
+                .map(|(rid, eid, _, _)| (*rid, eid.clone()));
+            let reply = match target {
+                Some((row_id, entity_id)) => {
+                    let payload = json!({
+                        "target": {"rowId": row_id, "entityId": entity_id},
+                        "feedback": feedback,
+                    });
+                    let cas = state
+                        .v4_log_epoch
+                        .borrow()
+                        .clone()
+                        .map(|epoch| (state.v4_revision.get(), epoch));
+                    match v4_command(
+                        &kernel,
+                        &kernel_sid,
+                        "setAssistantFeedback",
+                        payload,
+                        cas,
+                    )
+                    .await
+                    {
+                        Ok(ack) if ack.get("status") == Some(&json!("accepted")) => format!(
+                            "已{}最后一条回复。",
+                            match feedback {
+                                Some("like") => "点赞",
+                                Some(_) => "点踩",
+                                None => "清除评价",
+                            }
+                        ),
+                        Ok(ack) => format!(
+                            "评价未生效: {} ({})",
+                            ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?"),
+                            ack.get("message").and_then(Value::as_str).unwrap_or("")
+                        ),
+                        Err(e) => format!("评价失败: {e}"),
+                    }
+                }
+                None => "没有可评价的回复。".to_string(),
+            };
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+            );
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        // /drain on|off|show — kernel queue auto-drain control (v4
+        // setAutoDrain). stop() forces it false; queued kernel items then
+        // wait until drain resumes.
+        if text.trim_start().starts_with("/drain") && attachments.is_empty() {
+            let arg = text.trim_start()[6..].trim();
+            let kernel_sid = state.kernel_id.borrow().clone();
+            let reply = match arg {
+                "on" | "off" => {
+                    let want = arg == "on";
+                    // CAS command on this kernel: refresh for a fresh
+                    // revision, then fire with the tokens.
+                    {
+                        let before = state.v4_snapshot_count.get();
+                        v4_subscribe(&kernel, &kernel_sid);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        while state.v4_snapshot_count.get() <= before
+                            && std::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                    }
+                    let cas = state
+                        .v4_log_epoch
+                        .borrow()
+                        .clone()
+                        .map(|epoch| (state.v4_revision.get(), epoch));
+                    match v4_command(
+                        &kernel,
+                        &kernel_sid,
+                        "setAutoDrain",
+                        json!({"autoDrain": want}),
+                        cas,
+                    )
+                    .await
+                    {
+                        Ok(ack) if ack.get("status") == Some(&json!("accepted")) => format!(
+                            "内核队列排水已{}。",
+                            if want { "恢复" } else { "暂停" }
+                        ),
+                        Ok(ack) => format!(
+                            "设置未生效: {} ({})",
+                            ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?"),
+                            ack.get("message").and_then(Value::as_str).unwrap_or("")
+                        ),
+                        Err(e) => format!("设置失败: {e}"),
+                    }
+                }
+                _ => format!(
+                    "当前排水状态：{}（{}）。用法：/drain on | /drain off",
+                    if state.v4_queue_autodrain.get() { "开" } else { "关" },
+                    match state
+                        .v4_queue_items
+                        .borrow()
+                        .len() {
+                            0 => "队列为空".to_string(),
+                            n => format!("内核队列还有 {n} 条"),
+                        }
+                ),
+            };
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+            );
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
         // Send-now (强插): the pager marks interrupting prompts with
         // meta.sendNow — cancel the running kernel turn, wait for the
         // session to free, then send ours. The kernel rejects concurrent
@@ -2154,7 +2329,8 @@ impl acp::Agent for ZcodeAgent {
             // legacy stop+retry loop on kernels without v4.
             {
                 let kernel_sid = state.kernel_id.borrow().clone();
-                match v4_send_text(&kernel, &kernel_sid, &text, "startNow").await {
+                let held = held_queue_disposition(&state);
+                match v4_send_text_held(&kernel, &kernel_sid, &text, "startNow", held.as_ref().map(|h| (h.0, h.1.clone()))).await {
                     Ok(ack) if ack.get("status") == Some(&json!("accepted")) => {
                         debug_log("prompt: sendNow via v4 startNow accepted");
                         state.v4_awaiting_turn_start.set(true);
@@ -2421,7 +2597,17 @@ impl acp::Agent for ZcodeAgent {
             state.cancelled.set(true);
         }
         if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id) {
-            let _ = kernel.request("session/stop", kernel::stop_params(&state.kernel_id.borrow()));
+            let kernel_sid = state.kernel_id.borrow().clone();
+            // Official semantics ride the v4 stop command: it pauses the
+            // kernel queue's auto-drain (autoDrain=false) so queued items
+            // wait for /drain on. Legacy session/stop only interrupts the
+            // running turn and leaves the queue draining.
+            match v4_command(&kernel, &kernel_sid, "stop", json!({}), None).await {
+                Ok(ack) => debug_log(&format!("v4 stop ack: {ack}")),
+                Err(_) => {
+                    let _ = kernel.request("session/stop", kernel::stop_params(&kernel_sid));
+                }
+            }
         }
         Ok(())
     }
@@ -3221,6 +3407,7 @@ impl acp::Agent for ZcodeAgent {
                     "userRows": users,
                     "assistantRows": assistants,
                     "queueItems": state.v4_queue_items.borrow().len(),
+                    "queueAutoDrain": state.v4_queue_autodrain.get(),
                     "usage": state.v4_usage.borrow().map(|(used, max)| json!({
                         "usedTokens": used,
                         "maxTokens": max,
@@ -3823,7 +4010,8 @@ impl acp::Agent for ZcodeAgent {
                     .unwrap_or_default()
                     .to_string();
                 if !text.trim().is_empty() {
-                    let _ = v4_send_text(&kernel, &kernel_sid, &text, "queue").await;
+                    let held = held_queue_disposition(&state);
+                    let _ = v4_send_text_held(&kernel, &kernel_sid, &text, "queue", held.as_ref().map(|h| (h.0, h.1.clone()))).await;
                 }
             }
             // Local edit locks (hold/release) have no kernel counterpart.
@@ -4020,23 +4208,47 @@ async fn v4_command(
 /// running turn), queue (deliver after the turn) and guide (inject into
 /// the running turn at its next safe point) — the real steering the
 /// legacy session/send refuses with -32010. Returns the ack object.
+/// The safe held-queue disposition for a send while the kernel queue is
+/// held (items present + autoDrain false): `keepQueueAndSend` plus the
+/// expected item ids — the official choice-mode contract, with the
+/// non-destructive option as the TUI default (`/drain on` resumes draining).
+fn held_queue_disposition(state: &Rc<SessionState>) -> Option<(&'static str, Vec<String>)> {
+    let items = state.v4_queue_items.borrow().clone();
+    if !items.is_empty() && !state.v4_queue_autodrain.get() {
+        Some((
+            "keepQueueAndSend",
+            items.iter().map(|(id, _)| id.clone()).collect(),
+        ))
+    } else {
+        None
+    }
+}
+
 async fn v4_send_text(
     kernel: &Kernel,
     session_id: &str,
     text: &str,
     requested_delivery: &str,
 ) -> Result<Value, String> {
-    v4_command(
-        kernel,
-        session_id,
-        "sendText",
-        json!({
-            "text": text,
-            "requestedDelivery": requested_delivery,
-        }),
-        None,
-    )
-    .await
+    v4_send_text_held(kernel, session_id, text, requested_delivery, None).await
+}
+
+async fn v4_send_text_held(
+    kernel: &Kernel,
+    session_id: &str,
+    text: &str,
+    requested_delivery: &str,
+    held: Option<(&str, Vec<String>)>,
+) -> Result<Value, String> {
+    let mut payload = json!({
+        "text": text,
+        "requestedDelivery": requested_delivery,
+    });
+    if let Some((disposition, ids)) = held {
+        payload["heldQueueDisposition"] = json!(disposition);
+        payload["expectedHeldQueueItemIds"] = json!(ids);
+    }
+    v4_command(kernel, session_id, "sendText", payload, None).await
 }
 
 /// Fold one v4 conversation frame (snapshot or deltas) into the session's
@@ -4123,6 +4335,9 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                 }
             }
             *state.v4_queue_items.borrow_mut() = items;
+            if let Some(ad) = snapshot.pointer("/queue/autoDrain").and_then(Value::as_bool) {
+                state.v4_queue_autodrain.set(ad);
+            }
             *state.v4_goal.borrow_mut() = snapshot.get("goal").cloned().filter(|g| !g.is_null());
             *state.v4_background_works.borrow_mut() = snapshot
                 .get("backgroundWorks")
@@ -4200,6 +4415,9 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                                 }
                             }
                             *state.v4_queue_items.borrow_mut() = queue;
+                        }
+                        if let Some(ad) = patch.pointer("/queue/autoDrain").and_then(Value::as_bool) {
+                            state.v4_queue_autodrain.set(ad);
                         }
                         if let Some(goal) = patch.get("goal") {
                             *state.v4_goal.borrow_mut() =
