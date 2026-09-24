@@ -149,6 +149,34 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
 - **实测**（probe_usage）：GLM-5.3 maxTokens=1,000,000；compact 完成 115ms 后
   USAGE 通知 18365→6969 实时到达，无需再发消息。
 
+## 对齐批次：8 项收尾（827bcfd + 6a3fb2c）
+
+- **行定位铁律**：v4 行定位命令（setAssistantFeedback/retryTurn/applyFileRewind）
+  的 target 是 **turnHeader 行**（canRewindFiles/canRetry/canFork 只在它身上），
+  打 assistant/user 行会得到 `guard.actionUnavailable`。turnHeader 已入投影
+  （v4_turn_headers）+ 诊断转储。
+- **/rate like|dislike|clear**：setAssistantFeedback（CAS），作用于最后一条
+  非中断回复；ack.status 必须判 accepted（rejected 也走 Ok 通道！）。
+- **/drain on|off|show**：setAutoDrain（**也是 CAS 命令**，无 token 会被
+  proto.invalidPayload 拒）；queue.autoDrain 已入投影。实证：3.14.1 内核 v4 stop
+  被 accepted 但**不**置 autoDrain=false（OSS 注释是桌面端模型），stop 后队列
+  照常排水。
+- **held-queue choice**：队列 held（有项+autoDrain 关）时 v4 sendText 自动带
+  `heldQueueDisposition=keepQueueAndSend + expectedHeldQueueItemIds`（TUI 安全
+  默认不清队列）；cancel 走 v4 stop（legacy 兜底）。
+- **/filerewind [apply]**：文件级回退（不截历史）。预览走
+  `v4/conversation/fileRewindPreview` RPC，执行走 applyFileRewind CAS。
+  /rewind 点位的 hasFileChanges 徽章从账本真实计算（Write/Edit part 落在轮次
+  序列区间内）。
+- **内核标题同步**：turn 结束/resume 时把 session.title（generated）写进
+  pager 的 summary.json（session_summary + updated_at），resume 列表显示真标题。
+- **/retry**：v4 retryTurn 官方通道已接；3.14.1 guard 对 completed 和
+  interrupted 轮都不放行（actions=null），失败轮大概率才可用——如实上报。
+- **workflows**：v4 workflowRuns.runs 入投影 → workflow_updated 通知
+  （pending/running→active 等）；本机 workflows=0，映射按 OSS schema，未经
+  实机 e2e。
+- 广告的命令：goal/rate/drain/filerewind/retry（initialize meta + 每会话 ACU）。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
