@@ -224,6 +224,18 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         }
     }
 
+    /// Advertise ACP slash commands once the session pane exists. The pager
+    /// drops AvailableCommandsUpdate notifications that arrive before the
+    /// NewSession/LoadSession response has registered the pane, so fire from
+    /// a short delayed task after the response lands.
+    fn defer_available_commands(&self, session: acp::SessionId) {
+        let gateway = self.gateway.clone();
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            push_available_commands(&gateway, &session);
+        });
+    }
+
     /// Read the kernel's model catalog for this session and forward it to the
     /// pager as `x.ai/models/update` (params = acp::SessionModelState).
     async fn push_model_state(&self, kernel: &Kernel, session_id: &str) {
@@ -1263,6 +1275,29 @@ fn push_todos(
     notify(gateway, session, acp::SessionUpdate::Plan(acp::Plan::new(entries)));
 }
 
+/// The /goal command's advertisement JSON (pager `availableCommands` shape).
+/// The command itself is intercepted in prompt() and routed to the kernel's
+/// sessionGoal RPC — the ad only makes it discoverable in the dropdown.
+fn goal_command_json() -> Value {
+    json!({
+        "name": "goal",
+        "description": "Set a long-running goal the kernel pursues autonomously (pause/resume/clear/show)",
+        "input": { "hint": "<objective> | pause | resume | clear | show" },
+    })
+}
+
+fn push_available_commands(gateway: &AcpGatewaySender<acp::AgentSide>, session: &acp::SessionId) {
+    let cmd: acp::AvailableCommand =
+        serde_json::from_value(goal_command_json()).unwrap_or_else(|_| {
+            acp::AvailableCommand::new("goal", "Set a long-running goal")
+        });
+    notify(
+        gateway,
+        session,
+        acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![cmd])),
+    );
+}
+
 fn push_context_usage(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     shared: &Rc<Shared>,
@@ -1719,7 +1754,19 @@ impl acp::Agent for ZcodeAgent {
                     .title("ZCode (official kernel)"),
             )
             .agent_capabilities(acp::AgentCapabilities::new().load_session(true))
-            .auth_methods(vec![method]))
+            .auth_methods(vec![method])
+            .meta({
+                // Bootstrap the slash dropdown before any session exists:
+                // the pager seeds `availableCommands` from here, and the
+                // runtime AvailableCommandsUpdate only lands once a session
+                // pane is up (pre-session copies are dropped).
+                let mut meta = acp::Meta::new();
+                meta.insert(
+                    "availableCommands".to_string(),
+                    json!([goal_command_json()]),
+                );
+                meta
+            }))
     }
 
     async fn authenticate(&self, _args: acp::AuthenticateRequest) -> acp::Result<acp::AuthenticateResponse> {
@@ -1771,6 +1818,7 @@ impl acp::Agent for ZcodeAgent {
         // above and the x.ai ext notifications below.
         self.push_model_state(&kernel, &session_id).await;
         tracing::info!(%session_id, "zcode session created");
+        self.defer_available_commands(acp_session.clone());
         let mut response = acp::NewSessionResponse::new(acp_session);
         response.models = initial_models;
         Ok(response)
@@ -1964,6 +2012,7 @@ impl acp::Agent for ZcodeAgent {
             push_context_usage(&self.gateway, &self.shared, &state, &args.session_id);
         }
         tracing::info!(%session_id, "zcode session resumed");
+        self.defer_available_commands(args.session_id.clone());
         let mut response = acp::LoadSessionResponse::new();
         response.models = initial_models;
         Ok(response)

@@ -36,6 +36,7 @@ struct Seen {
     thought_durations_ms: RefCell<Vec<i64>>,
     thought_first_ts: std::cell::Cell<Option<i64>>,
     thought_chunks: RefCell<Vec<(i64, i64, bool)>>,
+    command_ads: RefCell<Vec<String>>,
     interjection_ids: RefCell<Vec<String>>,
 }
 
@@ -192,6 +193,11 @@ async fn main() -> anyhow::Result<()> {
                                                 .borrow_mut()
                                                 .push_str(&t.text);
                                         }
+                                    }
+                                }
+                                if let acp::SessionUpdate::AvailableCommandsUpdate(ads) = &u.update {
+                                    for c in &ads.available_commands {
+                                        seen.borrow_mut().command_ads.borrow_mut().push(c.name.clone());
                                     }
                                 }
                                 if let acp::SessionUpdate::Plan(plan) = &u.update {
@@ -1009,6 +1015,14 @@ async fn main() -> anyhow::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 let goals = seen.borrow().goal_updates.borrow().clone();
                 let saw_active = goals.iter().any(|g| g == "active");
+                let ads = seen.borrow().command_ads.borrow().clone();
+                check(
+                    "goal-command-advertised",
+                    ads.iter().any(|n| n == "goal"),
+                    format!("advertised commands: {ads:?}"),
+                    &mut summary,
+                    &mut fail,
+                );
                 check(
                     "goal-panel-set-visible",
                     matches!(&goal_turn, Ok(r) if r.stop_reason == acp::StopReason::EndTurn) && saw_active,
