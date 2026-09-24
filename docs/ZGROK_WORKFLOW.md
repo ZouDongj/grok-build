@@ -102,6 +102,13 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   created→completed，字符安全中点拆分），pager 计算真实时长。教训：拆分中文文本
   必须 is_char_boundary；/goal 之类斜杠命令 session/send 不解析（会当纯文本喂给
   模型），已由 agent 拦截路由到 sessionGoal RPC。
+- **0.0s 二次修复（bc866bd，第一次修得不彻底）**：pager 冻结时长的真公式是
+  `末块 agentTimestampMs - streamStartMs`，且 **meta 必须带 isReplay:true** 才会
+  禁用本地计时块——只盖 agentTimestampMs 时本地计时器（started_at=now）仍抢跑，
+  两块微秒级到达 → finish() 冻结 ~0ms 盖掉服务端值。正确做法：按 part 级
+  `time.start/end`（纯思考跨度，session/resume 的 parts 里就有）逐 part 重放，
+  每块盖齐三个 meta 字段；多段思考（思考→工具→思考）按 streamStart 分块。
+  教训：**回归检查必须复刻消费方的公式**，只验证"字段存在"不等于"渲染正确"。
 - **goal 面板**：v4 投影 goal 字段 → goal_updated 通知（active/user_paused/
   complete/blocked 映射）；/goal 文本命令 + x.ai/session/goal ext 均可控制。
 - **后台任务**：v4 投影 backgroundWorks（bash 类）→ background_tasks 通知；
