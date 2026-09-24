@@ -96,6 +96,17 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
 - **视频**：ACP 通道只有 Text/Image 块，TUI 结构性不支持（内核侧就绪）。
 - **v4 createSession**：开源注释明说其 binder 调旧 create op——无迁移紧迫性。
 
+## goal 模式 / 后台任务 / 重放思考时长（最新）
+
+- **重放 "Thought for 0.0s" 已修**：重放思考块带 meta.agentTimestampMs（账本
+  created→completed，字符安全中点拆分），pager 计算真实时长。教训：拆分中文文本
+  必须 is_char_boundary；/goal 之类斜杠命令 session/send 不解析（会当纯文本喂给
+  模型），已由 agent 拦截路由到 sessionGoal RPC。
+- **goal 面板**：v4 投影 goal 字段 → goal_updated 通知（active/user_paused/
+  complete/blocked 映射）；/goal 文本命令 + x.ai/session/goal ext 均可控制。
+- **后台任务**：v4 投影 backgroundWorks（bash 类）→ background_tasks 通知；
+  x.ai/task/kill → v4 cancelBackgroundWork。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
