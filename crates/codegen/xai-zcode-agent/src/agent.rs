@@ -99,6 +99,10 @@ struct SessionState {
     /// maxTokens). The official client's context meter source — updates in
     /// real time, including the drop right after a compaction completes.
     v4_usage: RefCell<Option<(u64, u64)>>,
+    /// Context tokens at goal start — the pager's live goal token line is
+    /// (current context - baseline) while active; the frozen delta rides
+    /// tokens_used on terminal states.
+    goal_token_baseline: std::cell::Cell<Option<u64>>,
     /// True when the RUNNING compaction turn was started by our
     /// x.ai/compact_conversation ext (the pager already shows its Command
     /// state — banners are only for KERNEL-initiated auto compaction).
@@ -152,6 +156,7 @@ impl SessionState {
             v4_goal: RefCell::new(None),
             v4_background_works: RefCell::new(Vec::new()),
             v4_usage: RefCell::new(None),
+            goal_token_baseline: std::cell::Cell::new(None),
             fail_grace_cancel: RefCell::new(None),
             compacting: std::cell::Cell::new(false),
             compact_by_ext: std::cell::Cell::new(false),
@@ -565,10 +570,40 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                                 }
                                 let goal_after = state.v4_goal.borrow().clone();
                                 if goal_before != goal_after {
+                                    // Goal token accounting: baseline = context
+                                    // usage at goal start (the pager renders the
+                                    // live delta while active — the same
+                                    // mechanism the grok-native shell uses);
+                                    // terminal states freeze the final delta.
+                                    let used_now = state.v4_usage.borrow().map(|(u, _)| u);
+                                    let was_set = goal_before.is_some();
+                                    let is_set = goal_after.is_some();
+                                    let terminal = goal_after.as_ref().is_some_and(|g| {
+                                        matches!(
+                                            g.get("status").and_then(Value::as_str),
+                                            Some("verified") | Some("notSatisfied") | Some("failed")
+                                        )
+                                    });
+                                    if !was_set && is_set {
+                                        // No usage observation yet (fresh
+                                        // session) means nothing was consumed
+                                        // before the goal — baseline 0.
+                                        state.goal_token_baseline.set(Some(used_now.unwrap_or(0)));
+                                    } else if !is_set {
+                                        state.goal_token_baseline.set(None);
+                                    }
+                                    let baseline = state.goal_token_baseline.get().unwrap_or(0);
+                                    let tokens_used = if terminal {
+                                        used_now.unwrap_or(0).saturating_sub(baseline)
+                                    } else {
+                                        0
+                                    };
                                     emit_goal_updated(
                                         &pump_gateway,
                                         notify_sid.0.as_ref(),
                                         goal_after.as_ref(),
+                                        baseline,
+                                        tokens_used,
                                     );
                                 }
                                 let works_after = state.v4_background_works.borrow().clone();
@@ -4193,6 +4228,8 @@ fn emit_goal_updated(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     session_id: &str,
     goal: Option<&Value>,
+    token_baseline: u64,
+    tokens_used: u64,
 ) {
     let update = match goal {
         Some(g) => {
@@ -4242,7 +4279,13 @@ fn emit_goal_updated(
                 "status": status,
                 "phase": phase,
                 "elapsed_ms": g.get("timeUsedSeconds").and_then(Value::as_u64).unwrap_or(0) * 1000,
-                "tokens_used": 0,
+                // Live line = current context - baseline (pager-side);
+                // tokens_used only carries the frozen delta on terminal
+                // states so a zero never reads as "no data" mid-run. The
+                // wire field is a plain i64 — null would fail parsing and
+                // drop the whole notification.
+                "token_baseline": token_baseline,
+                "tokens_used": tokens_used,
                 "total_deliverables": 0,
                 "completed_deliverables": 0,
                 "total_worker_rounds": total_worker_rounds,

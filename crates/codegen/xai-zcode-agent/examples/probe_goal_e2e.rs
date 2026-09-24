@@ -20,6 +20,8 @@ struct GoalSnap {
     verdict: Option<String>,
     pause_message: Option<String>,
     last_event: Option<String>,
+    tokens_used: i64,
+    token_baseline: Option<i64>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -81,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
                                         verdict: u["last_classifier_verdict"].as_str().map(String::from),
                                         pause_message: u["pause_message"].as_str().map(String::from),
                                         last_event: u["last_event"].as_str().map(String::from),
+                                        tokens_used: u["tokens_used"].as_i64().unwrap_or(0),
+                                        token_baseline: u["token_baseline"].as_i64(),
                                     });
                                 }
                             }
@@ -138,9 +142,9 @@ async fn main() -> anyhow::Result<()> {
         println!("\n=== goal_updated timeline ({} snaps) ===", all.len());
         for s in &all {
             println!(
-                "t+{:>6}ms {:>12} phase={:<9} worker={} verify={} verifying={} verdict={:?} pause={:?} event={:?}",
+                "t+{:>6}ms {:>12} phase={:<9} worker={} verify={} verifying={} verdict={:?} tokens={} baseline={:?} event={:?}",
                 s.t_ms, s.status, s.phase, s.worker_rounds, s.verify_rounds, s.verifying,
-                s.verdict, s.pause_message, s.last_event
+                s.verdict, s.tokens_used, s.token_baseline, s.last_event
             );
         }
         let file_ok = std::fs::read_to_string(format!("{WORKDIR}/goal-e2e.txt")).ok();
@@ -158,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
         verdict(
             "goal-verdict-reported",
             all.iter().any(|s| s.verdict.is_some()),
+        );
+        verdict(
+            "goal-tokens-are-real",
+            all.iter().any(|s| s.tokens_used > 0 || s.token_baseline.is_some()),
         );
 
         // Cleanup: clear goal + delete session.

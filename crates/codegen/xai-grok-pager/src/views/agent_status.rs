@@ -279,11 +279,14 @@ pub fn goal_status_line(
 
     let tokens_str =
         format_tokens_compact(goal.live_tokens_used(context_used, active_subagent_tokens));
+    // Zero tokens = either nothing consumed yet or the agent has no goal
+    // token accounting (zcode kernel) — show nothing rather than a fake "0".
     let tokens_display = match goal.token_budget {
         Some(budget) if budget > 0 => {
             format!("{}/{} tokens", tokens_str, format_tokens_compact(budget))
         }
-        _ => format!("{} tokens", tokens_str),
+        _ if tokens_str != "0" => format!("{tokens_str} tokens"),
+        _ => String::new(),
     };
 
     let elapsed_str = format_elapsed_compact(goal.live_elapsed_ms());
@@ -318,11 +321,16 @@ pub fn goal_status_line(
         format!("{chip_name}: {label}")
     };
 
+    let trailing = if tokens_display.is_empty() {
+        format!("  {elapsed_str}")
+    } else {
+        format!("  {tokens_display}  {elapsed_str}")
+    };
     Line::from(vec![
         Span::styled("[", dim_style),
         Span::styled(goal_text, label_style),
         Span::styled("]", dim_style),
-        Span::styled(format!("  {tokens_display}  {elapsed_str}"), dim_style),
+        Span::styled(trailing, dim_style),
     ])
 }
 

@@ -595,11 +595,15 @@ pub fn render_goal_detail(
         (0.0, format!("{tokens_str} tokens"))
     };
     let has_budget = goal.token_budget.is_some_and(|b| b > 0);
+    // Zero tokens = nothing consumed yet or no goal token accounting (zcode
+    // kernel) — drop the token segment rather than render a fake "0".
     let budget_label = if has_budget {
         let pct_display = format!(" ({:.0}%)", pct * 100.0);
         format!("Budget: {budget_display}{pct_display}  Elapsed: {elapsed_str}")
-    } else {
+    } else if tokens_str != "0" {
         format!("Tokens: {budget_display}  Elapsed: {elapsed_str}")
+    } else {
+        format!("Elapsed: {elapsed_str}")
     };
     buf.set_line_safe(
         x,
