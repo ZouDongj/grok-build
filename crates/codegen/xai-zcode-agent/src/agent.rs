@@ -4196,15 +4196,45 @@ fn emit_goal_updated(
 ) {
     let update = match goal {
         Some(g) => {
-            let objective = g.get("objective").and_then(Value::as_str).unwrap_or_default();
+            let objective = g.get("objective").and_then(Value::as_str).unwrap_or("");
             let kernel_status = g.get("status").and_then(Value::as_str).unwrap_or("active");
-            let status = match kernel_status {
-                "paused" => "user_paused",
-                "verified" => "complete",
-                "notSatisfied" | "failed" => "blocked",
-                _ => "active",
+            // Last verification entry: outcome/reason/nextAction drive the
+            // verdict chip, the Reason block (paused goals) and the status
+            // line's event detail.
+            let last_verification = g
+                .get("verifications")
+                .and_then(Value::as_array)
+                .and_then(|v| v.last());
+            let verify_reason = last_verification
+                .and_then(|v| v.get("reason"))
+                .and_then(Value::as_str);
+            let verify_next = last_verification
+                .and_then(|v| v.get("nextAction"))
+                .and_then(Value::as_str);
+            let verify_outcome = last_verification
+                .and_then(|v| v.get("outcome"))
+                .and_then(Value::as_str);
+            let (status, pause_message) = match kernel_status {
+                "paused" => ("user_paused", None),
+                "verified" => ("complete", None),
+                "notSatisfied" => (
+                    "blocked",
+                    Some(verify_reason.unwrap_or("验证结论：目标未达成").to_string()),
+                ),
+                "failed" => ("blocked", Some("验证过程失败".to_string())),
+                _ => ("active", None),
             };
-            let phase = if kernel_status == "verifying" { "executing" } else if status == "active" { "executing" } else { "idle" };
+            let phase = if status == "active" { "executing" } else { "idle" };
+            let total_verify_rounds = g
+                .get("verifications")
+                .and_then(Value::as_array)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
+            let total_worker_rounds = g
+                .get("iterations")
+                .and_then(Value::as_array)
+                .map(|v| v.len() as u32)
+                .unwrap_or(0);
             json!({
                 "sessionUpdate": "goal_updated",
                 "goal_id": g.get("targetId").and_then(Value::as_str).unwrap_or("kernel-goal"),
@@ -4215,8 +4245,19 @@ fn emit_goal_updated(
                 "tokens_used": 0,
                 "total_deliverables": 0,
                 "completed_deliverables": 0,
-                "total_worker_rounds": 0,
-                "total_verify_rounds": 0,
+                "total_worker_rounds": total_worker_rounds,
+                "total_verify_rounds": total_verify_rounds,
+                // The pager's dedicated "verifying" overlay (kernel status
+                // verifying) and verdict chip (last verification outcome).
+                "verifying_completion": if kernel_status == "verifying" { Some(true) } else { None },
+                "last_classifier_verdict": match verify_outcome {
+                    Some("pass") => Some("achieved"),
+                    Some(_) => Some("not_achieved"),
+                    None => None,
+                },
+                "pause_message": pause_message,
+                "last_event": verify_outcome.map(|o| format!("verification: {o}")),
+                "last_event_detail": verify_next.map(|s| s.to_string()),
             })
         }
         None => json!({
