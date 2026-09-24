@@ -124,8 +124,13 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   iterations.len→worker 轮数（面板 Rounds 行）；末轮 outcome→verdict 徽章
   （achieved/not_achieved）；notSatisfied/failed→blocked+pause_message（验证
   原因，Reason 块）。端到端实证（probe_goal_e2e）：设定目标→内核自主创建
-  文件并自验→active→verifying→complete(verify=1, achieved)。未映射：goal 专属
-  token 统计（内核 v4 不按 goal 分账，tokens_used 恒 0）。
+  文件并自验→active→verifying→complete(verify=1, achieved)。
+- **goal token 统计（a0f30cf）**：内核 v4 不按 goal 分账，但 pager 的 goal
+  token 行本就是 `当前上下文 - token_baseline`（grok 原生 shell 同款机制）——
+  设 goal 时快照基线（新会话无观测则 0），终态冻结
+  `tokens_used = 最终usage - 基线`。实证：complete 冻结 19128。注意
+  GoalUpdated 的 `token_baseline` 是裸 i64，发 null 会整条解析失败被丢弃。
+  值为 0 时 pager 隐藏 token 段（状态行 + 弹窗），不显示假 0。
 
 ## 上下文仪表实时刷新（compact 后立即回落，官方一致）
 
