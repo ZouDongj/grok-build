@@ -1853,8 +1853,10 @@ impl acp::Agent for ZcodeAgent {
                 if role != "user" && role != "assistant" {
                     continue;
                 }
-                let mut reasoning = String::new();
                 let mut text = String::new();
+                // Reasoning parts replayed individually with their own
+                // kernel-recorded spans: (text, Option<(start, end)>).
+                let mut reasonings: Vec<(String, Option<(u64, u64)>)> = Vec::new();
                 if let Some(parts) = message.get("parts").and_then(Value::as_array) {
                     for part in parts {
                         match part.get("type").and_then(Value::as_str) {
@@ -1862,55 +1864,74 @@ impl acp::Agent for ZcodeAgent {
                                 text.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
                             }
                             Some("reasoning") => {
-                                reasoning.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""))
+                                let body = part.get("text").and_then(Value::as_str).unwrap_or("");
+                                // Part-level time is the exact thinking span;
+                                // tolerate {start,end} (db shape) and
+                                // {created,completed} (message-level shape).
+                                let span = part
+                                    .pointer("/time/start")
+                                    .and_then(Value::as_u64)
+                                    .zip(part.pointer("/time/end").and_then(Value::as_u64))
+                                    .or_else(|| {
+                                        part.pointer("/time/created")
+                                            .and_then(Value::as_u64)
+                                            .zip(part.pointer("/time/completed").and_then(Value::as_u64))
+                                    });
+                                if !body.trim().is_empty() {
+                                    reasonings.push((body.to_string(), span));
+                                }
                             }
                             _ => {}
                         }
                     }
                 }
-                if role == "assistant" && !reasoning.trim().is_empty() {
-                    // Replay with REAL durations: the pager computes
-                    // "Thought for Xs" from chunk meta timestamps
-                    // (agentTimestampMs). One bare chunk reads as 0.0s; split
-                    // the reasoning and stamp the halves with the ledger's
-                    // message created/completed times so history shows the
-                    // true thinking span.
-                    let created = message
-                        .pointer("/info/time/created")
-                        .and_then(Value::as_u64);
-                    let completed = message
-                        .pointer("/info/time/completed")
-                        .and_then(Value::as_u64);
-                    let notify_thought = |text: String, ts: Option<u64>| {
+                // The pager's "Thought for Xs" contract: elapsed = last
+                // chunk's agentTimestampMs - streamStartMs, and isReplay must
+                // be true or the block runs a LOCAL timer that freezes to ~0ms
+                // (the two replay chunks arrive microseconds apart — the old
+                // "Thought for 0.0s" bug). Each reasoning part gets its own
+                // streamStartMs so multi-segment turns render separate blocks.
+                let message_span = message
+                    .pointer("/info/time/created")
+                    .and_then(Value::as_u64)
+                    .zip(message.pointer("/info/time/completed").and_then(Value::as_u64));
+                for (body, span) in &reasonings {
+                    let span = span.or(message_span);
+                    let notify_thought = |chunk_text: String, ts: u64, start: u64| {
                         let mut notif = acp::SessionNotification::new(
                             args.session_id.clone(),
-                            acp::SessionUpdate::AgentThoughtChunk(text_chunk(text)),
+                            acp::SessionUpdate::AgentThoughtChunk(text_chunk(chunk_text)),
                         );
-                        if let Some(ts) = ts {
-                            let mut meta = acp::Meta::new();
-                            meta.insert("agentTimestampMs".to_string(), json!(ts));
-                            notif.meta = Some(meta);
-                        }
+                        let mut meta = acp::Meta::new();
+                        meta.insert("agentTimestampMs".to_string(), json!(ts));
+                        meta.insert("streamStartMs".to_string(), json!(start));
+                        meta.insert("isReplay".to_string(), json!(true));
+                        notif.meta = Some(meta);
                         self.gateway.forward_fire_and_forget(notif);
                     };
-                    match (created, completed) {
-                        (Some(created), Some(completed)) if completed > created => {
+                    match span {
+                        Some((start, end)) if end > start => {
                             // Char-safe midpoint: byte split_at would panic
                             // inside a multi-byte character.
-                            let mut split = reasoning.len() / 2;
-                            while split < reasoning.len() && !reasoning.is_char_boundary(split) {
+                            let mut split = body.len() / 2;
+                            while split < body.len() && !body.is_char_boundary(split) {
                                 split += 1;
                             }
-                            let (head, tail) = reasoning.split_at(split.max(1));
-                            notify_thought(head.to_string(), Some(created));
-                            notify_thought(tail.to_string(), Some(completed));
+                            let (head, tail) = body.split_at(split.max(1));
+                            notify_thought(head.to_string(), start, start);
+                            notify_thought(tail.to_string(), end, start);
                         }
                         _ => {
-                            notify(
-                                &self.gateway,
-                                &args.session_id,
-                                acp::SessionUpdate::AgentThoughtChunk(text_chunk(reasoning)),
+                            // No usable span: still mark isReplay so the pager
+                            // shows "Thought" without a bogus 0.0s timer.
+                            let mut notif = acp::SessionNotification::new(
+                                args.session_id.clone(),
+                                acp::SessionUpdate::AgentThoughtChunk(text_chunk(body.clone())),
                             );
+                            let mut meta = acp::Meta::new();
+                            meta.insert("isReplay".to_string(), json!(true));
+                            notif.meta = Some(meta);
+                            self.gateway.forward_fire_and_forget(notif);
                         }
                     }
                 }

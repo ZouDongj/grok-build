@@ -35,6 +35,7 @@ struct Seen {
     goal_updates: RefCell<Vec<String>>,
     thought_durations_ms: RefCell<Vec<i64>>,
     thought_first_ts: std::cell::Cell<Option<i64>>,
+    thought_chunks: RefCell<Vec<(i64, i64, bool)>>,
     interjection_ids: RefCell<Vec<String>>,
 }
 
@@ -122,7 +123,19 @@ async fn main() -> anyhow::Result<()> {
                                 if let acp::SessionUpdate::AgentThoughtChunk(c) = &u.update {
                                     if let (acp::ContentBlock::Text(t), Some(m)) = (&c.content, u.meta.as_ref()) {
                                         if !t.text.is_empty() {
+                                            // Mirror the pager's duration formula:
+                                            // elapsed = agentTimestampMs - streamStartMs on
+                                            // the LAST chunk of each isReplay thinking block.
                                             let ts = m.get("agentTimestampMs").and_then(|v| v.as_i64());
+                                            let start = m.get("streamStartMs").and_then(|v| v.as_i64());
+                                            let is_replay = m.get("isReplay").and_then(|v| v.as_bool()).unwrap_or(false);
+                                            if let (Some(a), Some(s)) = (ts, start) {
+                                                seen
+                                                    .borrow_mut()
+                                                    .thought_chunks
+                                                    .borrow_mut()
+                                                    .push((a, s, is_replay));
+                                            }
                                             let first = seen.borrow().thought_first_ts.get();
                                             if let (Some(a), Some(first)) = (ts, first) {
                                                 seen
@@ -939,13 +952,34 @@ async fn main() -> anyhow::Result<()> {
                 let events = seen.borrow().subagent_events.borrow().clone();
                 // Replayed thoughts carry ledger timestamps: the pager can
                 // compute real durations instead of "Thought for 0.0s".
-                let stamps = seen.borrow().thought_durations_ms.borrow().clone();
-                let replay_durations_real = stamps.len() >= 2
-                    && stamps.windows(2).any(|w| w[1] - w[0] >= 1000);
+                let chunks = seen.borrow().thought_chunks.borrow().clone();
+                // Per the pager tracker: for each isReplay thinking block the
+                // FROZEN duration is the last chunk's agentTimestampMs -
+                // streamStartMs. Blocks are delimited by stream-start changes,
+                // so assert: replay chunks exist, all carry isReplay, and the
+                // last chunk of at least one stream has a >=1s real span.
+                let mut all_replay = true;
+                for &(_ts, _start, is_replay) in &chunks {
+                    if !is_replay {
+                        all_replay = false;
+                    }
+                }
+                let spans: Vec<i64> = chunks
+                    .windows(2)
+                    .filter(|w| w[0].1 == w[1].1)
+                    .map(|w| w[1].0 - w[1].1)
+                    .collect();
+                let replay_durations_real = !chunks.is_empty()
+                    && all_replay
+                    && spans.iter().any(|d| *d >= 1000)
+                    && spans.iter().all(|d| *d >= 0);
                 check(
                     "replay-thoughts-have-real-durations",
                     replay_durations_real,
-                    format!("thought timestamps seen: {stamps:?}"),
+                    format!(
+                        "replay thought chunks (agentTs,streamStart,isReplay): {:?}; per-block final spans: {spans:?}",
+                        chunks.iter().map(|(a, s, r)| (a - s, r)).collect::<Vec<_>>()
+                    ),
                     &mut summary,
                     &mut fail,
                 );
