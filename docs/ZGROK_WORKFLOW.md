@@ -107,6 +107,23 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
 - **后台任务**：v4 投影 backgroundWorks（bash 类）→ background_tasks 通知；
   x.ai/task/kill → v4 cancelBackgroundWork。
 
+## 上下文仪表实时刷新（compact 后立即回落，官方一致）
+
+- **官方机制**（OSS `zcode-protocol-v4/snapshot.ts`）：v4 投影的
+  `usage.contextWindow {usedTokens, maxTokens, autoCompactThresholdTokens}`，
+  注释明言 "conflation：值未变不下发" —— 内核在值变化时（含 compact 完成的骤降）
+  主动推 `state.updated` 增量，桌面右上角实时刷新。
+- **zgrok 旧缺陷**：上下文条取 `model_usage` 表最近一次 `main_turn` 的
+  input+output —— compact 后没有新 main_turn，条停在压缩前的大数，直到下一条
+  用户消息才回落；内核自发 auto-compact 的 banner 还带 `tokens_used: 0`/
+  `tokens_after: 0`，会把条刷成 0%。
+- **修复**（agent.rs）：`v4_usage` 投影消费（snapshot + state.updated patch）；
+  帧分发点 diff 变化即推 ACP `UsageUpdate(used, max)`；`push_context_usage`
+  优先投影值（db 账本降级兜底）；banner 带真实 token 数；fork 换 id 后 v4 帧
+  按 kernel_id 回查路由（此前 queue/goal/works 对换 id 会话全丢）。
+- **实测**（probe_usage）：GLM-5.3 maxTokens=1,000,000；compact 完成 115ms 后
+  USAGE 通知 18365→6969 实时到达，无需再发消息。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）

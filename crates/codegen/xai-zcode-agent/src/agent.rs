@@ -94,6 +94,11 @@ struct SessionState {
     v4_goal: RefCell<Option<Value>>,
     /// Last-seen kernel background works (v4 projection).
     v4_background_works: RefCell<Vec<Value>>,
+    /// Kernel-authoritative context usage from the v4 projection
+    /// (snapshot.usage / state.updated usage patches): (usedTokens,
+    /// maxTokens). The official client's context meter source — updates in
+    /// real time, including the drop right after a compaction completes.
+    v4_usage: RefCell<Option<(u64, u64)>>,
     /// True when the RUNNING compaction turn was started by our
     /// x.ai/compact_conversation ext (the pager already shows its Command
     /// state — banners are only for KERNEL-initiated auto compaction).
@@ -146,6 +151,7 @@ impl SessionState {
             v4_queue_items: RefCell::new(Vec::new()),
             v4_goal: RefCell::new(None),
             v4_background_works: RefCell::new(Vec::new()),
+            v4_usage: RefCell::new(None),
             fail_grace_cancel: RefCell::new(None),
             compacting: std::cell::Cell::new(false),
             compact_by_ext: std::cell::Cell::new(false),
@@ -511,11 +517,31 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                             .and_then(|t| t.strip_prefix("conversation/"))
                         {
                             let session_key = acp::SessionId::new(acp_sid.to_string());
-                            let state = pump_shared.state.borrow().sessions.get(&session_key).cloned();
-                            if let Some(state) = state {
+                            // Fork-swapped sessions keep their original ACP id
+                            // while the v4 topic carries the fork's kernel id —
+                            // fall back to a kernel_id scan so their projection
+                            // updates (queue/goal/usage) keep flowing, and
+                            // notify the ACP id the pager knows.
+                            let found = pump_shared
+                                .state
+                                .borrow()
+                                .sessions
+                                .get_key_value(&session_key)
+                                .map(|(k, st)| (k.clone(), st.clone()))
+                                .or_else(|| {
+                                    pump_shared
+                                        .state
+                                        .borrow()
+                                        .sessions
+                                        .iter()
+                                        .find(|(_, st)| st.kernel_id.borrow().as_str() == acp_sid)
+                                        .map(|(k, st)| (k.clone(), st.clone()))
+                                });
+                            if let Some((notify_sid, state)) = found {
                                 let queue_before = state.v4_queue_items.borrow().clone();
                                 let goal_before = state.v4_goal.borrow().clone();
                                 let works_before = state.v4_background_works.borrow().clone();
+                                let usage_before = *state.v4_usage.borrow();
                                 update_v4_projection(&state, frame);
                                 let queue_after = state.v4_queue_items.borrow().clone();
                                 if queue_before != queue_after {
@@ -523,15 +549,42 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                                         .iter()
                                         .map(|(id, text)| (id.clone(), "prompt", text.clone()))
                                         .collect();
-                                    broadcast_queue(&pump_gateway, acp_sid, &rows, None);
+                                    broadcast_queue(&pump_gateway, notify_sid.0.as_ref(), &rows, None);
                                 }
                                 let goal_after = state.v4_goal.borrow().clone();
                                 if goal_before != goal_after {
-                                    emit_goal_updated(&pump_gateway, acp_sid, goal_after.as_ref());
+                                    emit_goal_updated(
+                                        &pump_gateway,
+                                        notify_sid.0.as_ref(),
+                                        goal_after.as_ref(),
+                                    );
                                 }
                                 let works_after = state.v4_background_works.borrow().clone();
                                 if works_before != works_after {
-                                    emit_background_tasks(&pump_gateway, acp_sid, &works_after);
+                                    emit_background_tasks(
+                                        &pump_gateway,
+                                        notify_sid.0.as_ref(),
+                                        &works_after,
+                                    );
+                                }
+                                // Real-time context meter: the kernel pushes
+                                // usage patches whenever the value changes
+                                // (conflation — unchanged values are not
+                                // sent), including the drop right after a
+                                // compaction completes. Forward each change as
+                                // an ACP UsageUpdate so the pager's bar
+                                // refreshes immediately, not at next turn end.
+                                let usage_after = *state.v4_usage.borrow();
+                                if usage_before != usage_after {
+                                    if let Some((used, max)) = usage_after {
+                                        notify(
+                                            &pump_gateway,
+                                            &notify_sid,
+                                            acp::SessionUpdate::UsageUpdate(acp::UsageUpdate::new(
+                                                used, max,
+                                            )),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -1216,8 +1269,18 @@ fn push_context_usage(
     state: &Rc<SessionState>,
     session: &acp::SessionId,
 ) {
-    let used = last_turn_context_tokens(&state.kernel_id.borrow());
-    let size = context_window_tokens(shared);
+    // The v4 projection is kernel-authoritative and compact-aware (its
+    // usedTokens drops the moment compaction finishes); the db ledger's
+    // latest main_turn stays at the pre-compact number until the NEXT user
+    // turn, so prefer the projection whenever it has a value.
+    let (used, size) = match *state.v4_usage.borrow() {
+        Some(v4) => v4,
+        None => {
+            let used = last_turn_context_tokens(&state.kernel_id.borrow());
+            let size = context_window_tokens(shared);
+            (used, size)
+        }
+    };
     if used == 0 || size == 0 {
         return;
     }
@@ -3053,6 +3116,10 @@ impl acp::Agent for ZcodeAgent {
                     "userRows": users,
                     "assistantRows": assistants,
                     "queueItems": state.v4_queue_items.borrow().len(),
+                    "usage": state.v4_usage.borrow().map(|(used, max)| json!({
+                        "usedTokens": used,
+                        "maxTokens": max,
+                    })),
                 });
                 let raw = serde_json::value::to_raw_value(&body)
                     .expect("serialize projection");
@@ -3431,6 +3498,7 @@ impl acp::Agent for ZcodeAgent {
                 *state.v4_log_epoch.borrow_mut() = None;
                 *state.v4_user_rows.borrow_mut() = Vec::new();
                 *state.v4_assistant_rows.borrow_mut() = Vec::new();
+                *state.v4_usage.borrow_mut() = None;
                 state.v4_revision.set(0);
                 v4_subscribe(&kernel, &new_kernel_sid);
                 write_summary_stub(&new_kernel_sid, &state.cwd.borrow());
@@ -3870,6 +3938,19 @@ async fn v4_send_text(
 /// projection state. Snapshots are authoritative; deltas opportunistically
 /// refresh the CAS tokens and queue — anything unparsed keeps the last
 /// snapshot's values (rewind re-subscribes for freshness anyway).
+/// Parse the v4 sessionUsageState's contextWindow from a snapshot body or a
+/// state.updated patch. Returns Some(None) when the field is present but the
+/// window is null (no model call yet), None when absent (keep prior value).
+fn parse_v4_usage(parent: &Value) -> Option<Option<(u64, u64)>> {
+    let window = parent.pointer("/usage/contextWindow")?;
+    if window.is_null() {
+        return Some(None);
+    }
+    let used = window.get("usedTokens").and_then(Value::as_u64)?;
+    let max = window.get("maxTokens").and_then(Value::as_u64)?;
+    Some(Some((used, max)))
+}
+
 fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
     let payload = frame.pointer("/payload").unwrap_or(&Value::Null);
     match payload.get("kind").and_then(Value::as_str) {
@@ -3943,6 +4024,9 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
+            if let Some(usage) = parse_v4_usage(snapshot) {
+                *state.v4_usage.borrow_mut() = usage;
+            }
         }
         Some("deltas") => {
             let Some(deltas) = payload.get("deltas").and_then(Value::as_array) else {
@@ -4020,6 +4104,9 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                         }
                         if let Some(works) = patch.get("backgroundWorks").and_then(Value::as_array) {
                             *state.v4_background_works.borrow_mut() = works.clone();
+                        }
+                        if let Some(usage) = parse_v4_usage(patch) {
+                            *state.v4_usage.borrow_mut() = usage;
                         }
                     }
                     _ => {}
@@ -4441,13 +4528,17 @@ fn handle_event(
             // state for it — surface the official banner pair. (Ext-driven
             // compaction keeps the pager's own /compact UI.)
             if !state.compact_by_ext.get() {
+                let (tokens_used, window) = match *state.v4_usage.borrow() {
+                    Some((used, max)) => (used, max),
+                    None => (last_turn_context_tokens(&state.kernel_id.borrow()), context_window_tokens(shared)),
+                };
                 let payload = json!({
                     "sessionId": acp_session.0,
                     "update": {
                         "sessionUpdate": "auto_compact_started",
-                        "tokens_used": 0,
-                        "context_window": context_window_tokens(shared),
-                        "percentage": 0,
+                        "tokens_used": tokens_used,
+                        "context_window": window,
+                        "percentage": if window > 0 { tokens_used * 100 / window } else { 0 },
                         "reason": "auto",
                     },
                 });
@@ -4480,11 +4571,20 @@ fn handle_event(
         state.compacting.set(false);
         *state.compact_turn_id.borrow_mut() = None;
         if !was_ext_driven && event.kind == "turn.completed" {
+            // The post-compaction context size: the v4 projection patch may
+            // not have landed yet, so fall back to the ledger (its latest
+            // main_turn is still the pre-compact turn — better than 0, which
+            // the pager would render as an empty bar).
+            let tokens_after = state
+                .v4_usage
+                .borrow()
+                .map(|(used, _)| used)
+                .unwrap_or_else(|| last_turn_context_tokens(&state.kernel_id.borrow()));
             let payload = json!({
                 "sessionId": acp_session.0,
                 "update": {
                     "sessionUpdate": "auto_compact_completed",
-                    "tokens_after": 0,
+                    "tokens_after": tokens_after,
                 },
             });
             if let Ok(raw) = serde_json::value::to_raw_value(&payload) {

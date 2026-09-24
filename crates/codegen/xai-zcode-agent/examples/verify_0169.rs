@@ -842,6 +842,9 @@ async fn main() -> anyhow::Result<()> {
             // not "answered" by the kernel's "Compacted" text.
             {
                 seen.borrow_mut().current_text.borrow_mut().clear();
+                let usage_before =
+                    seen.borrow().usage_updates.borrow().last().cloned();
+                let usage_len_before = seen.borrow().usage_updates.borrow().len();
                 let cx_tx = client.tx.clone();
                 let cx_sid = sid.clone();
                 let compact_task = tokio::task::spawn_local(async move {
@@ -886,6 +889,30 @@ async fn main() -> anyhow::Result<()> {
                         && text_after.contains("Compacted")
                         && text_after.contains('2'),
                     format!("queued turn end={:?}, captured text: {:?}", queued_turn.as_ref().map(|r| format!("{:?}", r.stop_reason)).map_err(|e| e.to_string()), &text_after[..text_after.len().min(60)]),
+                    &mut summary,
+                    &mut fail,
+                );
+                // Real-time context meter: the kernel's usage patch (v4
+                // projection, official conflation channel) must arrive and
+                // DROP the meter without waiting for the next user turn.
+                let usages = seen.borrow().usage_updates.borrow().clone();
+                let dropped = usage_before
+                    .filter(|(pre, _)| {
+                        usages
+                            .iter()
+                            .skip(usage_len_before)
+                            .any(|(used, _)| *used + 2000 < *pre)
+                    })
+                    .is_some();
+                let last = usages.last().cloned();
+                check(
+                    "compact-drops-context-meter",
+                    dropped,
+                    format!(
+                        "pre-compact usage {:?}, post-compact stream {:?} — a lowered USAGE push must land without a further user turn",
+                        usage_before,
+                        last
+                    ),
                     &mut summary,
                     &mut fail,
                 );
