@@ -177,6 +177,21 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   实机 e2e。
 - 广告的命令：goal/rate/drain/filerewind/retry（initialize meta + 每会话 ACU）。
 
+## Windows 构建与使用（d40ab9b）
+
+- 上游 grok-build 本就跨平台（pager 20 处 cfg(windows)、shell 11 处、Unix 依赖
+  全部 cfg 隔离）；zcode 内核 Windows 存在（官方客户端布局
+  `%USERPROFILE%\.zcode`，本机内核 db 里就有 Windows 会话的路径证据）。
+- agent 侧已适配：`zcode_home()`（HOME→USERPROFILE 回退，18 处调用点）+
+  日志走 `std::env::temp_dir()`。
+- Windows 步骤：Rust(MSVC)+git → clone `ZouDongj/grok-build` 的 `zgrok` 分支 →
+  装 Windows 版 zcode CLI 并登录 coding plan（PATH 有 zcode 或设 ZCODE_BIN）→
+  `cargo build --release` → Windows Terminal 里运行。远程仓已推至
+  `git@github.com:ZouDongj/grok-build.git`（zgrok 分支，SSH 走
+  ssh.github.com:443 过本机代理）。
+- 未验证项（如实）：本机 mingw 交叉检查因磁盘不足未完成；我们 fork 的
+  cfg(windows) 编译面还没有机器证据；`grok wrap` PTY 功能可能被 cfg 掉。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
