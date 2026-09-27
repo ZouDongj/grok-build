@@ -210,12 +210,13 @@ async fn main() -> anyhow::Result<()> {
 
         let verdict = |name: &str, ok: bool| println!("CHECK {name}: {}", if ok { "PASS" } else { "FAIL" });
         verdict("rate-accepted", rate_reply.contains("点赞"));
-        // Kernel 3.14.1 empirics: v4 stop is accepted but does NOT flip
-        // autoDrain=false (the OSS comment describes the desktop's model).
-        // What matters end-to-end: the queued item still delivers after stop.
+        // Kernel 3.14.1 empirics: v4 stop is accepted; whether autoDrain
+        // flips to false is TIMING-DEPENDENT (observed both). What must hold
+        // end-to-end: the queued item survives the stop and delivers once
+        // drain resumes (/drain on).
         verdict(
-            "stop-keeps-queue-flowing",
-            proj_stopped.get("queueAutoDrain") == Some(&serde_json::json!(true)),
+            "stop-preserves-queued-item",
+            proj_stopped.get("queueItems") == Some(&serde_json::json!(1)),
         );
         verdict(
             "drain-resumes-delivery",

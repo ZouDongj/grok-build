@@ -320,7 +320,7 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
     /// current model come from the kernel config's `model/main`; every
     /// enabled official model comes from the kernel's bundled registry.
     async fn refresh_catalog(&self, _kernel: &Kernel) {
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        let Some(home) = Some(std::path::PathBuf::from(zcode_home())) else {
             return;
         };
         let Ok(config_raw) = std::fs::read_to_string(home.join(".zcode/cli/config.json")) else {
@@ -448,8 +448,7 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         // the session's current model. The list MUST match what the kernel's
         // own builtin registry declares (the desktop package the launcher
         // picks), or unknown ids poison the whole entry.
-        let model_ids: Vec<String> = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
+        let model_ids: Vec<String> = Some(std::path::PathBuf::from(zcode_home()))
             .map(|home| kernel_builtin_model_ids(&home, provider))
             .unwrap_or_default();
         let params = json!({
@@ -745,7 +744,7 @@ fn encode_cwd_dirname(cwd: &str) -> Option<String> {
 fn write_summary_stub(session_id: &str, cwd: &str) {
     let Some(home) = std::env::var_os("GROK_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .or_else(|| Some(std::path::PathBuf::from(zcode_home())))
     else {
         return;
     };
@@ -780,11 +779,11 @@ fn write_summary_stub(session_id: &str, cwd: &str) {
 fn sync_kernel_title(session_id: &str, cwd: &str) {
     let Some(home) = std::env::var_os("GROK_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .or_else(|| Some(std::path::PathBuf::from(zcode_home())))
     else {
         return;
     };
-    let kernel_home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let kernel_home = zcode_home();
     let Ok(con) = rusqlite::Connection::open_with_flags(
         std::path::Path::new(&kernel_home).join(".zcode/cli/db/db.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -859,7 +858,7 @@ fn kernel_action_outcome(
 /// Rewind points: every real user message in the kernel's ledger, oldest
 /// first, with a text preview from its first part.
 fn rewind_points(session_id: &str) -> Vec<Value> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
     let Ok(con) = rusqlite::Connection::open_with_flags(
         &db_path,
@@ -964,7 +963,7 @@ fn rewind_message_id(session_id: &str, target_prompt_index: usize) -> Option<Str
 /// `X-Bigmodel-Authorization` the coding-plan maas JWT (the bigmodel OAuth
 /// access token). Team-scope headers only apply to team plans — omitted.
 fn official_mcp_auth_headers() -> Option<Value> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let path = std::path::Path::new(&home).join(".zcode/v2/credentials.json");
     let store: Value = serde_json::from_str(
         &std::fs::read_to_string(path).ok()?,
@@ -986,7 +985,7 @@ fn official_mcp_auth_headers() -> Option<Value> {
 
 /// The kernel's prompt ledger for the composer's up-arrow recall.
 fn input_history_prompts(session_id: &str) -> Vec<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
     let Ok(con) = rusqlite::Connection::open_with_flags(
         &db_path,
@@ -1012,7 +1011,7 @@ fn input_history_prompts(session_id: &str) -> Vec<String> {
 /// round-trip re-sends the context), and subagent rows describe their own
 /// conversations, hence the main_turn filter.
 fn last_turn_context_tokens(kernel_session_id: &str) -> u64 {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
     let Ok(con) = rusqlite::Connection::open_with_flags(
         &db_path,
@@ -1380,12 +1379,20 @@ fn spawn_subagent_poller(
     });
 }
 
-/// Emit the pager's context meter update for a session.
+/// The kernel's home directory as a String (HOME on Unix, USERPROFILE on
+/// Windows — the official Windows client uses %USERPROFILE%\.zcode, same
+/// layout as ~/.zcode). Last-resort "/root" matches the old inline default.
+fn zcode_home() -> String {
+    std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| "/root".to_string())
+}
+
 /// The kernel's TodoWrite state for a session, from its own db (the
 /// `todo` table: content/status/position). Empty when the model never
 /// used TodoWrite.
 fn kernel_todos(kernel_sid: &str) -> Vec<(String, String)> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
     let Ok(con) = rusqlite::Connection::open_with_flags(
         &db_path,
@@ -1474,6 +1481,7 @@ fn push_available_commands(gateway: &AcpGatewaySender<acp::AgentSide>, session: 
     );
 }
 
+/// Emit the pager's context meter update for a session.
 fn push_context_usage(
     gateway: &AcpGatewaySender<acp::AgentSide>,
     shared: &Rc<Shared>,
@@ -1505,7 +1513,7 @@ fn push_context_usage(
 /// Session token totals aggregated from the kernel's per-turn usage ledger,
 /// in the pager's PromptUsage wire shape.
 fn session_usage_totals(session_id: &str) -> Value {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
     let empty = json!({
         "usage": {
@@ -1547,9 +1555,7 @@ fn session_usage_totals(session_id: &str) -> Value {
 fn delete_kernel_session(session_id: &str, cwd: &str) -> Result<(), String> {
     use rusqlite::Connection;
 
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .ok_or("no HOME")?;
+    let home = std::path::PathBuf::from(zcode_home());
     let db_path = home.join(".zcode/cli/db/db.sqlite");
     let db = Connection::open(&db_path)
         .and_then(|conn| {
@@ -1613,7 +1619,7 @@ fn delete_kernel_session(session_id: &str, cwd: &str) -> Result<(), String> {
 /// `account-provider:coding-plan:<providerId>:account:<uid>:api-key`.
 /// Read in-process only; the value is never logged or forwarded.
 fn coding_plan_api_key(provider_id: &str) -> Option<String> {
-    let home = std::env::var_os("HOME")?;
+    let home = zcode_home();
     let raw = std::fs::read_to_string(
         std::path::PathBuf::from(home).join(".zcode/v2/credentials.json"),
     )
@@ -1723,7 +1729,7 @@ fn decrypt_credential(value: &str) -> String {
 }
 
 fn home_dir_string() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+    zcode_home()
 }
 
 /// setModel with a short retry: 0.16.9 materializes account entitlements
@@ -1801,7 +1807,7 @@ fn version_of(path: &std::path::Path) -> Vec<u64> {
 /// The kernel's live builtin registry revision, e.g. "zcode-builtin:30:<hash>",
 /// as reported by its own provider_registry.ready log line at/after boot.
 fn kernel_builtin_revision(boot_epoch_ms: u128) -> String {
-    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+    let Some(home) = Some(std::path::PathBuf::from(zcode_home())) else {
         return "host".to_string();
     };
     let log_dir = home.join(".zcode/cli/log");
@@ -1904,7 +1910,7 @@ fn debug_log(text: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/zcode-agent-debug.log")
+        .open(std::env::temp_dir().join("zcode-agent-debug.log"))
     {
         let _ = writeln!(f, "[{now}] {text}");
     }
@@ -4476,7 +4482,7 @@ fn dirs_config_file(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+        .or_else(|| Some(std::path::PathBuf::from(zcode_home())))
         .map(|base| base.join("zcode-tui").join(name))
 }
 
@@ -5067,7 +5073,7 @@ fn subagent_agent_dir(kernel_parent: &str, agent_id: &str) -> Option<std::path::
     if !agent_id.starts_with("agent_") || !kernel_parent.starts_with("sess_") {
         return None;
     }
-    let home = std::env::var("HOME").ok()?;
+    let home = zcode_home();
     let dir = std::path::Path::new(&home)
         .join(".zcode/cli/agents")
         .join(kernel_parent)
@@ -5145,7 +5151,7 @@ fn flush_child_content(
 /// New assistant messages of a subagent child since the last poll, as
 /// (message_id, kind, text) triples — kind is "reasoning" or "text".
 fn child_new_messages(child_id: &str, seen: &mut std::collections::HashSet<String>) -> Vec<(String, &'static str, String)> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
+    let home = zcode_home();
     let db_path = std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite");
     let mut out = Vec::new();
     let Ok(con) = rusqlite::Connection::open_with_flags(

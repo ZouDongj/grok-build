@@ -30,7 +30,7 @@ pub fn debug_log_kernel(text: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("/tmp/zcode-agent-debug.log")
+        .open(std::env::temp_dir().join("zcode-agent-debug.log"))
     {
         let _ = writeln!(f, "[{}] kernel: {text}", now_ms());
     }
@@ -135,7 +135,7 @@ impl Kernel {
     ) -> std::io::Result<(Kernel, mpsc::UnboundedReceiver<KernelMessage>)> {
         let kernel_log = std::env::var_os("ZCODE_KERNEL_LOG")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/zcode-kernel.err"));
+            .unwrap_or_else(|| std::env::temp_dir().join("zcode-kernel.err"));
         let kernel_err = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
