@@ -192,6 +192,18 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
 - 未验证项（如实）：本机 mingw 交叉检查因磁盘不足未完成；我们 fork 的
   cfg(windows) 编译面还没有机器证据；`grok wrap` PTY 功能可能被 cfg 掉。
 
+## 引擎附注（nudge）与 todo 面板（08d0b88 + 45e2756）
+
+- 内核会把 todo 提醒等"引擎附注"存成**独立 user 角色消息**（info.synthetic=true /
+  metadata.visibility=model-only；本机库 2692 条）。官方投影 origin=synthetic 折叠
+  不显示；我们 replay 曾把它们当用户发言重放（用户看到的"TodoWrite hasn't been
+  used"气泡）。修复：replay 按结构标记跳过（勿按文本嗅探）。真实会话只读验证：
+  db 25 条 nudge → 重放 0 条，20 条真实消息完整。
+- todo 面板链路本来就通（内核 todo 表 → ACP Plan → 面板，回归绿）。看不到列表
+  的真实原因：模型没调用 TodoWrite（内核的 nudge 正是在催模型用它）。面板条目
+  为空时高度 0 自动隐藏。45e2756：TodoWrite 工具 result 事件即时推 Plan（官方
+  同款），不再等回合结束。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
