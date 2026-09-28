@@ -2104,6 +2104,16 @@ impl acp::Agent for ZcodeAgent {
                 if role != "user" && role != "assistant" {
                     continue;
                 }
+                // Engine nudges (todo reminders, etc.) are stored as
+                // user-role messages but carry synthetic/model-only markers
+                // — the official clients fold them out of the transcript.
+                // Never replay them as if the user said them.
+                if message.pointer("/info/synthetic").and_then(Value::as_bool) == Some(true)
+                    || message.pointer("/info/metadata/visibility").and_then(Value::as_str)
+                        == Some("model-only")
+                {
+                    continue;
+                }
                 let mut text = String::new();
                 // Reasoning parts replayed individually with their own
                 // kernel-recorded spans: (text, Option<(start, end)>).
