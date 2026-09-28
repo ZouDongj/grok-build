@@ -5478,6 +5478,11 @@ fn handle_event(
                     &acp_session,
                     acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(acp_id, fields)),
                 );
+                // Live todo pane: the official client updates the plan the
+                // moment TodoWrite lands, not at turn end.
+                if event.tool_name.as_deref() == Some("TodoWrite") {
+                    push_todos(gateway, &state, &acp_session);
+                }
             }
         }
         ("turn.completed" | "turn.failed")
