@@ -1,0 +1,210 @@
+//! E2E: launch a MINIMAL dwf workflow through a probe session (the model
+//! writes and starts it via CreateWorkflow), then verify zgrok's
+//! workflow_updated rail carries real actors/phases/status to the pager.
+use agent_client_protocol as acp;
+use std::cell::RefCell;
+use std::rc::Rc;
+use xai_acp_lib::{AcpClientMessage, AcpGatewayReceiver, acp_channels, acp_send};
+
+const WORKDIR: &str = "/tmp/probedwf";
+
+#[derive(Clone, Debug)]
+struct WfSnap {
+    t_ms: u128,
+    status: String,
+    agents_used: u64,
+    active_agents: u32,
+    phases: usize,
+    agents: usize,
+    current_phase: Option<String>,
+    last_event: Option<String>,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> anyhow::Result<()> {
+    let local = tokio::task::LocalSet::new();
+    local.run_until(async move {
+        std::fs::create_dir_all(WORKDIR)?;
+        let (client, agent_channel) = acp_channels();
+        let gateway = xai_acp_lib::AcpGatewaySender::new(agent_channel.tx);
+        let agent = Rc::new(xai_zcode_agent::ZcodeAgent::new(gateway, "zcode"));
+        let gw_rx = AcpGatewayReceiver::new(agent_channel.rx, agent.clone()).with_tracing(false);
+        tokio::task::spawn_local(gw_rx.run());
+
+        let t0 = std::time::Instant::now();
+        let snaps: Rc<RefCell<Vec<WfSnap>>> = Rc::new(RefCell::new(Vec::new()));
+        let tool_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let subagent_events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let agent_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        {
+            let agent_text = agent_text.clone();
+            let snaps = snaps.clone();
+            let tool_names = tool_names.clone();
+            let subagent_events = subagent_events.clone();
+            let t0 = t0.clone();
+            let mut rx = client.rx;
+            tokio::task::spawn_local(async move {
+                while let Some(m) = rx.recv().await {
+                    match m {
+                        AcpClientMessage::ExtMethod(n) => {
+                            let raw = serde_json::value::to_raw_value(&serde_json::json!({
+                                "outcome": "approved"
+                            }))
+                            .unwrap();
+                            let _ = n.response_tx.send(Ok(acp::ExtResponse::new(raw.into())));
+                        }
+                        AcpClientMessage::RequestPermission(p) => {
+                            let pick = p
+                                .options
+                                .iter()
+                                .find(|o| matches!(o.kind, acp::PermissionOptionKind::AllowOnce))
+                                .or_else(|| p.options.first())
+                                .cloned();
+                            if let Some(o) = pick {
+                                let _ = p.response_tx.send(Ok(
+                                    acp::RequestPermissionResponse::new(
+                                        acp::RequestPermissionOutcome::Selected(
+                                            acp::SelectedPermissionOutcome::new(o.option_id.clone()),
+                                        ),
+                                    ),
+                                ));
+                            }
+                        }
+                        AcpClientMessage::SessionNotification(u) => match &u.update {
+                            acp::SessionUpdate::ToolCall(tc) => {
+                                tool_names.borrow_mut().push(tc.title.clone());
+                            }
+                            acp::SessionUpdate::AgentMessageChunk(c) => {
+                                if let acp::ContentBlock::Text(t) = &c.content {
+                                    agent_text.borrow_mut().push_str(&t.text);
+                                }
+                            }
+                            acp::SessionUpdate::AvailableCommandsUpdate(_) => {}
+                            _ => {}
+                        },
+                        AcpClientMessage::ExtNotification(n) => {
+                            let v: serde_json::Value =
+                                serde_json::from_str(n.params.get()).unwrap_or(serde_json::json!({}));
+                            let upd = &v["update"];
+                            if n.method.as_ref() == "x.ai/session_notification" {
+                                match upd["sessionUpdate"].as_str() {
+                                    Some("workflow_updated") => snaps.borrow_mut().push(WfSnap {
+                                        t_ms: t0.elapsed().as_millis(),
+                                        status: upd["status"].as_str().unwrap_or("").into(),
+                                        agents_used: upd["agents_used"].as_u64().unwrap_or(0),
+                                        active_agents: upd["active_agents"].as_u64().unwrap_or(0) as u32,
+                                        phases: upd["phases"].as_array().map(|a| a.len()).unwrap_or(0),
+                                        agents: upd["agents"].as_array().map(|a| a.len()).unwrap_or(0),
+                                        current_phase: upd["current_phase"].as_str().map(String::from),
+                                        last_event: upd["last_event"].as_str().map(String::from),
+                                    }),
+                                    Some("subagent_spawned") | Some("subagent_finished") => {
+                                        subagent_events.borrow_mut().push(
+                                            format!(
+                                                "{}@{}",
+                                                upd["sessionUpdate"].as_str().unwrap_or("?"),
+                                                upd.get("description").and_then(|d| d.as_str()).unwrap_or("")
+                                            ),
+                                        );
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+
+        let _init =
+            acp_send(acp::InitializeRequest::new(acp::ProtocolVersion::V1), &client.tx).await?;
+        let session = acp_send(
+            acp::NewSessionRequest::new(std::path::PathBuf::from(WORKDIR)),
+            &client.tx,
+        )
+        .await?;
+        let sid = session.session_id.clone();
+        println!("[probe] session {}", sid.0);
+
+        let resp = acp_send(
+            acp::PromptRequest::new(
+                sid.clone(),
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "用 CreateWorkflow 工具创建并运行一个最小工作流：单个 actor 问一句\"1+1等于几？只回答数字\"，把答案作为产出。不要做任何别的事。".to_string(),
+                ))],
+            ),
+            &client.tx,
+        )
+        .await?;
+        println!("[probe] launch turn: {:?}", resp.stop_reason);
+
+        // Watch the workflow rail until a terminal status or timeout.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(420);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let last = snaps.borrow().last().cloned();
+            if let Some(s) = last {
+                println!(
+                    "[probe t+{:>6}ms] {} agents={} active={} phases={:?} phase={:?} event={:?}",
+                    s.t_ms, s.status, s.agents, s.active_agents, s.phases, s.current_phase, s.last_event
+                );
+                if s.status == "complete" || s.status == "failed" || s.status == "cancelled" {
+                    break;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                println!("[probe] timeout waiting for terminal workflow status");
+                break;
+            }
+        }
+        let all = snaps.borrow().clone();
+        println!("\n=== workflow_updated timeline ({} snaps) ===", all.len());
+        for s in &all {
+            println!(
+                "t+{:>6}ms {:>10} used={} active={} phases={} agents={} cur={:?} ev={:?}",
+                s.t_ms, s.status, s.agents_used, s.active_agents, s.phases, s.agents, s.current_phase, s.last_event
+            );
+        }
+        println!("tools seen: {:?}", tool_names.borrow());
+        println!("agent reply: {}", agent_text.borrow().chars().take(300).collect::<String>());
+        println!("subagent events: {:?}", subagent_events.borrow());
+
+        let verdict = |name: &str, ok: bool| println!("CHECK {name}: {}", if ok { "PASS" } else { "FAIL" });
+        verdict(
+            "workflow-launched",
+            tool_names.borrow().iter().any(|t| t.to_lowercase().contains("workflow")),
+        );
+        verdict(
+            "workflow-updates-flow",
+            !all.is_empty(),
+        );
+        verdict(
+            "workflow-actors-visible",
+            all.iter().any(|s| s.agents > 0 || s.agents_used > 0),
+        );
+        verdict(
+            "workflow-phases-visible",
+            all.iter().any(|s| s.phases > 0),
+        );
+        verdict(
+            "workflow-terminal-status",
+            all.iter().any(|s| matches!(s.status.as_str(), "complete" | "failed" | "cancelled")),
+        );
+
+        let _ = acp_send(
+            acp::ExtRequest::new(
+                "x.ai/session/delete",
+                serde_json::value::to_raw_value(&serde_json::json!({
+                    "sessionId": sid.0, "cwd": WORKDIR,
+                }))
+                .unwrap()
+                .into(),
+            ),
+            &client.tx,
+        )
+        .await;
+        Ok::<(), anyhow::Error>(())
+    }).await?;
+    Ok(())
+}

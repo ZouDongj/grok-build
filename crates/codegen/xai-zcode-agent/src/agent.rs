@@ -1982,6 +1982,7 @@ impl acp::Agent for ZcodeAgent {
         debug_log("acp: new_session");
         let kernel = self.ensure_kernel().await?;
         let cwd = args.cwd.clone();
+        enable_dynamic_workflows(&kernel, &cwd.to_string_lossy()).await;
         let created = kernel
             .call("session/create", kernel::create_params(&cwd))
             .await
@@ -2031,6 +2032,7 @@ impl acp::Agent for ZcodeAgent {
         debug_log("acp: load_session");
         let kernel = self.ensure_kernel().await?;
         let session_id = args.session_id.0.as_ref().to_string();
+        enable_dynamic_workflows(&kernel, &args.cwd.to_string_lossy()).await;
         let resumed = kernel
             .call("session/resume", kernel::resume_params(&session_id))
             .await
@@ -4851,10 +4853,84 @@ fn emit_workflow_updates(
             },
             _ => "active",
         };
-        let nodes = run
+        let nodes_used = run
             .pointer("/usage/nodesUsed")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // Actors -> the pager's agents list; nodes -> phase progress.
+        let actors = run.get("actors").and_then(Value::as_array);
+        let nodes = run.get("nodes").and_then(Value::as_array);
+        let agents: Vec<Value> = actors
+            .map(|list| {
+                list.iter()
+                    .map(|a| {
+                        json!({
+                            "agent_id": a.get("siteId").and_then(Value::as_str).unwrap_or("?"),
+                            "label": a.get("name").and_then(Value::as_str)
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!(
+                                    "actor-{}",
+                                    a.get("ordinal").and_then(Value::as_u64).unwrap_or(0)
+                                )),
+                            "phase": a.get("phaseName"),
+                            "state": a.get("status").and_then(Value::as_str).unwrap_or("waiting"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let active_agents = actors
+            .map(|list| {
+                list.iter()
+                    .filter(|a| a.get("status").and_then(Value::as_str) == Some("running"))
+                    .count() as u32
+            })
+            .unwrap_or(0);
+        // Phase groups by script phaseName (default "main"): running while
+        // any node is pre-settled, failed if any failed, else done.
+        let mut phase_order: Vec<String> = Vec::new();
+        let mut phase_map: std::collections::HashMap<String, (u64, u64, u64)> =
+            std::collections::HashMap::new(); // (active, settled, failed)
+        if let Some(list) = nodes {
+            for n in list {
+                let name = n
+                    .get("phaseName")
+                    .and_then(Value::as_str)
+                    .unwrap_or("main")
+                    .to_string();
+                let entry = phase_map.entry(name.clone()).or_insert((0, 0, 0));
+                match n.get("phase").and_then(Value::as_str) {
+                    Some("settled") => {
+                        if n.get("outcome").and_then(Value::as_str) == Some("failed") {
+                            entry.2 += 1;
+                        } else {
+                            entry.1 += 1;
+                        }
+                    }
+                    _ => entry.0 += 1,
+                }
+                if !phase_order.contains(&name) {
+                    phase_order.push(name);
+                }
+            }
+        }
+        let phases: Vec<Value> = phase_order
+            .iter()
+            .map(|name| {
+                let (active, settled, failed) = phase_map[name];
+                json!({
+                    "title": name,
+                    "state": if failed > 0 && active == 0 { "failed" }
+                        else if active > 0 { "running" }
+                        else { "complete" },
+                    "detail": format!("{settled} settled"),
+                })
+            })
+            .collect();
+        let current_phase = phase_order.last().cloned();
+        let executing = phase_map.values().map(|(a, _, _)| *a).sum::<u64>();
+        let settled = phase_map.values().map(|(_, s, _)| *s).sum::<u64>();
+        let failed = phase_map.values().map(|(_, _, f)| *f).sum::<u64>();
         let update = json!({
             "sessionUpdate": "workflow_updated",
             "run_id": run_id,
@@ -4862,10 +4938,14 @@ fn emit_workflow_updates(
             "objective": run.get("resultPreview").and_then(Value::as_str).unwrap_or(""),
             "status": status,
             "revision": 0,
-            "agents_used": nodes,
+            "phases": phases,
+            "current_phase": current_phase,
+            "agents": agents,
+            "agents_used": nodes_used,
             "agents_reserved": 0,
             "elapsed_ms": 0,
-            "active_agents": if status == "active" { nodes as u32 } else { 0 },
+            "active_agents": active_agents,
+            "last_event": format!("nodes: {executing} running / {settled} settled / {failed} failed"),
             "result_summary": run.get("resultPreview"),
             "pause_message": run.get("error"),
         });
@@ -5024,6 +5104,26 @@ fn emit_background_tasks(
 
 /// (Re)subscribe the v4 conversation topic for a session; the snapshot
 /// frame lands asynchronously and refreshes the projection state.
+/// Open the dynamic-workflow gate. The kernel ships it FAIL-CLOSED: the
+/// official host reads its rollout config and calls
+/// workspace/updateDynamicWorkflowPolicy; without this call sessions get
+/// no CreateWorkflow toolset. Must fire BEFORE session create/resume (the
+/// policy only affects records created after it flips).
+async fn enable_dynamic_workflows(kernel: &Kernel, cwd: &str) {
+    if let Err(e) = kernel
+        .call(
+            "workspace/updateDynamicWorkflowPolicy",
+            json!({
+                "workspace": {"workspacePath": cwd, "workspaceKey": cwd},
+                "enabled": true,
+            }),
+        )
+        .await
+    {
+        debug_log(&format!("dynamic workflow policy: {e}"));
+    }
+}
+
 fn v4_subscribe(kernel: &Kernel, kernel_sid: &str) {
     let _ = kernel.request(
         "v4/conversation/subscribe",
