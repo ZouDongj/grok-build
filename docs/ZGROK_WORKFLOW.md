@@ -222,6 +222,22 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
 - 未接：startSavedWorkflow（保存的定义启动，workflow_definition 表当前为空，
   用户实际用法是模型动态创建）。
 
+## workflow TUI 界面（5f1c762）
+
+- **状态条（输入框上方）**：有 run 时显示 `⟳ Workflow · 名称 · 阶段 · N
+  agents · settled/total phases`，活动时带 spinner；hover 下划线，**鼠标点击或
+  g 键**展开 workflows 全屏视图（run 列表/阶段分组/agent roster）。优先显示
+  活动 run。
+- **agent roster 富化**：v4 run 不带 name/model，从账本补（dwf_run.name、
+  dwf_actor.resolved_model 去 provider 前缀、persona_json 的 system 作工作
+  内容描述）。description 走 wire→ingest→视图新字段，渲染在 live-activity
+  槽位（有 live 子代理活动时优先 live）。
+- **actor 进子代理管道**：首次见到 actor 的 sessionId 发 subagent_spawned
+  （带 workflow_run_id/persona/model/child_session_id），settled 发
+  subagent_finished——点亮 roster、dashboard、workflows 视图的 live map。
+- e2e：模型自建"最小问答工作流"，通知流带真实 name/model/desc，
+  spawn/finish 事件齐，8/8 过。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
