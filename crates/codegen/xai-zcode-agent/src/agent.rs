@@ -2669,6 +2669,24 @@ impl acp::Agent for ZcodeAgent {
             );
             return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
         }
+        // /workflow <自然语言目标> — direct launch shortcut. The workflow
+        // engine is driven by the CreateWorkflow TOOL (the authoring step is
+        // model work: it writes the dwf script), so rewrite the command
+        // into an authoring prompt instead of asking the user to know the
+        // tool name. ("/workflow runs" never arrives — the pager opens the
+        // dashboard locally.)
+        let text = if text.trim_start().starts_with("/workflow") && attachments.is_empty() {
+            let desc = text.trim_start()[9..].trim();
+            if desc.is_empty() {
+                text.clone()
+            } else {
+                format!(
+                    "使用 CreateWorkflow 工具创建并立即启动一个工作流来完成下面的目标。要求：不要先询问确认；创建后报告工作流名称与运行 ID；然后等待其完成并汇报结果。目标：\n{desc}"
+                )
+            }
+        } else {
+            text.clone()
+        };
         // Send-now (强插): the pager marks interrupting prompts with
         // meta.sendNow — cancel the running kernel turn, wait for the
         // session to free, then send ours. The kernel rejects concurrent

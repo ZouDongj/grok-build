@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
             acp::PromptRequest::new(
                 sid.clone(),
                 vec![acp::ContentBlock::Text(acp::TextContent::new(
-                    "用 CreateWorkflow 工具创建并运行一个最小工作流：单个 actor 问一句\"1+1等于几？只回答数字\"，把答案作为产出。不要做任何别的事。".to_string(),
+                    "/workflow 单个 actor 问一句 1+1 等于几，只回答数字，把答案作为产出".to_string(),
                 ))],
             ),
             &client.tx,
