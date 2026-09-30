@@ -35,9 +35,11 @@ async fn main() -> anyhow::Result<()> {
         let snaps: Rc<RefCell<Vec<WfSnap>>> = Rc::new(RefCell::new(Vec::new()));
         let tool_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let subagent_events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let perm_titles: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let meta: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let agent_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         {
+            let perm_titles = perm_titles.clone();
             let meta = meta.clone();
             let agent_text = agent_text.clone();
             let snaps = snaps.clone();
@@ -56,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
                             let _ = n.response_tx.send(Ok(acp::ExtResponse::new(raw.into())));
                         }
                         AcpClientMessage::RequestPermission(p) => {
+                            perm_titles.borrow_mut().push(p.tool_call.fields.title.clone().unwrap_or_default());
                             let pick = p
                                 .options
                                 .iter()
@@ -194,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         println!("agent reply: {}", agent_text.borrow().chars().take(300).collect::<String>());
         println!("subagent events: {:?}", subagent_events.borrow());
         println!("meta: {:?}", meta.borrow());
+        println!("permission titles: {:?}", perm_titles.borrow());
 
         let verdict = |name: &str, ok: bool| println!("CHECK {name}: {}", if ok { "PASS" } else { "FAIL" });
         verdict(
@@ -227,6 +231,13 @@ async fn main() -> anyhow::Result<()> {
         verdict(
             "actor-subagent-events",
             !subagent_events.borrow().is_empty(),
+        );
+        verdict(
+            "workflow-approval-asked",
+            perm_titles
+                .borrow()
+                .iter()
+                .any(|t| t.to_lowercase().contains("workflow") || t.contains("工作流")),
         );
 
         let _ = acp_send(

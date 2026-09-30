@@ -236,7 +236,12 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   （带 workflow_run_id/persona/model/child_session_id），settled 发
   subagent_finished——点亮 roster、dashboard、workflows 视图的 live map。
 - e2e：模型自建"最小问答工作流"，通知流带真实 name/model/desc，
-  spawn/finish 事件齐，8/8 过。
+  spawn/finish 事件齐。
+- **/workflow 直发命令**：`/workflow <目标>` 在 agent 侧重写为授权提示（不必知道
+  工具名）。**授权确认走内核 alwaysAsk 门**：CreateWorkflow 的 interaction 请求
+  → ACP RequestPermission → pager 原生确认弹窗，用户批准后才启动（官方同款；
+  e2e 实证标题 "Tool CreateWorkflow always requires explicit approval"，9/9 过）。
+  重写提示词勿写"不要询问确认"——门是内核级的，措辞误导模型反而多余。
 
 ## 排查手册
 

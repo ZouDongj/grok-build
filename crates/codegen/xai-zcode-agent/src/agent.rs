@@ -2681,7 +2681,7 @@ impl acp::Agent for ZcodeAgent {
                 text.clone()
             } else {
                 format!(
-                    "使用 CreateWorkflow 工具创建并立即启动一个工作流来完成下面的目标。要求：不要先询问确认；创建后报告工作流名称与运行 ID；然后等待其完成并汇报结果。目标：\n{desc}"
+                    "使用 CreateWorkflow 工具为下面的目标创建工作流并启动（工具调用会触发用户确认，经用户同意后自动开始）。创建后报告工作流名称与运行 ID；等待其完成并汇报结果。目标：\n{desc}"
                 )
             }
         } else {
