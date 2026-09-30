@@ -204,6 +204,24 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   为空时高度 0 自动隐藏。45e2756：TodoWrite 工具 result 事件即时推 Plan（官方
   同款），不再等回合结束。
 
+## workflows 全链路（41d35e9，实机 e2e 通过）
+
+- **根因**：内核的动态工作流工具集（CreateWorkflow 全家）**fail-closed**——官方
+  Host 读 rollout 配置后显式调 `workspace/updateDynamicWorkflowPolicy
+  {workspace:{workspacePath,workspaceKey}, enabled:true}`，且只影响**之后**创建的
+  会话。不调用的会话模型根本没有这些工具（同 agent 同模型对比实证：官方建的
+  AgentENV 会话有全套，我们建的是空的）。
+- **对接**：new_session/load_session 在 create/resume 前按会话 cwd 打开闸门。
+- **可视化**：v4 workflowRuns.runs → workflow_updated（actors→agents 列表含
+  label/phaseName/state；nodes 按 phaseName 分组出 running/complete/failed；
+  current phase；节点计数事件行）。e2e：模型用 CreateWorkflow 写了个最小
+  dwf（单 actor 问 1+1），面板流 active→running(1 actor, 阶段"提问 1+1")→
+  settled→complete，答案返回。
+- 用户入口：直接让模型"用 CreateWorkflow 建工作流…"；运行中 `g` 键开 workflows
+  视图（runs 非空时）；drafts 在 `<cwd>/.zcode/workflow-drafts/`。
+- 未接：startSavedWorkflow（保存的定义启动，workflow_definition 表当前为空，
+  用户实际用法是模型动态创建）。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
