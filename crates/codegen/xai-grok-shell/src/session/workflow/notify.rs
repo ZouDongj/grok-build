@@ -130,6 +130,7 @@ pub(crate) fn build_workflow_updated(
             label: a.label.clone(),
             phase: a.phase.clone(),
             model: a.model.clone(),
+            description: None,
             state: a.state.clone(),
             tokens_used: a.tokens_used,
             duration_ms: a.duration_ms,

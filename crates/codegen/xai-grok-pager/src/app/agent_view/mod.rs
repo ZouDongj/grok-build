@@ -1063,6 +1063,7 @@ pub struct AgentView {
     pub hit_catalog_close: HitArea,
     pub hit_bg_status: HitArea,
     pub hit_goal_status: HitArea,
+    pub hit_workflow_status: HitArea,
     pub hit_goal_close: HitArea,
     pub hit_bg_button: HitArea,
     pub(crate) last_bg_click: Option<Instant>,

@@ -1295,6 +1295,23 @@ impl AgentView {
                 ),
             );
         }
+        if let Some(run) = self
+            .workflow_runs_newest_first()
+            .into_iter()
+            .find(|r| r.is_active())
+            .or_else(|| self.workflow_runs_newest_first().into_iter().next())
+        {
+            let tick = self.tasks.tick_count() as usize;
+            status.push(
+                "workflow",
+                crate::views::agent_status::workflow_status_line(
+                    &run,
+                    &theme,
+                    self.hit_workflow_status.hovered,
+                    tick,
+                ),
+            );
+        }
         if let Some(mcp_line) = self.mcp_init_progress.as_ref().and_then(|p| {
             crate::views::agent_status::mcp_status_line(p, self.scrollback.animation_tick(), &theme)
         }) {
@@ -1383,6 +1400,7 @@ impl AgentView {
         let areas = status.render(buf, layout.status_bar);
         self.hit_bg_status.rect = areas.get("bg_tasks").copied();
         self.hit_goal_status.rect = areas.get("goal").copied();
+        self.hit_workflow_status.rect = areas.get("workflow").copied();
         self.hit_context.rect = areas.get("context").copied();
         self.hit_credits.rect = areas.get("credits").copied();
         self.hit_plan_button.rect = areas.get("plan").copied();

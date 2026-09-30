@@ -29,6 +29,9 @@ pub struct WorkflowAgentInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub state: String,
+    /// Short work-content summary (e.g. the dwf actor's persona mission).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default)]
     pub tokens_used: u64,
     #[serde(default)]

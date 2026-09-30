@@ -334,6 +334,53 @@ pub fn goal_status_line(
     ])
 }
 
+/// One-line workflow status strip for the status bar (above the composer).
+/// Mirrors the goal strip: chip + activity; click / `g` opens the workflows view.
+pub fn workflow_status_line(
+    run: &crate::views::workflows::WorkflowRunSnapshot,
+    theme: &Theme,
+    hovered: bool,
+    tick: usize,
+) -> Line<'static> {
+    let dim_style = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+    let chip_style = if run.is_active() {
+        Style::default().fg(theme.accent_plan).bg(theme.bg_base)
+    } else {
+        Style::default().fg(theme.gray).bg(theme.bg_base)
+    };
+    let chip_style = if hovered {
+        chip_style
+            .add_modifier(ratatui::style::Modifier::BOLD)
+            .add_modifier(ratatui::style::Modifier::UNDERLINED)
+    } else {
+        chip_style
+    };
+    let chip_name = "Workflow";
+    let chip = if run.is_active() {
+        let frames = crate::glyphs::dot_spinner_frames();
+        let frame = frames.get((tick / 4) % frames.len()).copied().unwrap_or("");
+        format!("{frame} {chip_name}")
+    } else {
+        chip_name.to_string()
+    };
+    let name = crate::util::truncate_to_width(&run.name, 24).into_owned();
+    let settled = run.phases.iter().filter(|(_, st)| st != "running").count();
+    let phases_part = if run.phases.len() > 1 {
+        format!(" · {settled}/{} phases", run.phases.len())
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        Span::styled("[", dim_style),
+        Span::styled(chip, chip_style),
+        Span::styled("]", dim_style),
+        Span::styled(
+            format!("  {name} · {}{phases_part}", run.activity_label()),
+            dim_style,
+        ),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // MCP connecting indicator
 // ---------------------------------------------------------------------------

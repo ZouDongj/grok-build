@@ -57,6 +57,14 @@ impl AgentView {
                     }
                     return InputOutcome::Changed;
                 }
+                if self.hit_workflow_status.contains(mouse.column, mouse.row) {
+                    self.show_workflows = !self.show_workflows;
+                    if self.show_workflows {
+                        self.workflows_view.reset();
+                        self.show_goal_detail = false;
+                    }
+                    return InputOutcome::Changed;
+                }
                 if self.hit_goal_status.contains(mouse.column, mouse.row) {
                     if !self.workflow_runs.is_empty() {
                         self.show_workflows = !self.show_workflows;
@@ -1093,6 +1101,7 @@ impl AgentView {
                     .update_hover(mouse.column, mouse.row);
                 changed |= self.hit_bg_status.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_goal_status.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_workflow_status.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);

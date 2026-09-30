@@ -157,6 +157,7 @@ pub(super) fn ingest_workflow_update(agent: &mut AgentView, update: XaiSessionUp
                     phase: a.phase.clone(),
                     model: a.model.clone(),
                     state: a.state.clone(),
+                    description: a.description.clone(),
                     tokens_used: a.tokens_used,
                     duration_ms: a.duration_ms,
                 })

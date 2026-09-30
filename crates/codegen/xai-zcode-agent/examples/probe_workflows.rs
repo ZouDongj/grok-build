@@ -35,8 +35,10 @@ async fn main() -> anyhow::Result<()> {
         let snaps: Rc<RefCell<Vec<WfSnap>>> = Rc::new(RefCell::new(Vec::new()));
         let tool_names: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let subagent_events: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let meta: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let agent_text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
         {
+            let meta = meta.clone();
             let agent_text = agent_text.clone();
             let snaps = snaps.clone();
             let tool_names = tool_names.clone();
@@ -88,7 +90,28 @@ async fn main() -> anyhow::Result<()> {
                             let upd = &v["update"];
                             if n.method.as_ref() == "x.ai/session_notification" {
                                 match upd["sessionUpdate"].as_str() {
-                                    Some("workflow_updated") => snaps.borrow_mut().push(WfSnap {
+                                    Some("workflow_updated") => {
+                                        let name = upd["name"].as_str().unwrap_or("").to_string();
+                                        let model = upd["agents"].as_array()
+                                            .and_then(|a| a.first())
+                                            .and_then(|g| g.get("model"))
+                                            .and_then(|m| m.as_str())
+                                            .map(String::from);
+                                        let desc = upd["agents"].as_array()
+                                            .and_then(|a| a.first())
+                                            .and_then(|g| g.get("description"))
+                                            .and_then(|m| m.as_str())
+                                            .map(String::from);
+                                        if !name.is_empty() && name != "Workflow" {
+                                            meta.borrow_mut().push(format!("name={name}"));
+                                        }
+                                        if let Some(m) = model {
+                                            meta.borrow_mut().push(format!("model={m}"));
+                                        }
+                                        if let Some(d) = desc {
+                                            meta.borrow_mut().push(format!("desc={}", d.chars().take(40).collect::<String>()));
+                                        }
+                                        snaps.borrow_mut().push(WfSnap {
                                         t_ms: t0.elapsed().as_millis(),
                                         status: upd["status"].as_str().unwrap_or("").into(),
                                         agents_used: upd["agents_used"].as_u64().unwrap_or(0),
@@ -96,8 +119,9 @@ async fn main() -> anyhow::Result<()> {
                                         phases: upd["phases"].as_array().map(|a| a.len()).unwrap_or(0),
                                         agents: upd["agents"].as_array().map(|a| a.len()).unwrap_or(0),
                                         current_phase: upd["current_phase"].as_str().map(String::from),
-                                        last_event: upd["last_event"].as_str().map(String::from),
-                                    }),
+                                            last_event: upd["last_event"].as_str().map(String::from),
+                                        })
+                                    }
                                     Some("subagent_spawned") | Some("subagent_finished") => {
                                         subagent_events.borrow_mut().push(
                                             format!(
@@ -169,6 +193,7 @@ async fn main() -> anyhow::Result<()> {
         println!("tools seen: {:?}", tool_names.borrow());
         println!("agent reply: {}", agent_text.borrow().chars().take(300).collect::<String>());
         println!("subagent events: {:?}", subagent_events.borrow());
+        println!("meta: {:?}", meta.borrow());
 
         let verdict = |name: &str, ok: bool| println!("CHECK {name}: {}", if ok { "PASS" } else { "FAIL" });
         verdict(
@@ -190,6 +215,18 @@ async fn main() -> anyhow::Result<()> {
         verdict(
             "workflow-terminal-status",
             all.iter().any(|s| matches!(s.status.as_str(), "complete" | "failed" | "cancelled")),
+        );
+        verdict(
+            "run-has-real-name",
+            meta.borrow().iter().any(|m| m.starts_with("name=") && !m.contains("name=Workflow")),
+        );
+        verdict(
+            "agent-has-model",
+            meta.borrow().iter().any(|m| m.starts_with("model=") && m != "model=None"),
+        );
+        verdict(
+            "actor-subagent-events",
+            !subagent_events.borrow().is_empty(),
         );
 
         let _ = acp_send(

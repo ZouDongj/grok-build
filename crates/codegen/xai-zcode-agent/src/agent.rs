@@ -4829,6 +4829,63 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
     }
 }
 
+/// dwf run display facts from the ledger: run name + per-actor
+/// (resolved_model, persona summary) keyed by actor siteId.
+fn dwf_run_facts(run_id: &str) -> (Option<String>, std::collections::HashMap<String, (Option<String>, Option<String>)>) {
+    let home = zcode_home();
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return (None, Default::default());
+    };
+    let name = con
+        .query_row(
+            "SELECT name FROM dwf_run WHERE id = ?1",
+            [run_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    let mut map = std::collections::HashMap::new();
+    if let Ok(mut stmt) = con.prepare(
+        "SELECT site_id, resolved_model, persona_json FROM dwf_actor WHERE run_id = ?1",
+    ) {
+        let rows = stmt
+            .query_map([run_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (site, model, persona_json) in rows {
+            let persona = persona_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<Value>(j).ok());
+            let summary = persona.as_ref().and_then(|p| {
+                p.get("system")
+                    .and_then(Value::as_str)
+                    .or_else(|| p.get("name").and_then(Value::as_str))
+                    .map(|t| t.chars().take(80).collect::<String>())
+            });
+            map.insert(
+                site,
+                (
+                    model.map(|m| {
+                        // strip the provider prefix: account:.../GLM-5.3 -> GLM-5.3
+                        m.rsplit('/').next().unwrap_or(&m).to_string()
+                    }),
+                    summary,
+                ),
+            );
+        }
+    }
+    (name, map)
+}
+
 /// Translate the kernel's v4 workflow runs into the pager's
 /// workflow_updated notifications (one per run on every change; the pager
 /// upserts by run_id).
@@ -4842,6 +4899,7 @@ fn emit_workflow_updates(
         if run_id.is_empty() {
             continue;
         }
+        let (run_name, actor_facts) = dwf_run_facts(run_id);
         let kernel_status = run.get("status").and_then(Value::as_str).unwrap_or("running");
         let status = match kernel_status {
             "pending" | "running" => "active",
@@ -4860,20 +4918,42 @@ fn emit_workflow_updates(
         // Actors -> the pager's agents list; nodes -> phase progress.
         let actors = run.get("actors").and_then(Value::as_array);
         let nodes = run.get("nodes").and_then(Value::as_array);
+        let mut subagent_events: Vec<(String, String, Option<String>, Option<String>, String)> =
+            Vec::new(); // (child_sid, name, model, persona, state)
         let agents: Vec<Value> = actors
             .map(|list| {
                 list.iter()
                     .map(|a| {
+                        let site = a.get("siteId").and_then(Value::as_str).unwrap_or("?");
+                        let label = a
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                format!("actor-{}", a.get("ordinal").and_then(Value::as_u64).unwrap_or(0))
+                            });
+                        let state =
+                            a.get("status").and_then(Value::as_str).unwrap_or("waiting").to_string();
+                        let (model, description) = actor_facts
+                            .get(site)
+                            .cloned()
+                            .unwrap_or((None, None));
+                        if let Some(child) = a.get("sessionId").and_then(Value::as_str) {
+                            subagent_events.push((
+                                child.to_string(),
+                                label.clone(),
+                                model.clone(),
+                                description.clone(),
+                                state.clone(),
+                            ));
+                        }
                         json!({
-                            "agent_id": a.get("siteId").and_then(Value::as_str).unwrap_or("?"),
-                            "label": a.get("name").and_then(Value::as_str)
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!(
-                                    "actor-{}",
-                                    a.get("ordinal").and_then(Value::as_u64).unwrap_or(0)
-                                )),
+                            "agent_id": site,
+                            "label": label,
                             "phase": a.get("phaseName"),
-                            "state": a.get("status").and_then(Value::as_str).unwrap_or("waiting"),
+                            "state": state,
+                            "model": model,
+                            "description": description,
                         })
                     })
                     .collect()
@@ -4931,10 +5011,11 @@ fn emit_workflow_updates(
         let executing = phase_map.values().map(|(a, _, _)| *a).sum::<u64>();
         let settled = phase_map.values().map(|(_, s, _)| *s).sum::<u64>();
         let failed = phase_map.values().map(|(_, _, f)| *f).sum::<u64>();
+        let display_name = run_name.clone().unwrap_or_else(|| "Workflow".to_string());
         let update = json!({
             "sessionUpdate": "workflow_updated",
             "run_id": run_id,
-            "name": "Workflow",
+            "name": display_name,
             "objective": run.get("resultPreview").and_then(Value::as_str).unwrap_or(""),
             "status": status,
             "revision": 0,
@@ -4955,6 +5036,38 @@ fn emit_workflow_updates(
                 "x.ai/session_notification",
                 raw.into(),
             ));
+        }
+        // Surface actors on the pager's subagent rail (roster + dashboard +
+        // live map linkage via workflow_run_id). Spawn on first sight of the
+        // child session; finish when the actor settles.
+        for (child, label, model, persona, state) in subagent_events {
+            let event = if state == "completed" {
+                json!({
+                    "sessionUpdate": "subagent_finished",
+                    "subagent_id": child,
+                    "status": "completed",
+                    "description": label,
+                })
+            } else {
+                json!({
+                    "sessionUpdate": "subagent_spawned",
+                    "subagent_id": child,
+                    "child_session_id": child,
+                    "parent_session_id": session_id,
+                    "subagent_type": "workflow-actor",
+                    "description": label,
+                    "persona": persona,
+                    "model": model,
+                    "workflow_run_id": run_id,
+                })
+            };
+            let payload = json!({"sessionId": session_id, "update": event});
+            if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+                gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                    "x.ai/session_notification",
+                    raw.into(),
+                ));
+            }
         }
     }
 }

@@ -277,6 +277,7 @@ impl AgentView {
             hit_catalog_close: Default::default(),
             hit_bg_status: Default::default(),
             hit_goal_status: Default::default(),
+            hit_workflow_status: Default::default(),
             hit_goal_close: Default::default(),
             hit_bg_button: Default::default(),
             last_bg_click: None,

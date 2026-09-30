@@ -2080,6 +2080,7 @@ fn workflow_run(
             label: "one".into(),
             phase: Some("Verify".into()),
             model: None,
+            description: None,
             state: "running".into(),
             tokens_used: 0,
             duration_ms: 0,

@@ -15,6 +15,9 @@ pub struct WorkflowAgentRowView {
     pub phase: Option<String>,
     pub model: Option<String>,
     pub state: String,
+    /// Work-content summary shown in the live-activity slot when the agent
+    /// has no live subagent feed (workflow actors without a live map entry).
+    pub description: Option<String>,
     pub tokens_used: u64,
     pub duration_ms: u64,
 }
@@ -1079,7 +1082,10 @@ fn render_detail(
             );
             trail_x += unicode_width::UnicodeWidthStr::width(model_txt.as_str()) as u16 + 2;
         }
-        if let Some(activity) = live_status.and_then(|l| l.activity.as_deref()) {
+        let activity_text = live_status
+            .and_then(|l| l.activity.clone())
+            .or_else(|| agent.description.clone());
+        if let Some(activity) = activity_text.as_deref() {
             let activity_txt = truncate_to_width(
                 &format!("· {}", strip_control(activity)),
                 meta_x.saturating_sub(trail_x + 1) as usize,
@@ -1132,7 +1138,8 @@ mod tests {
                     label: "planner".into(),
                     phase: Some("Plan".into()),
                     model: None,
-                    state: "done".into(),
+                    description: None,
+            state: "done".into(),
                     tokens_used: 12_300,
                     duration_ms: 0,
                 },
@@ -1141,7 +1148,8 @@ mod tests {
                     label: "researcher-1".into(),
                     phase: Some("Research".into()),
                     model: Some("grok-4.5".into()),
-                    state: "running".into(),
+                    description: None,
+            state: "running".into(),
                     tokens_used: 0,
                     duration_ms: 0,
                 },
@@ -1406,6 +1414,7 @@ mod tests {
             label: "dynamic-agent".to_owned(),
             phase: Some("Discovered".to_owned()),
             model: None,
+            description: None,
             state: "running".to_owned(),
             tokens_used: 0,
             duration_ms: 0,
@@ -1592,7 +1601,8 @@ mod tests {
                 label: format!("agent-{i:02}"),
                 phase: None,
                 model: None,
-                state: "done".into(),
+                description: None,
+            state: "done".into(),
                 tokens_used: 0,
                 duration_ms: 0,
             })
@@ -1645,6 +1655,7 @@ mod tests {
             label: "agent-30".to_owned(),
             phase: None,
             model: None,
+            description: None,
             state: "running".to_owned(),
             tokens_used: 0,
             duration_ms: 0,
@@ -1716,7 +1727,8 @@ mod tests {
                 label: "audit-batch-0".into(),
                 phase: Some("Audit".into()),
                 model: None,
-                state: "done".into(),
+                description: None,
+            state: "done".into(),
                 tokens_used: 1_000,
                 duration_ms: 0,
             },
@@ -1725,7 +1737,8 @@ mod tests {
                 label: "synthesizer".into(),
                 phase: Some("Synthesize".into()),
                 model: None,
-                state: "running".into(),
+                description: None,
+            state: "running".into(),
                 tokens_used: 0,
                 duration_ms: 0,
             },
@@ -1767,6 +1780,7 @@ mod tests {
             label: "synthesizer".into(),
             phase: Some("Synthesize".into()),
             model: None,
+            description: None,
             state: "running".into(),
             tokens_used: 0,
             duration_ms: 0,
