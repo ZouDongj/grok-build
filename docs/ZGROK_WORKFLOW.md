@@ -256,6 +256,17 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
 - 凭据只在进程内解密使用，不落日志不回显；界面只出数字。
 - 旧的 x.ai/billing/check_subscription 桩仍在（pager 兼容），真实数据走 /quota。
 
+## 额度芯片 + workflow 产物（最新）
+
+- **额度常驻芯片**：状态区上下文仪表旁 `⚡22%·39%`（5h/7d 用量；≥90% 警示色；
+  `⟳5+6` 附可用重置数）。会话启动时 best-effort 拉取推送（x.ai/quota/update），
+  /quota 刷新。点击芯片预填 /quota。数据源见上一节（解密凭据 + 官方端点）。
+- **/workflow artifacts [n]**：产物清单（v4/conversation/workflowRunArtifacts，
+  主交付物 ★）+ 内容预览（file 型读 sourcePath；store 型走
+  v4/conversation/workflowRunArtifactRead 首 8KB base64→UTF-8，文本类内联预览
+  1200 字符）。store URI（zcode-artifact://）按协议只给 CLI，读 RPC 才是客户端通道。
+- e2e：workflow 交付 markdown 产物，清单+预览（实际内容渲染）全链路通。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
