@@ -192,7 +192,12 @@ fn workflow(status: &str) -> WorkflowRunSnapshot {
         agent_usage_incomplete: false,
         active_agents: 0,
         elapsed_ms: 0,
-        received_at: Instant::now(),
+        steps_settled: None,
+            steps_observed: None,
+            run_tokens: None,
+            artifacts_count: None,
+            subagent_model: None,
+            received_at: Instant::now(),
         pause_message: None,
         result_summary: None,
     }

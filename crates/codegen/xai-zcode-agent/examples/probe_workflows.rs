@@ -114,6 +114,18 @@ async fn main() -> anyhow::Result<()> {
                                         if let Some(d) = desc {
                                             meta.borrow_mut().push(format!("desc={}", d.chars().take(40).collect::<String>()));
                                         }
+                                        let steps = upd["steps_settled"].as_u64()
+                                            .zip(upd["steps_observed"].as_u64())
+                                            .map(|(a, b)| format!("{a}/{b}"));
+                                        if let Some(st) = steps {
+                                            meta.borrow_mut().push(format!("steps={st}"));
+                                        }
+                                        if let Some(t) = upd["run_tokens"].as_u64() {
+                                            meta.borrow_mut().push(format!("tokens={t}"));
+                                        }
+                                        if let Some(m) = upd["subagent_model"].as_str() {
+                                            meta.borrow_mut().push(format!("submodel={m}"));
+                                        }
                                         snaps.borrow_mut().push(WfSnap {
                                         t_ms: t0.elapsed().as_millis(),
                                         status: upd["status"].as_str().unwrap_or("").into(),
@@ -231,6 +243,11 @@ async fn main() -> anyhow::Result<()> {
         verdict(
             "actor-subagent-events",
             !subagent_events.borrow().is_empty(),
+        );
+        verdict(
+            "summary-fields-flow",
+            meta.borrow().iter().any(|m| m.starts_with("steps="))
+                && meta.borrow().iter().any(|m| m.starts_with("submodel=")),
         );
         verdict(
             "workflow-approval-asked",

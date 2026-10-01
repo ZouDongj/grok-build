@@ -983,6 +983,21 @@ pub enum SessionUpdate {
         elapsed_ms: u64,
         #[serde(default)]
         active_agents: u32,
+        /// Official step accounting (settled / observed nodes); detail-page
+        /// summary row, NOT the card header.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steps_settled: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        steps_observed: Option<u64>,
+        /// Whole-run token spend from the ledger.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_tokens: Option<u64>,
+        /// Count of user-facing artifacts (detail summary row).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifacts_count: Option<u64>,
+        /// Resolved subagent model label for the header tail segment.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         current_agent_label: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

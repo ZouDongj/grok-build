@@ -98,6 +98,11 @@ pub(super) fn ingest_workflow_update(agent: &mut AgentView, update: XaiSessionUp
         agent_usage_incomplete,
         elapsed_ms,
         active_agents: _,
+        steps_settled,
+        steps_observed,
+        run_tokens,
+        artifacts_count,
+        subagent_model,
         current_agent_label: _,
         agents,
         last_event: _,
@@ -172,6 +177,11 @@ pub(super) fn ingest_workflow_update(agent: &mut AgentView, update: XaiSessionUp
             received_at: std::time::Instant::now(),
             pause_message: pause_message.clone(),
             result_summary: result_summary.clone(),
+            steps_settled,
+            steps_observed,
+            run_tokens,
+            artifacts_count,
+            subagent_model: subagent_model.clone(),
         };
         match agent
             .workflow_runs

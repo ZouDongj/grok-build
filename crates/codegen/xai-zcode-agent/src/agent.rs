@@ -4862,22 +4862,24 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
 
 /// dwf run display facts from the ledger: run name + per-actor
 /// (resolved_model, persona summary) keyed by actor siteId.
-fn dwf_run_facts(run_id: &str) -> (Option<String>, std::collections::HashMap<String, (Option<String>, Option<String>)>) {
+fn dwf_run_facts(
+    run_id: &str,
+) -> (Option<String>, Option<u64>, std::collections::HashMap<String, (Option<String>, Option<String>)>) {
     let home = zcode_home();
     let Ok(con) = rusqlite::Connection::open_with_flags(
         std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) else {
-        return (None, Default::default());
+        return (None, None, Default::default());
     };
-    let name = con
+    let (name, spent) = con
         .query_row(
-            "SELECT name FROM dwf_run WHERE id = ?1",
+            "SELECT name, spent_tokens FROM dwf_run WHERE id = ?1",
             [run_id],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?)),
         )
-        .ok()
-        .flatten();
+        .map(|(n, t)| (n, t.map(|v| v.max(0) as u64)))
+        .unwrap_or((None, None));
     let mut map = std::collections::HashMap::new();
     if let Ok(mut stmt) = con.prepare(
         "SELECT site_id, resolved_model, persona_json FROM dwf_actor WHERE run_id = ?1",
@@ -4914,7 +4916,7 @@ fn dwf_run_facts(run_id: &str) -> (Option<String>, std::collections::HashMap<Str
             );
         }
     }
-    (name, map)
+    (name, spent, map)
 }
 
 /// Translate the kernel's v4 workflow runs into the pager's
@@ -4930,7 +4932,7 @@ fn emit_workflow_updates(
         if run_id.is_empty() {
             continue;
         }
-        let (run_name, actor_facts) = dwf_run_facts(run_id);
+        let (run_name, run_tokens, actor_facts) = dwf_run_facts(run_id);
         let kernel_status = run.get("status").and_then(Value::as_str).unwrap_or("running");
         let status = match kernel_status {
             "pending" | "running" => "active",
@@ -5042,6 +5044,21 @@ fn emit_workflow_updates(
         let executing = phase_map.values().map(|(a, _, _)| *a).sum::<u64>();
         let settled = phase_map.values().map(|(_, s, _)| *s).sum::<u64>();
         let failed = phase_map.values().map(|(_, _, f)| *f).sum::<u64>();
+        // Official step accounting: settled nodes / observed nodes; artifacts
+        // are the run's user-facing outputs (count only on the wire).
+        let steps_settled = settled;
+        let steps_observed = settled + executing;
+        let artifacts_count = run
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .map(|a| a.len() as u64)
+            .unwrap_or(0);
+        let subagent_model = actors
+            .and_then(|list| list.first())
+            .and_then(|a| a.get("siteId"))
+            .and_then(Value::as_str)
+            .and_then(|site| actor_facts.get(site))
+            .and_then(|(m, _)| m.clone());
         let display_name = run_name.clone().unwrap_or_else(|| "Workflow".to_string());
         let update = json!({
             "sessionUpdate": "workflow_updated",
@@ -5057,6 +5074,11 @@ fn emit_workflow_updates(
             "agents_reserved": 0,
             "elapsed_ms": 0,
             "active_agents": active_agents,
+            "steps_settled": steps_settled,
+            "steps_observed": steps_observed,
+            "run_tokens": run_tokens,
+            "artifacts_count": artifacts_count,
+            "subagent_model": subagent_model,
             "last_event": format!("nodes: {executing} running / {settled} settled / {failed} failed"),
             "result_summary": run.get("resultPreview"),
             "pause_message": run.get("error"),

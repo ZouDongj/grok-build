@@ -53,6 +53,14 @@ pub struct WorkflowRunSnapshot {
     pub received_at: std::time::Instant,
     pub pause_message: Option<String>,
     pub result_summary: Option<String>,
+    /// Official detail-summary fields (detail header/footer, not the card
+    /// header): settled/observed steps, whole-run tokens, artifact count,
+    /// and the resolved subagent model label.
+    pub steps_settled: Option<u64>,
+    pub steps_observed: Option<u64>,
+    pub run_tokens: Option<u64>,
+    pub artifacts_count: Option<u64>,
+    pub subagent_model: Option<String>,
 }
 
 impl WorkflowRunSnapshot {
@@ -119,6 +127,52 @@ impl WorkflowRunSnapshot {
             }
         } else {
             self.status.replace('_', " ")
+        }
+    }
+
+    /// Official card-header detail: phase count · agents (working count
+    /// while running, total after) · subagent model as a dim tail segment.
+    pub fn header_detail(&self) -> String {
+        let phases = phase_rail(self).len();
+        let agents_part = if self.is_active() {
+            match self.active_agent_count() {
+                0 => "0 agents working".to_owned(),
+                1 => "1 agent working".to_owned(),
+                n => format!("{n} agents working"),
+            }
+        } else {
+            match self.agents.len() {
+                1 => "1 agent".to_owned(),
+                n => format!("{n} agents"),
+            }
+        };
+        let mut parts = vec![format!("{phases} {}", plural(phases, "phase")), agents_part];
+        if let Some(model) = self.subagent_model.as_deref() {
+            parts.push(model.to_owned());
+        }
+        parts.join(" · ")
+    }
+
+    /// Official detail summary row: `4/7 steps · 42.1K tokens · 2 artifacts`.
+    pub fn summary_row(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(settled) = self.steps_settled {
+            let observed = self.steps_observed.unwrap_or(settled);
+            parts.push(format!("{settled}/{observed} steps"));
+        }
+        if let Some(tokens) = self.run_tokens.filter(|t| *t > 0) {
+            parts.push(format!(
+                "{} tokens",
+                crate::views::agent_status::format_tokens_compact(tokens as i64)
+            ));
+        }
+        if let Some(artifacts) = self.artifacts_count.filter(|a| *a > 0) {
+            parts.push(format!("{artifacts} {}", plural(artifacts as usize, "artifact")));
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
         }
     }
 
@@ -625,24 +679,8 @@ fn render_list(
             break;
         }
         let (glyph, glyph_style) = status_glyph_and_style(&run.status, theme);
-        let done_phases = run.phases.iter().filter(|(_, s)| s == "done").count();
-        let phase_part = if run.phases.is_empty() {
-            run.status.clone()
-        } else {
-            format!(
-                "{}/{} phase{}",
-                done_phases,
-                run.phases.len(),
-                if run.phases.len() == 1 { "" } else { "s" }
-            )
-        };
-        let meta = format!(
-            "{phase_part} · {}/{} agent{} · {}",
-            run.done_agents(),
-            run.agents.len(),
-            if run.agents.len() == 1 { "" } else { "s" },
-            format_elapsed(run.live_elapsed_ms()),
-        );
+        // Official digest language: phases · agents (working/total) · model.
+        let meta = run.header_detail();
         let label = format!(
             "{} · {}",
             strip_control(&run.name),
@@ -705,13 +743,9 @@ fn render_detail(
     } else {
         format!("{glyph} ")
     };
-    let meta = format!(
-        "{}/{} agent{} · {}",
-        run.done_agents(),
-        run.agents.len(),
-        if run.agents.len() == 1 { "" } else { "s" },
-        format_elapsed(run.live_elapsed_ms()),
-    );
+    // Official card-header detail (phases · agents · model); elapsed moves
+    // to the summary row with steps/tokens/artifacts.
+    let meta = run.header_detail();
     let meta_w = unicode_width::UnicodeWidthStr::width(meta.as_str()) as u16;
     let meta_x = inner.right().saturating_sub(meta_w + 1);
 
@@ -754,7 +788,26 @@ fn render_detail(
         inner.right(),
     );
 
-    let mut body_y = inner.y + 2;
+    // Official detail summary row: `4/7 steps · 42.1K tokens · 2 artifacts · 1m32s`
+    let mut summary_y = inner.y + 2;
+    {
+        let elapsed = format_elapsed(run.live_elapsed_ms());
+        let summary = match run.summary_row() {
+            Some(row) => format!("{row} · {elapsed}"),
+            None => elapsed,
+        };
+        span_at(
+            buf,
+            inner.x + 1,
+            summary_y,
+            &truncate_to_width(&summary, inner.width.saturating_sub(2) as usize),
+            Style::default().fg(theme.gray),
+            inner.right(),
+        );
+        summary_y += 1;
+    }
+
+    let mut body_y = summary_y;
     let status_line = if run.status == "budget_limited" {
         let body = if run.agents_used >= 1_024 {
             "budget limited: maximum agent budget reached; start a new run".to_string()
@@ -916,15 +969,22 @@ fn render_detail(
         let count_w = unicode_width::UnicodeWidthStr::width(count.as_str()) as u16;
         let count_x = rail_inner.right().saturating_sub(count_w);
 
+        // Official station-lamp language: numbered indexes are gone; the
+        // lamp IS the state (done ● green / active spinner frame / pending ○).
+        let lamp = match effective_state {
+            "done" => "●".to_string(),
+            "active" => {
+                let frames = crate::glyphs::dot_spinner_frames();
+                frames
+                    .get((tick / 4) % frames.len())
+                    .copied()
+                    .unwrap_or("●")
+                    .to_string()
+            }
+            _ => "○".to_string(),
+        };
         span_at(buf, rail_inner.x, y, marker, num_style, rail_inner.right());
-        span_at(
-            buf,
-            rail_inner.x + 2,
-            y,
-            &format!("{} ", idx + 1),
-            num_style,
-            rail_inner.right(),
-        );
+        span_at(buf, rail_inner.x + 2, y, &lamp, num_style, rail_inner.right());
         span_at(
             buf,
             rail_inner.x + 4,
@@ -1161,6 +1221,11 @@ mod tests {
             agent_usage_incomplete: false,
             active_agents: 1,
             elapsed_ms: 95_000,
+            steps_settled: None,
+            steps_observed: None,
+            run_tokens: None,
+            artifacts_count: None,
+            subagent_model: None,
             received_at: std::time::Instant::now(),
             pause_message: None,
             result_summary: None,
@@ -1218,7 +1283,8 @@ mod tests {
         assert!(text.contains("Research"), "{text}");
         assert!(text.contains("researcher-1"), "{text}");
         assert!(text.contains("grok-4.5"), "{text}");
-        assert!(text.contains("1/2 agents"), "{text}");
+        assert!(text.contains("agent working"), "{text}");
+        assert!(text.contains("phase"), "{text}");
         assert!(text.contains("s save"), "{text}");
     }
 
@@ -1352,7 +1418,7 @@ mod tests {
         let text = buf_text(&buf, area);
         assert!(text.contains("deep-research"), "{text}");
         assert!(text.contains("count-v2"), "{text}");
-        assert!(text.contains("1/2 agents"), "{text}");
+        assert!(text.contains("agent working"), "{text}");
         assert!(!text.contains("128"), "budget cap is not shown: {text}");
         assert!(!text.contains(" · out "), "{text}");
         assert!(text.contains("enter open"), "{text}");
@@ -1708,7 +1774,7 @@ mod tests {
         let mut state = WorkflowsViewState::default();
         state.normalize(&runs);
         let text = render_to_text(&runs, &state);
-        assert!(text.contains("1/2 agents"), "{text}");
+        assert!(text.contains("agent working"), "{text}");
         assert!(!text.contains("128"), "budget cap is not shown: {text}");
         assert!(!text.contains("left"), "{text}");
     }

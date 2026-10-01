@@ -364,20 +364,13 @@ pub fn workflow_status_line(
         chip_name.to_string()
     };
     let name = crate::util::truncate_to_width(&run.name, 24).into_owned();
-    let settled = run.phases.iter().filter(|(_, st)| st != "running").count();
-    let phases_part = if run.phases.len() > 1 {
-        format!(" · {settled}/{} phases", run.phases.len())
-    } else {
-        String::new()
-    };
+    // Official card-header language: phases count · agents (working count
+    // while running) · subagent model as a dim tail. No step numbers here.
     Line::from(vec![
         Span::styled("[", dim_style),
         Span::styled(chip, chip_style),
         Span::styled("]", dim_style),
-        Span::styled(
-            format!("  {name} · {}{phases_part}", run.activity_label()),
-            dim_style,
-        ),
+        Span::styled(format!("  {name} · {}", run.header_detail()), dim_style),
     ])
 }
 
