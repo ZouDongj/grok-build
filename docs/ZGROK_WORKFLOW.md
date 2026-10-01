@@ -243,6 +243,19 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   e2e 实证标题 "Tool CreateWorkflow always requires explicit approval"，9/9 过）。
   重写提示词勿写"不要询问确认"——门是内核级的，措辞误导模型反而多余。
 
+## /quota 套餐额度（最新）
+
+- **数据源**（复刻官方桌面账户页）：`GET bigmodel.cn/api/monitor/usage/quota/limit`
+  （`authorization` = **解密后**的 coding-plan api key——v2 凭据库的值是
+  `enc:v1:` AES-GCM 密文，直接读原值必 401）；`GET
+  zcode.z.ai/api/v1/coding-plan/reset/status`（头：原始 zcode JWT +
+  `X-Bigmodel-Authorization` api key + `Bigmodel-Target-Type: PERSONAL`，
+  都不加 Bearer 前缀）。
+- **用法**：`/quota`（窗口用量/百分比/下次重置（北京时间到分钟）+ 可用重置次数）；
+  `/quota reset five_hour|week` 消耗一次重置（POST reset/use 带幂等键）。
+- 凭据只在进程内解密使用，不落日志不回显；界面只出数字。
+- 旧的 x.ai/billing/check_subscription 桩仍在（pager 兼容），真实数据走 /quota。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
