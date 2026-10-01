@@ -1476,11 +1476,15 @@ fn push_available_commands(gateway: &AcpGatewaySender<acp::AgentSide>, session: 
         "workflow",
         "Launch a workflow from a natural-language goal",
     );
+    let quota = acp::AvailableCommand::new(
+        "quota",
+        "Coding-plan quota windows and reset counts; reset <kind> uses one",
+    );
     notify(
         gateway,
         session,
         acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![
-            cmd, rate, drain, filerewind, retry, workflow,
+            cmd, rate, drain, filerewind, retry, workflow, quota,
         ])),
     );
 }
@@ -1736,6 +1740,173 @@ fn home_dir_string() -> String {
     zcode_home()
 }
 
+/// Fetch the coding-plan quota snapshot (windows + resets) from the same
+/// endpoints the official desktop's account page uses. Credentials are
+/// resolved/decrypted in-process and never logged or echoed — only quota
+/// numbers leave this function.
+fn fetch_quota_snapshot() -> Result<Value, String> {
+    let provider = DEFAULT_PROVIDER;
+    let apikey = coding_plan_api_key(provider).ok_or("no coding-plan credential")?;
+    let jwt = {
+        let home = zcode_home();
+        let raw = std::fs::read_to_string(
+            std::path::PathBuf::from(home).join(".zcode/v2/credentials.json"),
+        )
+        .map_err(|e| format!("read credentials: {e}"))?;
+        let store: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        store
+            .get("zcodejwttoken")
+            .and_then(Value::as_str)
+            .map(decrypt_credential)
+            .unwrap_or_default()
+    };
+    // 1) windows: bigmodel.cn monitor quota (authorization = raw api key)
+    let quota: Value = ureq::get("https://bigmodel.cn/api/monitor/usage/quota/limit")
+        .set("authorization", &apikey)
+        .timeout(std::time::Duration::from_secs(15))
+        .call()
+        .map_err(|e| format!("quota request: {e}"))?
+        .into_json()
+        .map_err(|e| format!("quota parse: {e}"))?;
+    let limits = quota
+        .pointer("/data/limits")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    // 2) resets: zcode.z.ai reset status (raw JWT + api key + personal scope)
+    let reset: Value = if jwt.is_empty() {
+        json!({"skipped": "no zcode jwt"})
+    } else {
+        ureq::get("https://zcode.z.ai/api/v1/coding-plan/reset/status")
+            .set("Authorization", &jwt)
+            .set("X-Bigmodel-Authorization", &apikey)
+            .set("Bigmodel-Target-Type", "PERSONAL")
+            .timeout(std::time::Duration::from_secs(15))
+            .call()
+            .map(|r| r.into_json().unwrap_or(json!({})))
+            .unwrap_or(json!({"error": "reset status unavailable"}))
+    };
+    Ok(json!({
+        "level": quota.pointer("/data/level"),
+        "limits": limits,
+        "resets": reset.get("data").cloned().unwrap_or(json!(null)),
+    }))
+}
+
+/// Consume one quota reset (the desktop account page's "use reset" button).
+fn use_quota_reset(reset_type: &str) -> Result<Value, String> {
+    let provider = DEFAULT_PROVIDER;
+    let apikey = coding_plan_api_key(provider).ok_or("no coding-plan credential")?;
+    let jwt = {
+        let home = zcode_home();
+        let raw = std::fs::read_to_string(
+            std::path::PathBuf::from(home).join(".zcode/v2/credentials.json"),
+        )
+        .map_err(|e| format!("read credentials: {e}"))?;
+        let store: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        store
+            .get("zcodejwttoken")
+            .and_then(Value::as_str)
+            .map(decrypt_credential)
+            .unwrap_or_default()
+    };
+    if jwt.is_empty() {
+        return Err("no zcode jwt for reset".into());
+    }
+    static RESET_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let seq = RESET_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let idem = format!("zgrok-reset-{now_ms}-{seq}");
+    let resp: Value = ureq::post("https://zcode.z.ai/api/v1/coding-plan/reset/use")
+        .set("Authorization", &jwt)
+        .set("X-Bigmodel-Authorization", &apikey)
+        .set("Bigmodel-Target-Type", "PERSONAL")
+        .timeout(std::time::Duration::from_secs(20))
+        .send_json(json!({
+            "idempotency_key": idem,
+            "reset_type": reset_type,
+        }))
+        .map_err(|e| format!("reset request: {e}"))?
+        .into_json()
+        .map_err(|e| format!("reset parse: {e}"))?;
+    Ok(resp)
+}
+
+/// Render the quota snapshot as the /quota reply text (numbers only).
+fn quota_reply_text(snapshot: &Value) -> String {
+    let mut lines = Vec::new();
+    let level = snapshot
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("coding plan");
+    lines.push(format!("套餐额度（GLM Coding Plan · {level}）"));
+    for limit in snapshot
+        .get("limits")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        let (label, span) = match (
+            limit.get("number").and_then(Value::as_u64),
+            limit.get("unit").and_then(Value::as_u64),
+        ) {
+            (Some(5), Some(3)) => ("5 小时窗口", "5h"),
+            (Some(1), Some(6)) => ("7 天窗口", "7d"),
+            _ => ("额度窗口", "?"),
+        };
+        let used = limit.get("currentValue").and_then(Value::as_u64).unwrap_or(0);
+        let total = limit.get("usage").and_then(Value::as_u64).unwrap_or(0);
+        let pct = limit.get("percentage").and_then(Value::as_u64).unwrap_or(0);
+        let next = limit
+            .get("nextResetTime")
+            .and_then(Value::as_u64)
+            .map(|ms| {
+                let local = ms as i64 + 8 * 3600 * 1000; // UTC+8 (CST)
+                let secs = local.div_euclid(1000);
+                let tod = secs.rem_euclid(86_400);
+                let days = secs.div_euclid(86_400);
+                // reuse civil_from_days via ms_to_rfc3339's date half: cheap recompute
+                let date = {
+                    let z = days + 719_468;
+                    let era = z.div_euclid(146_097);
+                    let doe = z.rem_euclid(146_097);
+                    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+                    let year = yoe + era * 400;
+                    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+                    let mp = (5 * doy + 2) / 153;
+                    let day = doy - (153 * mp + 2) / 5 + 1;
+                    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+                    let y = if month <= 2 { year + 1 } else { year };
+                    format!("{y:04}-{month:02}-{day:02}")
+                };
+                format!("{date} {:02}:{:02}", tod / 3600, (tod % 3600) / 60)
+            })
+            .unwrap_or_else(|| "?".into());
+        let _ = span;
+        lines.push(format!(
+            "  {label}：已用 {used} / {total}（{pct}%），重置于 {next}"
+        ));
+    }
+    if let Some(resets) = snapshot.get("resets") {
+        let five = resets
+            .get("available_five_hour_resets")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let week = resets
+            .get("available_week_resets")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0);
+        lines.push(format!(
+            "  可用重置：5 小时 ×{five}，7 天 ×{week}（使用：/quota reset five_hour 或 /quota reset week）"
+        ));
+    }
+    lines.join("\n")
+}
+
 /// setModel with a short retry: 0.16.9 materializes account entitlements
 /// asynchronously after kernel start, and a first-touch setModel for an
 /// account provider can race that ("Provider Registry 中不存在 Model").
@@ -1978,6 +2149,11 @@ impl acp::Agent for ZcodeAgent {
                             "name": "workflow",
                             "description": "Launch a workflow from a natural-language goal",
                             "input": { "hint": "<goal> | runs" },
+                        }),
+                        json!({
+                            "name": "quota",
+                            "description": "Coding-plan quota windows and reset counts; reset <kind> uses one",
+                            "input": { "hint": "(bare = status) | reset five_hour | reset week" },
                         }),
                     ]),
                 );
@@ -2404,6 +2580,38 @@ impl acp::Agent for ZcodeAgent {
                     }
                 }
                 None => "没有可评价的回复。".to_string(),
+            };
+            notify(
+                &self.gateway,
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+            );
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+        // /quota — coding-plan quota windows + reset counts (the desktop
+        // account page's data, read live from the same endpoints); the
+        // `reset <kind>` form consumes one reset.
+        if text.trim_start().starts_with("/quota") && attachments.is_empty() {
+            let rest = text.trim_start()[6..].trim().to_string();
+            let reply = if let Some(kind) = rest.strip_prefix("reset ").map(str::trim) {
+                match kind {
+                    "five_hour" | "5h" | "week" | "7d" => {
+                        let normalized = if kind == "5h" { "five_hour" } else if kind == "7d" { "week" } else { kind };
+                        match use_quota_reset(normalized) {
+                            Ok(v) => format!(
+                                "重置已提交（{normalized}）。响应：{}",
+                                v.get("msg").and_then(Value::as_str).unwrap_or("ok")
+                            ),
+                            Err(e) => format!("重置失败: {e}"),
+                        }
+                    }
+                    _ => "用法：/quota reset five_hour | /quota reset week".to_string(),
+                }
+            } else {
+                match fetch_quota_snapshot() {
+                    Ok(v) => quota_reply_text(&v),
+                    Err(e) => format!("额度查询失败: {e}"),
+                }
             };
             notify(
                 &self.gateway,

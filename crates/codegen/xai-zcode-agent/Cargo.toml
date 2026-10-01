@@ -6,6 +6,7 @@ publish = false
 description = "acp::Agent backed by the ZCode kernel (app-server protocol): full grok-build TUI on the ZCode brain"
 
 [dependencies]
+ureq = { version = "2", features = ["json"] }
 agent-client-protocol = { workspace = true }
 async-trait = { workspace = true }
 anyhow = { workspace = true }
