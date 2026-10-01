@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
             acp::PromptRequest::new(
                 sid.clone(),
                 vec![acp::ContentBlock::Text(acp::TextContent::new(
-                    "/workflow 单个 actor 问一句 1+1 等于几，只回答数字，把答案作为产出".to_string(),
+                    "/workflow 单个 actor 回答 1+1 等于几（只回答数字），并用 artifact() 把答案写成一个 markdown 产物交付".to_string(),
                 ))],
             ),
             &client.tx,
@@ -210,6 +210,42 @@ async fn main() -> anyhow::Result<()> {
         println!("subagent events: {:?}", subagent_events.borrow());
         println!("meta: {:?}", meta.borrow());
         println!("permission titles: {:?}", perm_titles.borrow());
+
+        // /workflow artifacts: list + preview (second command turn)
+        let replies_len = || agent_text.borrow().len();
+        let agent_text_after = |from: usize| agent_text.borrow()[from..].to_string();
+        {
+            let from = replies_len();
+            let _ = acp_send(
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "/workflow artifacts".to_string(),
+                    ))],
+                ),
+                &client.tx,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+            let artifacts_reply = agent_text_after(from);
+            println!("[probe] artifacts reply:\n{}", artifacts_reply.chars().take(400).collect::<String>());
+        }
+        {
+            let from = replies_len();
+            let _ = acp_send(
+                acp::PromptRequest::new(
+                    sid.clone(),
+                    vec![acp::ContentBlock::Text(acp::TextContent::new(
+                        "/workflow artifacts 1".to_string(),
+                    ))],
+                ),
+                &client.tx,
+            )
+            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+            let preview_reply = agent_text_after(from);
+            println!("[probe] artifact preview:\n{}", preview_reply.chars().take(300).collect::<String>());
+        }
 
         let verdict = |name: &str, ok: bool| println!("CHECK {name}: {}", if ok { "PASS" } else { "FAIL" });
         verdict(

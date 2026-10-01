@@ -17,8 +17,10 @@ async fn main() -> anyhow::Result<()> {
         let gw_rx = AcpGatewayReceiver::new(agent_channel.rx, agent.clone()).with_tracing(false);
         tokio::task::spawn_local(gw_rx.run());
         let text: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        let chip: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
         {
             let text = text.clone();
+            let chip = chip.clone();
             let mut rx = client.rx;
             tokio::task::spawn_local(async move {
                 while let Some(m) = rx.recv().await {
@@ -42,6 +44,15 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        AcpClientMessage::ExtNotification(n) => {
+                            if n.method.as_ref() == "x.ai/quota/update" {
+                                let v: serde_json::Value =
+                                    serde_json::from_str(n.params.get()).unwrap_or(serde_json::json!({}));
+                                *chip.borrow_mut() = Some(
+                                    format!("{:?}/{:?}", v.get("fiveHour"), v.get("week")),
+                                );
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -61,6 +72,11 @@ async fn main() -> anyhow::Result<()> {
         v("quota-windows-shown", t.contains("5 小时窗口") && t.contains("7 天窗口"));
         v("quota-percentages", t.contains('%'));
         v("reset-counts-shown", t.contains("可用重置"));
+        println!("chip payload: {:?}", chip.borrow());
+        v(
+            "quota-chip-notified",
+            chip.borrow().is_some(),
+        );
         let _ = acp_send(
             acp::ExtRequest::new(
                 "x.ai/session/delete",

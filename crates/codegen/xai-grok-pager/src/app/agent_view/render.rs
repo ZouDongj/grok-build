@@ -1295,6 +1295,13 @@ impl AgentView {
                 ),
             );
         }
+        if let Some(chip) = self
+            .quota_state
+            .as_ref()
+            .and_then(|q| crate::views::agent_status::quota_chip(q, &theme, self.hit_quota.hovered))
+        {
+            status.push("quota", chip);
+        }
         if let Some(run) = self
             .workflow_runs_newest_first()
             .into_iter()
@@ -1401,6 +1408,7 @@ impl AgentView {
         self.hit_bg_status.rect = areas.get("bg_tasks").copied();
         self.hit_goal_status.rect = areas.get("goal").copied();
         self.hit_workflow_status.rect = areas.get("workflow").copied();
+        self.hit_quota.rect = areas.get("quota").copied();
         self.hit_context.rect = areas.get("context").copied();
         self.hit_credits.rect = areas.get("credits").copied();
         self.hit_plan_button.rect = areas.get("plan").copied();

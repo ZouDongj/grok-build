@@ -57,6 +57,13 @@ impl AgentView {
                     }
                     return InputOutcome::Changed;
                 }
+                if self.hit_quota.contains(mouse.column, mouse.row) {
+                    // Prefill the composer with /quota (full windows + reset
+                    // actions) rather than firing it — quota use is explicit.
+                    self.prompt.set_text("/quota");
+                    self.set_active_pane(AgentPane::Prompt, false);
+                    return InputOutcome::Changed;
+                }
                 if self.hit_workflow_status.contains(mouse.column, mouse.row) {
                     self.show_workflows = !self.show_workflows;
                     if self.show_workflows {
@@ -1102,6 +1109,7 @@ impl AgentView {
                 changed |= self.hit_bg_status.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_goal_status.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_workflow_status.update_hover(mouse.column, mouse.row);
+                changed |= self.hit_quota.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);

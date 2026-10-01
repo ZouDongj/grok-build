@@ -334,6 +334,50 @@ pub fn goal_status_line(
     ])
 }
 
+/// Compact coding-plan quota chip state (5h / 7d window usage percent +
+/// available reset counts) for the status bar.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuotaChipState {
+    pub five_hour_pct: Option<u8>,
+    pub week_pct: Option<u8>,
+    pub reset_five: Option<u32>,
+    pub reset_week: Option<u32>,
+}
+
+/// `⚡22%·39%` — usage percent of the 5h and 7d windows (official shows the
+/// same two numbers on the account page). Warning colour when a window is
+/// nearly exhausted.
+pub fn quota_chip(
+    q: &QuotaChipState,
+    theme: &Theme,
+    hovered: bool,
+) -> Option<Line<'static>> {
+    let five = q.five_hour_pct?;
+    let week = q.week_pct.unwrap_or(0);
+    let dim = Style::default().fg(theme.gray_dim).bg(theme.bg_base);
+    let hot = five >= 90 || week >= 90;
+    let style = if hot {
+        Style::default().fg(theme.warning).bg(theme.bg_base)
+    } else {
+        dim
+    };
+    let style = if hovered {
+        style
+            .add_modifier(ratatui::style::Modifier::BOLD)
+            .add_modifier(ratatui::style::Modifier::UNDERLINED)
+    } else {
+        style
+    };
+    let resets = match (q.reset_five, q.reset_week) {
+        (Some(f), Some(w)) => format!(" ⟳{f}+{w}"),
+        _ => String::new(),
+    };
+    Some(Line::from(Span::styled(
+        format!("⚡{five}%·{week}%{resets}"),
+        style,
+    )))
+}
+
 /// One-line workflow status strip for the status bar (above the composer).
 /// Mirrors the goal strip: chip + activity; click / `g` opens the workflows view.
 pub fn workflow_status_line(

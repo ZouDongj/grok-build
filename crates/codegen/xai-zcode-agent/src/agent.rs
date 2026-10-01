@@ -252,6 +252,149 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         });
     }
 
+    /// `/workflow artifacts [n]` reply: the run's outputs from the v4 list
+    /// RPC (title/kind/bytes/sourcePath), with a bounded text preview for
+    /// text-ish content types.
+    async fn workflow_artifacts_reply(
+        &self,
+        kernel: &Kernel,
+        state: &Rc<SessionState>,
+        arg: &str,
+    ) -> String {
+        let kernel_sid = state.kernel_id.borrow().clone();
+        let runs = state.v4_workflow_runs.borrow().clone();
+        let Some(run) = runs
+            .iter()
+            .rev()
+            .find(|r| {
+                r.get("artifacts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            })
+            .or_else(|| runs.iter().rev().next())
+        else {
+            return "没有 workflow 运行记录。".to_string();
+        };
+        let run_id = run.get("runId").and_then(Value::as_str).unwrap_or_default();
+        let Ok(listed) = kernel
+            .call(
+                "v4/conversation/workflowRunArtifacts",
+                json!({"sessionId": kernel_sid, "runId": run_id}),
+            )
+            .await
+        else {
+            return "产物清单查询失败。".to_string();
+        };
+        let artifacts = listed
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if artifacts.is_empty() {
+            return "该运行没有产物（工作流需用 artifact()/report() 交付）。".to_string();
+        }
+        let index: Option<usize> = arg.parse().ok();
+        let Some(idx) = index else {
+            let name = run
+                .pointer("/resultPreview")
+                .and_then(Value::as_str)
+                .unwrap_or(run_id);
+            let mut lines = vec![format!("产物（{artifacts_len} 项，查看：/workflow artifacts <序号>）：", artifacts_len = artifacts.len())];
+            for (i, a) in artifacts.iter().enumerate() {
+                let title = a
+                    .get("title")
+                    .or_else(|| a.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("?");
+                let kind = a.get("kind").and_then(Value::as_str).unwrap_or("?");
+                let bytes = a.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                let primary = if a.get("primary").is_some() { " ★" } else { "" };
+                lines.push(format!(
+                    "  {}. [{}] {}{primary}（{} B）",
+                    i + 1,
+                    kind,
+                    title,
+                    bytes
+                ));
+            }
+            let _ = name;
+            return lines.join("\n");
+        };
+        let Some(a) = artifacts.get(idx.saturating_sub(1)) else {
+            return format!("序号超出范围（1-{}）。", artifacts.len());
+        };
+        let title = a
+            .get("title")
+            .or_else(|| a.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        let ct = a
+            .get("contentType")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let path = a.get("sourcePath").and_then(Value::as_str).unwrap_or("");
+        let id = a.get("id").and_then(Value::as_str).unwrap_or_default();
+        let version = a.get("version").and_then(Value::as_u64).unwrap_or(1);
+        let total = a
+            .get("bytes")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                a.get("versions")
+                    .and_then(Value::as_array)
+                    .and_then(|vs| vs.last())
+                    .and_then(|v| v.get("bytes"))
+                    .and_then(Value::as_u64)
+            })
+            .unwrap_or(0);
+        let mut out = format!("{title}（{ct}，{total} B，v{version}）");
+        if !path.is_empty() {
+            out.push_str(&format!("\n路径：{path}"));
+        }
+        // Content: prefer the workspace file; else the ArtifactRead RPC's
+        // first chunk (base64). Text-ish types get an inline preview.
+        let texty = ct.starts_with("text/")
+            || ct.contains("json")
+            || ct.contains("markdown")
+            || ct.contains("jsonl");
+        let body: Option<String> = if !path.is_empty() {
+            std::fs::read_to_string(path).ok()
+        } else {
+            kernel
+                .call(
+                    "v4/conversation/workflowRunArtifactRead",
+                    json!({
+                        "sessionId": kernel_sid,
+                        "runId": run_id,
+                        "artifactId": id,
+                        "version": version,
+                        "offset": 0,
+                        "limit": 8192,
+                    }),
+                )
+                .await
+                .ok()
+                .and_then(|r| {
+                    r.get("dataBase64")
+                        .and_then(Value::as_str)
+                        .and_then(decode_base64_utf8)
+                })
+        };
+        if let Some(body) = body {
+            if texty {
+                let head: String = body.chars().take(1200).collect();
+                out.push_str("\n--- 预览 ---\n");
+                out.push_str(&head);
+                if body.chars().count() > 1200 {
+                    out.push_str("\n…（已截断）");
+                }
+            }
+        } else if !texty {
+            out.push_str("\n（二进制产物，请用官方客户端或按路径打开）");
+        }
+        out
+    }
+
     /// Read the kernel's model catalog for this session and forward it to the
     /// pager as `x.ai/models/update` (params = acp::SessionModelState).
     async fn push_model_state(&self, kernel: &Kernel, session_id: &str) {
@@ -1688,6 +1831,15 @@ fn coding_plan_api_key(provider_id: &str) -> Option<String> {
 /// the marker are already plaintext. Feeding the sealed form to the kernel
 /// looks like a valid one-dot credential to its parser but is ciphertext
 /// garbage, which the server rejects as 身份验证失败.
+/// Best-effort base64 -> UTF-8 for artifact content previews.
+fn decode_base64_utf8(data: &str) -> Option<String> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 fn decrypt_credential(value: &str) -> String {
     const MARKER: &str = "enc:v1:";
     let Some(sealed) = value.strip_prefix(MARKER) else {
@@ -1833,6 +1985,50 @@ fn use_quota_reset(reset_type: &str) -> Result<Value, String> {
         .into_json()
         .map_err(|e| format!("reset parse: {e}"))?;
     Ok(resp)
+}
+
+/// Push the compact quota chip payload to the pager (x.ai/quota/update).
+fn emit_quota_update(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &str) {
+    let Ok(snapshot) = fetch_quota_snapshot() else {
+        return;
+    };
+    let pct_of = |limit: &Value| {
+        (
+            limit.get("currentValue").and_then(Value::as_u64).unwrap_or(0),
+            limit.get("usage").and_then(Value::as_u64).unwrap_or(0),
+            limit.get("percentage").and_then(Value::as_u64).unwrap_or(0),
+        )
+    };
+    let mut five = None;
+    let mut week = None;
+    for limit in snapshot
+        .get("limits")
+        .and_then(Value::as_array)
+        .unwrap_or(&Vec::new())
+    {
+        match (
+            limit.get("number").and_then(Value::as_u64),
+            limit.get("unit").and_then(Value::as_u64),
+        ) {
+            (Some(5), Some(3)) => five = Some(pct_of(limit)),
+            (Some(1), Some(6)) => week = Some(pct_of(limit)),
+            _ => {}
+        }
+    }
+    let resets = snapshot.get("resets").cloned().unwrap_or(json!(null));
+    let payload = json!({
+        "sessionId": session_id,
+        "fiveHour": five.map(|(u, t, p)| json!({"used": u, "total": t, "pct": p})),
+        "week": week.map(|(u, t, p)| json!({"used": u, "total": t, "pct": p})),
+        "resetFive": resets.get("available_five_hour_resets").and_then(Value::as_array).map(|a| a.len()),
+        "resetWeek": resets.get("available_week_resets").and_then(Value::as_array).map(|a| a.len()),
+    });
+    if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
+        gateway.forward_fire_and_forget(acp::ExtNotification::new(
+            "x.ai/quota/update",
+            raw.into(),
+        ));
+    }
 }
 
 /// Render the quota snapshot as the /quota reply text (numbers only).
@@ -2212,6 +2408,16 @@ impl acp::Agent for ZcodeAgent {
         self.push_model_state(&kernel, &session_id).await;
         tracing::info!(%session_id, "zcode session created");
         self.defer_available_commands(acp_session.clone());
+        {
+            // Quota chip: one best-effort fetch at session start (the
+            // numbers move slowly; /quota refreshes on demand).
+            let gateway = self.gateway.clone();
+            let sid = acp_session.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                emit_quota_update(&gateway, sid.0.as_ref());
+            });
+        }
         let mut response = acp::NewSessionResponse::new(acp_session);
         response.models = initial_models;
         Ok(response)
@@ -2609,7 +2815,10 @@ impl acp::Agent for ZcodeAgent {
                 }
             } else {
                 match fetch_quota_snapshot() {
-                    Ok(v) => quota_reply_text(&v),
+                    Ok(v) => {
+                        emit_quota_update(&self.gateway, args.session_id.0.as_ref());
+                        quota_reply_text(&v)
+                    }
                     Err(e) => format!("额度查询失败: {e}"),
                 }
             };
@@ -2898,6 +3107,22 @@ impl acp::Agent for ZcodeAgent {
         // dashboard locally.)
         let text = if text.trim_start().starts_with("/workflow") && attachments.is_empty() {
             let desc = text.trim_start()[9..].trim();
+            // Artifacts sub-surface: list a run's outputs (v4 list RPC) and
+            // preview text-ish ones from their sourcePath.
+            if desc == "artifacts" || desc.starts_with("artifacts ") {
+                let reply = self.workflow_artifacts_reply(
+                    &kernel,
+                    &state,
+                    desc.strip_prefix("artifacts").unwrap_or("").trim(),
+                )
+                .await;
+                notify(
+                    &self.gateway,
+                    &args.session_id,
+                    acp::SessionUpdate::AgentMessageChunk(text_chunk(reply)),
+                );
+                return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+            }
             if desc.is_empty() {
                 text.clone()
             } else {

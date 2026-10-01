@@ -653,6 +653,37 @@ fn queue_open_workflows_modal_refresh(app: &mut AppView, agent_id: AgentId) {
     }
 }
 
+/// Coding-plan quota chip state from the zcode backend (windows + reset
+/// counts); rendered in the status area, click prefills /quota.
+fn handle_quota_update(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(notif.params.get()) else {
+        return false;
+    };
+    let Some(session_id) = v.get("sessionId").and_then(|s| s.as_str()) else {
+        return false;
+    };
+    let sid = acp::SessionId::new(session_id.to_string());
+    let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+        return false;
+    };
+    let Some(agent) = app.agents.get_mut(&id) else {
+        return false;
+    };
+    agent.quota_state = Some(crate::views::agent_status::QuotaChipState {
+        five_hour_pct: v
+            .pointer("/fiveHour/pct")
+            .and_then(|p| p.as_u64())
+            .map(|p| p.min(100) as u8),
+        week_pct: v
+            .pointer("/week/pct")
+            .and_then(|p| p.as_u64())
+            .map(|p| p.min(100) as u8),
+        reset_five: v.get("resetFive").and_then(|n| n.as_u64()).map(|n| n as u32),
+        reset_week: v.get("resetWeek").and_then(|n| n.as_u64()).map(|n| n as u32),
+    });
+    true
+}
+
 fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> bool {
     let method = notif.method.as_ref();
     if crate::acp::is_session_update_ext_method(method) {
@@ -682,6 +713,7 @@ fn handle_ext_notification(notif: &acp::ExtNotification, app: &mut AppView) -> b
             handle_mcp_server_status(notif, app)
         }
         "x.ai/mcp/elicit_complete" => handle_mcp_elicit_complete(notif, app),
+        "x.ai/quota/update" => handle_quota_update(notif, app),
         "x.ai/mcp/servers_updated" => handle_mcp_servers_updated(notif, app),
         _ => false,
     }
