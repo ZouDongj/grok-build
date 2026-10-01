@@ -1472,11 +1472,15 @@ fn push_available_commands(gateway: &AcpGatewaySender<acp::AgentSide>, session: 
         "retry",
         "Re-run the last user turn (official retryTurn)",
     );
+    let workflow = acp::AvailableCommand::new(
+        "workflow",
+        "Launch a workflow from a natural-language goal",
+    );
     notify(
         gateway,
         session,
         acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(vec![
-            cmd, rate, drain, filerewind, retry,
+            cmd, rate, drain, filerewind, retry, workflow,
         ])),
     );
 }
@@ -1965,6 +1969,15 @@ impl acp::Agent for ZcodeAgent {
                         json!({
                             "name": "retry",
                             "description": "Re-run the last user turn (official retryTurn)",
+                        }),
+                        // The pager's builtin /workflow only becomes visible
+                        // when the agent advertises this name (it shadows the
+                        // ACP entry; dispatch stays PassThrough -> our
+                        // prompt interception rewrites it).
+                        json!({
+                            "name": "workflow",
+                            "description": "Launch a workflow from a natural-language goal",
+                            "input": { "hint": "<goal> | runs" },
                         }),
                     ]),
                 );
