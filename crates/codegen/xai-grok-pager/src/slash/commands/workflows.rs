@@ -1,7 +1,7 @@
 //! `/workflows`: browse the workflow catalog in the extensions modal.
 
 use crate::app::actions::Action;
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 use crate::views::extensions_modal::ExtensionsTab;
 use xai_grok_telemetry::events::ExtensionsModalTrigger;
 
@@ -13,6 +13,22 @@ impl SlashCommand for WorkflowsCommand {
         name: "workflows",
         description: "Browse installed workflows",
         usage: "/workflows",
+    }
+
+    /// The catalog browser only matters for the grok-shell backend (saved
+    /// definitions). The zcode backend's definition list is empty — hide it
+    /// there so /workflow (launch/manage) is the single workflow entry.
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        static ZCODE_DEFAULT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let grok = *ZCODE_DEFAULT.get_or_init(|| {
+            std::env::var("GROK_BACKEND")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "grok" || v == "shell"
+                })
+                .unwrap_or(false)
+        });
+        grok
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {
@@ -58,7 +74,15 @@ mod tests {
                 screen_mode: crate::app::ScreenMode::Fullscreen,
                 current_title: None,
             };
-            assert!(WorkflowsCommand.visible(&ctx));
+            // Default (zcode) backend hides the catalog browser; the
+            // visibility flag the test sweeps only matters on grok-shell.
+            let grok_default = std::env::var("GROK_BACKEND")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "grok" || v == "shell"
+                })
+                .unwrap_or(false);
+            assert_eq!(WorkflowsCommand.visible(&ctx), grok_default);
         }
     }
 
