@@ -5245,6 +5245,87 @@ fn update_v4_projection(state: &Rc<SessionState>, frame: &Value) {
                             state.v4_assistant_rows.borrow_mut().retain(|(rid, _, _, _)| *rid < from);
                         }
                     }
+                    // v3.15: workflowRuns moved from whole-key state
+                    // replacement to per-run incremental deltas (header
+                    // patch + actor/node entry replacement keyed by
+                    // siteId/ordinal; upsert when the run is new).
+                    "workflowRun.updated" => {
+                        let Some(run_id) = delta.get("runId").and_then(Value::as_str) else { continue };
+                        let runs = &mut *state.v4_workflow_runs.borrow_mut();
+                        let run = match runs
+                            .iter_mut()
+                            .find(|r| r.get("runId").and_then(Value::as_str) == Some(run_id))
+                        {
+                            Some(existing) => existing,
+                            None => {
+                                runs.push(json!({"runId": run_id}));
+                                runs.last_mut().expect("just pushed")
+                            }
+                        };
+                        let obj = run.as_object_mut().expect("run is object");
+                        if let Some(header) = delta.get("run").and_then(Value::as_object) {
+                            for (k, v) in header {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                        if let Some(cleared) = delta.get("cleared").and_then(Value::as_array) {
+                            for key in cleared.iter().filter_map(Value::as_str) {
+                                obj.remove(key);
+                            }
+                        }
+                        for (list_key, ref_key, removed_key) in [
+                            ("actors", "actors", "removedActors"),
+                            ("nodes", "nodes", "removedNodes"),
+                        ] {
+                            if let Some(removed) = delta.get(removed_key).and_then(Value::as_array) {
+                                let gone: Vec<(String, i64)> = removed
+                                    .iter()
+                                    .filter_map(|r| {
+                                        Some((
+                                            r.get("siteId").and_then(Value::as_str)?.to_string(),
+                                            r.get("ordinal").and_then(Value::as_i64)?,
+                                        ))
+                                    })
+                                    .collect();
+                                if let Some(list) = obj.get_mut(list_key).and_then(Value::as_array_mut) {
+                                    list.retain(|e| {
+                                        !gone.iter().any(|(sid, ord)| {
+                                            e.get("siteId").and_then(Value::as_str) == Some(sid)
+                                                && e.get("ordinal").and_then(Value::as_i64) == Some(*ord)
+                                        })
+                                    });
+                                }
+                            }
+                            if let Some(entries) = delta.get(ref_key).and_then(Value::as_array) {
+                                let list = obj
+                                    .entry(list_key)
+                                    .or_insert_with(|| json!([]))
+                                    .as_array_mut()
+                                    .expect("list is array");
+                                for e in entries {
+                                    let key = |v: &Value| {
+                                        (
+                                            v.get("siteId").and_then(Value::as_str).unwrap_or("").to_string(),
+                                            v.get("ordinal").and_then(Value::as_i64).unwrap_or(-1),
+                                        )
+                                    };
+                                    let k = key(e);
+                                    if let Some(slot) = list.iter_mut().find(|x| key(x) == k) {
+                                        *slot = e.clone();
+                                    } else {
+                                        list.push(e.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    "workflowRun.removed" => {
+                        let Some(run_id) = delta.get("runId").and_then(Value::as_str) else { continue };
+                        state
+                            .v4_workflow_runs
+                            .borrow_mut()
+                            .retain(|r| r.get("runId").and_then(Value::as_str) != Some(run_id));
+                    }
                     "state.updated" => {
                         let Some(patch) = delta.get("patch") else { continue };
                         if let Some(rev) = patch.get("revision").and_then(Value::as_u64) {
@@ -6660,4 +6741,98 @@ fn parse_interaction(method: &str, params: &Value) -> Option<InteractionWire> {
 
 fn str_at(value: &Value, key: &str) -> String {
     value.get(key).and_then(Value::as_str).unwrap_or_default().to_string()
+}
+
+#[cfg(test)]
+mod workflow_delta_tests {
+    use super::*;
+
+    fn run_state(runs: &[Value]) -> Rc<SessionState> {
+        let state = Rc::new(SessionState::new());
+        *state.v4_workflow_runs.borrow_mut() = runs.to_vec();
+        state
+    }
+
+    fn frame(ops: Value) -> Value {
+        json!({"payload": {"kind": "deltas", "deltas": ops}})
+    }
+
+    /// v3.15 workflowRun.updated: header patch merges, entries replace by
+    /// (siteId, ordinal), removals drop, unknown run upserts.
+    #[test]
+    fn workflow_run_updated_folds_entries_and_header() {
+        let state = run_state(&[json!({
+            "runId": "r1", "status": "running", "usage": {"nodesUsed": 1},
+            "actors": [{"siteId": "a#1", "ordinal": 1, "status": "waiting"}],
+            "nodes": [{"siteId": "n#1", "ordinal": 1, "phase": "queued"}],
+        })]);
+        update_v4_projection(&state, &frame(json!([{
+            "op": "workflowRun.updated",
+            "runId": "r1",
+            "revision": 2,
+            "run": {"status": "completed"},
+            "actors": [{"siteId": "a#1", "ordinal": 1, "status": "completed"}],
+            "nodes": [
+                {"siteId": "n#1", "ordinal": 1, "phase": "settled", "outcome": "ok"},
+                {"siteId": "n#2", "ordinal": 2, "phase": "settled", "outcome": "ok"},
+            ],
+        }]))); 
+        let runs = state.v4_workflow_runs.borrow();
+        let run = &runs[0];
+        assert_eq!(run["status"], "completed");
+        assert_eq!(run["actors"][0]["status"], "completed");
+        assert_eq!(run["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(run["nodes"][0]["phase"], "settled");
+    }
+
+    #[test]
+    fn workflow_run_updated_upserts_new_run() {
+        let state = run_state(&[]);
+        update_v4_projection(&state, &frame(json!([{
+            "op": "workflowRun.updated",
+            "runId": "r9",
+            "revision": 1,
+            "run": {"status": "running"},
+            "actors": [{"siteId": "a#1", "ordinal": 1, "status": "running"}],
+        }])));
+        let runs = state.v4_workflow_runs.borrow();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["runId"], "r9");
+        assert_eq!(runs[0]["actors"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn workflow_run_removed_drops_run() {
+        let state = run_state(&[json!({"runId": "r1"}), json!({"runId": "r2"})]);
+        update_v4_projection(&state, &frame(json!([{
+            "op": "workflowRun.removed", "runId": "r1", "revision": 3,
+        }])));
+        let runs = state.v4_workflow_runs.borrow();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["runId"], "r2");
+    }
+
+    #[test]
+    fn workflow_run_updated_removals_and_cleared_keys() {
+        let state = run_state(&[json!({
+            "runId": "r1", "status": "running", "resultPreview": "old",
+            "actors": [
+                {"siteId": "a#1", "ordinal": 1, "status": "completed"},
+                {"siteId": "a#2", "ordinal": 2, "status": "running"},
+            ],
+        })]);
+        update_v4_projection(&state, &frame(json!([{
+            "op": "workflowRun.updated",
+            "runId": "r1",
+            "revision": 4,
+            "run": {"status": "completed"},
+            "cleared": ["resultPreview"],
+            "removedActors": [{"siteId": "a#1", "ordinal": 1}],
+        }])));
+        let runs = state.v4_workflow_runs.borrow();
+        assert_eq!(runs[0]["status"], "completed");
+        assert!(runs[0].get("resultPreview").is_none());
+        assert_eq!(runs[0]["actors"].as_array().unwrap().len(), 1);
+        assert_eq!(runs[0]["actors"][0]["siteId"], "a#2");
+    }
 }

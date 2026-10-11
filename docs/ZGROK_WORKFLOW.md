@@ -267,6 +267,24 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   1200 字符）。store URI（zcode-artifact://）按协议只给 CLI，读 RPC 才是客户端通道。
 - e2e：workflow 交付 markdown 产物，清单+预览（实际内容渲染）全链路通。
 
+## v3.15.1 同步（上游 zai-org/ZCode 2026-10-10）
+
+- **唯一破坏性变化**：workflowRuns 从 state.updated 整键重发改为**增量 delta**——
+  新 op `workflowRun.updated`（header patch 合并 + cleared 键移除 + actors/nodes
+  按 (siteId, ordinal) 整条替换 + removedActors/removedNodes + 新 run upsert）
+  和 `workflowRun.removed`。不折叠这两个 op 的话，3.15 内核上 workflow 面板只有
+  第一帧快照、之后不再更新。已实现折叠（4 个合成帧单元测试钉住）。
+- 其余全部向后兼容：updateDynamicWorkflowPolicy 加可选 mode（我们的
+  {enabled:true} 仍有效）；snapshot/rows 全是 additive（turnHeader 新增
+  outputTokens/真实耗时，可后续消费）；requestProviderRuntimeHeaders 的 reason
+  枚举扩容（我们不按 reason 分支）；pluginUiSurfaces 删除（从未消费）。
+- workflow 上限 256→1024（actors/nodes）；actorsSettled/actorsFailed/nodesUnlisted
+  新计数（additive，未消费）。
+- **实机验证状态**：Linux 无 3.15 发行包（GitHub 仅 mac/win，npm 无）——折叠逻辑
+  按规范实现 + 单测；3.14.1 上回归 48/48 + workflow e2e 10/10 不受影响（新 op
+  在 3.14 不出现）。本机桌面升级到 3.15.x 后启动器自动切换，届时重跑回归即可。
+- 桌面版升级会自动被 zgrok 采用（启动器选最高版本目录）。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）
