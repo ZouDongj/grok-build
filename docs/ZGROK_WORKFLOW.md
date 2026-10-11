@@ -285,6 +285,24 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   在 3.14 不出现）。本机桌面升级到 3.15.x 后启动器自动切换，届时重跑回归即可。
 - 桌面版升级会自动被 zgrok 采用（启动器选最高版本目录）。
 
+## herdr 对接（其他 Agent 可驱动 zgrok）
+
+- **机制**：herdr（[github.com/ogulcancelik/herdr](https://github.com/ogulcancelik/herdr)，
+  文档 herdr.dev）的 agent 集成 = Claude 风格 SessionStart hook 自报身份
+  （`herdr integration install grok` 装到 `~/.grok/hooks/herdr-agent-state.sh` +
+  herdr.json；hook 从环境取 GROK_SESSION_ID + HERDR_*，向 herdr socket 报
+  pane.report_agent_session）+ 终端输出扫描判生命周期（idle/working/blocked/done）。
+- **我们的适配**：上游 grok 本就有完整 hooks 系统（xai-grok-hooks：发现
+  ~/.grok/hooks/*.json + 项目 .grok/hooks），但只有 grok 后端在服务端触发；
+  zcode 后端无人触发。pager 新增 session_hooks::fire_session_start——
+  SessionCreated/SessionLoaded 后触发（仅 zcode 后端，grok 后端服务端已触发
+  不重复）。**坑**：dispatch 路径不在 LocalSet 里，spawn_local 会 panic——
+  专用线程 + 一次性 current_thread runtime。
+- **用法**（其他 Agent 视角）：`herdr agent start <名字> --kind grok --pane <pane>`
+  → `herdr agent prompt <名字> "<任务>" --wait`。e2e 实证：识别 idle + 会话
+  上报 → prompt 注入 → 回答 "2" → 状态 done。
+- 生命周期状态由 herdr 扫 TUI 输出判定（我们是 grok 渲染，天然同款）。
+
 ## 排查手册
 
 - agent 调试日志：`/tmp/zcode-agent-debug.log`（prompt/interject/ext 调用全记录）

@@ -490,7 +490,15 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             session_id,
             models: new_models,
             modes,
-        } => handle_session_created(app, agent_id, session_id, new_models, modes),
+        } => {
+            if let Some(agent) = app.agents.get(&agent_id)
+                && let Some(sid) = Some(session_id.0.to_string())
+            {
+                let cwd = agent.session.cwd.clone();
+                crate::app::session_hooks::fire_session_start(&sid, &cwd.to_string_lossy());
+            }
+            handle_session_created(app, agent_id, session_id, new_models, modes)
+        }
         TaskResult::SessionFailed {
             agent_id,
             error,
@@ -626,17 +634,25 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_summary,
             restore_degree,
             running_prompt_id,
-        } => handle_session_loaded(
-            app,
-            agent_id,
-            session_id,
+        } => {
+            if let Some(agent) = app.agents.get(&agent_id)
+                && let Some(sid) = Some(session_id.0.to_string())
+            {
+                let cwd = agent.session.cwd.clone();
+                crate::app::session_hooks::fire_session_start(&sid, &cwd.to_string_lossy());
+            }
+            handle_session_loaded(
+                app,
+                agent_id,
+                session_id,
             new_models,
             modes,
             code_restored,
             restore_summary,
             restore_degree,
             running_prompt_id,
-        ),
+            )
+        }
         TaskResult::SessionMetaFromDisk {
             agent_id,
             title,

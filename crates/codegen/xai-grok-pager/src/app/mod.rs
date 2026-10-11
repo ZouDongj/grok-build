@@ -34,6 +34,7 @@ mod csi_filter;
 mod dashboard_session_picker;
 mod dispatch;
 pub mod roster;
+pub mod session_hooks;
 pub mod session_startup;
 pub(crate) mod session_title_resolve;
 pub mod status_blocks;
