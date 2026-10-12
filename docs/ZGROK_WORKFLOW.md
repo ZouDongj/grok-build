@@ -285,6 +285,31 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   在 3.14 不出现）。本机桌面升级到 3.15.x 后启动器自动切换，届时重跑回归即可。
 - 桌面版升级会自动被 zgrok 采用（启动器选最高版本目录）。
 
+## 全量 ext 对账（机械化审计，堵住抽查漏洞）
+
+- **方法**：提取 pager 源码里全部 `x.ai/*` 字符串（115 个），与 agent 实现
+  集合做差（81 个原始差）→ 人工分拣：通知（agent→pager 方向）/ 测试占位 /
+  grok-shell 专属 / **真缺口**。之前的盘点只查了 v4 协议面 + 抽查命令面，
+  这是漏项根源。
+- **本轮修复**：
+  - `/rename`（含 --auto）→ v4 `renameSession {title}`（官方通道；勿用 legacy
+    写 RPC）+ 本地 summary.json 同步（读回 db title，reset 场景自动反映内核
+    生成值）；
+  - `/btw` 跨会话问答 → 目标会话 v4 sendText(queue) 投递（held 队列自动带
+    disposition），轮询内核账本等发送时间之后的新 assistant 回复，按
+    `result.answer` 契约返回（目标必须是本 agent 承载的活跃会话）；
+  - `/session/search`（深度搜索）→ 账本 LIKE（标题优先 + 内容含 snippet），
+    bootstrapping=false；
+  - `queue/hold_edit|release_edit` 是通知（fire-and-forget），agent 兜底忽略
+    即可——本来就无碍；
+  - shell-only 管理面（skills/hooks/marketplace/mcp 管理、memory/flush、
+    recap、share、suggest、subagent/cancel、restore_code、worktree 等 22 个）
+    返回友好中文错误而非裸 Method not found。
+- e2e 4/4（rename 接受 / btw 答案"紫色河马42" / search 命中 / 友好错误）。
+- 诚实表：worktree（ctrl+w）、MCP 管理、hooks 管理、marketplace 安装、
+  memory/recap/share/feedback 仍是 grok-shell 专属——现在它们会明说而不是
+  假装成功。
+
 ## /fork 挂死修复（重要教训）
 
 - **现象**：/fork 直接失败，之后 resume 其他会话也全部失败。

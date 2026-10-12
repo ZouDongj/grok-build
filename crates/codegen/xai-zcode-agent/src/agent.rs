@@ -915,6 +915,169 @@ fn write_summary_stub(session_id: &str, cwd: &str) {
     }
 }
 
+/// Ledger-backed session search: title matches first, then message-text
+/// matches with a snippet. Scores are rough (match counts) — the pager only
+/// orders by them.
+fn session_search(query: &str, limit: usize) -> Vec<Value> {
+    let home = zcode_home();
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Vec::new();
+    };
+    let like = format!("%{}%", query.replace('%', ""));
+    let mut out: Vec<Value> = Vec::new();
+    // 1) title matches
+    if let Ok(mut stmt) = con.prepare(
+        "SELECT id, path, title, time_updated FROM session \
+         WHERE (title LIKE ?1 OR summary LIKE ?1) AND path IS NOT NULL \
+         ORDER BY time_updated DESC LIMIT ?2",
+    ) {
+        let rows = stmt
+            .query_map(rusqlite::params![like, limit as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for (id, path, title, updated) in rows {
+            out.push(json!({
+                "session_id": id,
+                "cwd": path.unwrap_or_default(),
+                "summary": title.unwrap_or_default(),
+                "updated_at": ms_to_rfc3339(updated),
+                "score": 10.0,
+                "matched_fields": ["title"],
+            }));
+        }
+    }
+    // 2) content matches (skip sessions already hit by title)
+    let content_stmt = con.prepare(
+        "SELECT s.id, s.path, s.title, s.time_updated, substr(json_extract(p.data, '$.text'), 1, 200) \
+         FROM part p JOIN message m ON m.id = p.message_id JOIN session s ON s.id = m.session_id \
+         WHERE p.data LIKE ?1 AND s.path IS NOT NULL \
+         GROUP BY s.id ORDER BY MAX(s.time_updated) DESC LIMIT ?2",
+    );
+    if out.len() < limit {
+        if let Ok(mut stmt) = content_stmt {
+        let rows = stmt
+            .query_map(rusqlite::params![like, (limit - out.len()) as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .map(|rows| rows.filter_map(Result::ok).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let seen: Vec<String> = out
+            .iter()
+            .filter_map(|v| v.get("session_id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        for (id, path, title, updated, snippet) in rows {
+            if seen.contains(&id) {
+                continue;
+            }
+            out.push(json!({
+                "session_id": id,
+                "cwd": path.unwrap_or_default(),
+                "summary": title.unwrap_or_default(),
+                "updated_at": ms_to_rfc3339(updated),
+                "score": 1.0,
+                "matched_fields": ["content"],
+                "snippet": snippet,
+            }));
+        }
+        }
+    }
+    out.truncate(limit);
+    out
+}
+
+/// Write a custom (or cleared) session title into the pager's summary.json.
+/// The kernel db is authoritative after the renameSession command; read the
+/// resulting title back so reset-to-auto reflects what the kernel chose.
+fn sync_custom_title(kernel_sid: &str, _title: &str, cwd: &str) {
+    let home = zcode_home();
+    let Ok(con) = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return;
+    };
+    let title = con
+        .query_row(
+            "SELECT title FROM session WHERE id = ?1",
+            [kernel_sid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if title.trim().is_empty() {
+        return;
+    }
+    let Some(grok_home) = std::env::var_os("GROK_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(std::path::PathBuf::from))
+    else {
+        return;
+    };
+    let Some(encoded) = encode_cwd_dirname(cwd) else { return };
+    let path = grok_home
+        .join(".grok")
+        .join("sessions")
+        .join(encoded)
+        .join(kernel_sid)
+        .join("summary.json");
+    let Ok(raw) = std::fs::read_to_string(&path) else { return };
+    let Ok(mut summary) = serde_json::from_str::<Value>(&raw) else { return };
+    summary["session_summary"] = json!(title);
+    let _ = std::fs::write(&path, summary.to_string());
+}
+
+/// The newest assistant text of a session created after `after_ms` (0 = any).
+fn last_assistant_text_after(kernel_sid: &str, after_ms: i64) -> Option<String> {
+    let home = zcode_home();
+    let con = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let (msg_id, created): (String, i64) = con
+        .query_row(
+            "SELECT m.id, m.time_created FROM message m \
+             WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'assistant' \
+             AND m.time_created >= ?2 ORDER BY m.time_created DESC LIMIT 1",
+            rusqlite::params![kernel_sid, after_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()?;
+    if created < after_ms {
+        return None;
+    }
+    con.query_row(
+        "SELECT p.data FROM part p WHERE p.message_id = ?1 \
+         AND json_extract(p.data, '$.type') = 'text' ORDER BY p.sequence DESC LIMIT 1",
+        [msg_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|data| {
+        serde_json::from_str::<Value>(&data)
+            .ok()
+            .and_then(|j| j.get("text").and_then(Value::as_str).map(str::to_string))
+    })
+    .filter(|t| !t.trim().is_empty())
+}
+
 /// Sync the kernel's auto-generated session title (session.title,
 /// title_source='generated') into the pager's summary.json so the resume
 /// list shows real titles instead of the stub's empty summary. Best-effort;
@@ -4436,6 +4599,167 @@ impl acp::Agent for ZcodeAgent {
                     }
                 }
             }
+            // Deep session search over the kernel ledger: LIKE over titles
+            // and message text, newest-first, with a content snippet.
+            "x.ai/session/search" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let query = params
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .min(50) as usize;
+                let results = if query.is_empty() {
+                    Vec::new()
+                } else {
+                    session_search(&query, limit)
+                };
+                let body = json!({"result": {"results": results, "bootstrapping": false}});
+                let raw =
+                    serde_json::value::to_raw_value(&body).expect("serialize search results");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // /rename + /rename --auto: the official v4 renameSession
+            // command (title becomes titleSource=custom; empty title resets
+            // toward auto). Local summary.json syncs so the resume list
+            // reflects the name immediately.
+            "x.ai/session/rename" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let id = params
+                    .get("session_id")
+                    .or_else(|| params.get("sessionId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let reset_to_auto = params
+                    .get("reset_to_auto")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let cwd = params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !id.starts_with("sess_") {
+                    return Err(acp::Error::invalid_params().data("bad sessionId"));
+                }
+                let kernel = self.kernel()?;
+                let kernel_sid = self.session_kernel_id(&acp::SessionId::new(id.clone()));
+                let ack = v4_command(
+                    &kernel,
+                    &kernel_sid,
+                    "renameSession",
+                    json!({"title": title}),
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(format!("rename failed: {e}")))?;
+                if ack.get("status").and_then(Value::as_str) != Some("accepted") {
+                    return Err(acp::Error::internal_error().data(format!(
+                        "rename rejected: {}",
+                        ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?")
+                    )));
+                }
+                // Reflect the new name locally: reset_to_auto clears the
+                // custom title so the kernel's generated one shows on sync.
+                let display_title = if reset_to_auto { "" } else { &title };
+                sync_custom_title(&kernel_sid, display_title, &cwd);
+                let raw = serde_json::value::to_raw_value(&json!({"result": {"ok": true}}))
+                    .expect("serialize rename ack");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // /btw: ask a question to ANOTHER live session of this agent.
+            // The target receives the question as a queued prompt; we wait
+            // for that turn to settle and return its final text as the
+            // answer (the pager's contract: result.answer).
+            "x.ai/btw" => {
+                let params: Value =
+                    serde_json::from_str(args.params.get()).unwrap_or(json!({}));
+                let target = params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let question = params
+                    .get("question")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if question.trim().is_empty() {
+                    return Err(acp::Error::invalid_params().data("empty question"));
+                }
+                let kernel = self.kernel()?;
+                let target_acp = acp::SessionId::new(target.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&target_acp)
+                    .cloned()
+                    .ok_or_else(|| {
+                        acp::Error::internal_error().data(
+                            "target session is not hosted by this agent (open it first)",
+                        )
+                    })?;
+                let kernel_sid = state.kernel_id.borrow().clone();
+                // Queue the question; the kernel delivers it as the next
+                // turn when the target is free.
+                let held = held_queue_disposition(&state);
+                let ack = v4_send_text_held(
+                    &kernel,
+                    &kernel_sid,
+                    &format!(
+                        "（来自另一会话的提问，请直接回答，答完不要做其他事）{question}"
+                    ),
+                    "queue",
+                    held.as_ref().map(|h| (h.0, h.1.clone())),
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(format!("btw send failed: {e}")))?;
+                if ack.get("status").and_then(Value::as_str) != Some("accepted") {
+                    return Err(acp::Error::internal_error().data(format!(
+                        "btw rejected: {}",
+                        ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?")
+                    )));
+                }
+                // Poll the ledger for the answer: an assistant text part
+                // created AFTER our send. Robust against turns already
+                // running (queue delivers next) and requires no turn_done
+                // choreography.
+                let sent_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+                let mut answer: Option<String> = None;
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+                    if let Some(text) = last_assistant_text_after(&kernel_sid, sent_ms - 1500) {
+                        answer = Some(text);
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        break;
+                    }
+                }
+                let answer = answer.unwrap_or_else(|| "No response".into());
+                let raw = serde_json::value::to_raw_value(&json!({"result": {"answer": answer}}))
+                    .expect("serialize btw answer");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
             // Session fork: clone the conversation at the latest checkpoint.
             // The legacy session/fork RPC WEDGES the 3.14.1 kernel's command
             // loop (every later call — including session/resume — then times
@@ -4854,6 +5178,39 @@ impl acp::Agent for ZcodeAgent {
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
             _ => {}
+        }
+        // Shell-only management surfaces (grok backend features the zcode
+        // kernel does not host): say so instead of a bare method-not-found.
+        const SHELL_ONLY: &[&str] = &[
+            "x.ai/skills/toggle",
+            "x.ai/hooks/action",
+            "x.ai/marketplace/action",
+            "x.ai/mcp/upsert",
+            "x.ai/mcp/delete",
+            "x.ai/mcp/toggle",
+            "x.ai/mcp/toggle_tool",
+            "x.ai/mcp/setup",
+            "x.ai/mcp/auth_trigger",
+            "x.ai/memory/flush",
+            "x.ai/recap",
+            "x.ai/share_session",
+            "x.ai/feedback",
+            "x.ai/suggest",
+            "x.ai/subagent/cancel",
+            "x.ai/restore_code",
+            "x.ai/toggle_plan_mode",
+            "x.ai/consent/record",
+            "x.ai/commands/list",
+            "x.ai/terminal/background",
+            "x.ai/scheduler/delete",
+            "x.ai/git/worktree/create_from_worktree_sync",
+            "x.ai/git/worktree/resume_session",
+        ];
+        if SHELL_ONLY.contains(&args.method.as_ref()) {
+            return Err(acp::Error::method_not_found().data(format!(
+                "该功能属于 grok-shell 后端，zcode 内核不提供（{}）",
+                args.method
+            )));
         }
         Err(acp::Error::method_not_found())
     }
