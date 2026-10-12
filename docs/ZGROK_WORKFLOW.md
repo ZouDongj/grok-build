@@ -285,6 +285,21 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   在 3.14 不出现）。本机桌面升级到 3.15.x 后启动器自动切换，届时重跑回归即可。
 - 桌面版升级会自动被 zgrok 采用（启动器选最高版本目录）。
 
+## /fork 挂死修复（重要教训）
+
+- **现象**：/fork 直接失败，之后 resume 其他会话也全部失败。
+- **根因**：fork ext 走 legacy `session/fork` RPC——3.14.1 内核处理它时把
+  **命令循环整个挂死**（进程活着，`kernel alive: true`，但之后所有 RPC
+  30s 超时：session/list、updateDynamicWorkflowPolicy、session/resume 全灭）。
+  调试日志时间线：fork → TIMEOUT → 4×session/list TIMEOUT → resume TIMEOUT。
+- **修复**：x.ai/session/fork 改走 **v4 forkAssistant 命令**（rewind 路径
+  验证过的通道）：刷新投影取 CAS → 目标=最后一个 complete 的 assistant 行
+  → ack 的 result.sessionId 即 fork 会话 → session/subscribe 它 → 响应
+  契约 result.newSessionId（pager 的 fork_session_params 契约）。
+- **铁律**：**不要用 legacy 面的会话级写 RPC**（session/fork 这类）——写操作
+  一律优先 v4 命令面（CAS + 状态机），legacy 只读尚可，写会挂死内核。
+- e2e 3/3：fork 返回新会话；原会话 resume 正常；fork 携带完整对话（标记词召回）。
+
 ## herdr 对接（其他 Agent 可驱动 zgrok）
 
 - **机制**：herdr（[github.com/ogulcancelik/herdr](https://github.com/ogulcancelik/herdr)，

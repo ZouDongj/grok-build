@@ -4431,7 +4431,12 @@ impl acp::Agent for ZcodeAgent {
                     }
                 }
             }
-            // Session fork: kernel sessionFork clones at the latest checkpoint.
+            // Session fork: clone the conversation at the latest checkpoint.
+            // The legacy session/fork RPC WEDGES the 3.14.1 kernel's command
+            // loop (every later call — including session/resume — then times
+            // out; observed live). The v4 forkAssistant command is the
+            // official, rewind-proven channel: fork at the last stable
+            // assistant row, CAS envelope, ack carries the new session id.
             "x.ai/session/fork" => {
                 let params: Value =
                     serde_json::from_str(args.params.get()).unwrap_or(json!({}));
@@ -4445,13 +4450,79 @@ impl acp::Agent for ZcodeAgent {
                     return Err(acp::Error::invalid_params().data("bad sessionId"));
                 }
                 let kernel = self.kernel()?;
-                let result = kernel
-                    .call("session/fork", json!({"sessionId": id}))
+                let acp_sid = acp::SessionId::new(id.clone());
+                let state = self
+                    .shared
+                    .state
+                    .borrow()
+                    .sessions
+                    .get(&acp_sid)
+                    .cloned()
+                    .ok_or_else(|| acp::Error::invalid_params().data("unknown session"))?;
+                let kernel_sid = state.kernel_id.borrow().clone();
+                // Fresh projection (CAS tokens + rows), like the rewind path.
+                {
+                    let before = state.v4_snapshot_count.get();
+                    v4_subscribe(&kernel, &kernel_sid);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while state.v4_snapshot_count.get() <= before
+                        && std::time::Instant::now() < deadline
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+                let target = state
+                    .v4_assistant_rows
+                    .borrow()
+                    .iter()
+                    .rev()
+                    .find(|(_, _, _, st)| st == "complete")
+                    .map(|(rid, eid, _, _)| (*rid, eid.clone()));
+                let Some((row_id, entity_id)) = target else {
+                    return Err(acp::Error::internal_error()
+                        .data("fork failed: no stable assistant row to fork at"));
+                };
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0);
+                let envelope = json!({
+                    "commandId": format!("zgrok-fork-{now_ms}"),
+                    "clientId": "zgrok",
+                    "sessionId": kernel_sid,
+                    "baseRevision": state.v4_revision.get(),
+                    "baseLogEpoch": state.v4_log_epoch.borrow().clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    "type": "forkAssistant",
+                    "payload": {"target": {"rowId": row_id, "entityId": entity_id}},
+                    "issuedAt": now_ms,
+                });
+                let ack = kernel
+                    .call("v4/command", envelope)
                     .await
-                    .map_err(|e| {
-                        acp::Error::internal_error().data(format!("fork failed: {e}"))
-                    })?;
-                let body = json!({"result": result});
+                    .map_err(|e| acp::Error::internal_error().data(format!("fork failed: {e}")))?;
+                if ack.get("status").and_then(Value::as_str) != Some("accepted") {
+                    return Err(acp::Error::internal_error().data(format!(
+                        "fork rejected: {} {}",
+                        ack.get("reasonCode").and_then(Value::as_str).unwrap_or("?"),
+                        ack.get("message").and_then(Value::as_str).unwrap_or("")
+                    )));
+                }
+                let fork_sid = ack
+                    .pointer("/result/sessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !fork_sid.starts_with("sess_") {
+                    return Err(acp::Error::internal_error()
+                        .data("fork ack carried no session id"));
+                }
+                // The fork needs its own legacy event subscription (turn
+                // events ride session/event per session).
+                let _ = kernel
+                    .call("session/subscribe", kernel::subscribe_params(&fork_sid))
+                    .await;
+                let body = json!({"result": {"newSessionId": fork_sid}});
                 let raw = serde_json::value::to_raw_value(&body)
                     .expect("serialize fork result");
                 return Ok(acp::ExtResponse::new(raw.into()));
