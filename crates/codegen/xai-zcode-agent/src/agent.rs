@@ -2411,12 +2411,17 @@ impl acp::Agent for ZcodeAgent {
         {
             // Quota chip: one best-effort fetch at session start (the
             // numbers move slowly; /quota refreshes on demand).
+            // The fetch does BLOCKING http — run it on a dedicated thread
+            // so it can never stall the single-threaded agent runtime.
             let gateway = self.gateway.clone();
-            let sid = acp_session.clone();
-            tokio::task::spawn_local(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                emit_quota_update(&gateway, sid.0.as_ref());
-            });
+            let sid = acp_session.0.as_ref().to_string();
+            std::thread::Builder::new()
+                .name("quota-chip-fetch".into())
+                .spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    emit_quota_update(&gateway, &sid);
+                })
+                .ok();
         }
         let mut response = acp::NewSessionResponse::new(acp_session);
         response.models = initial_models;

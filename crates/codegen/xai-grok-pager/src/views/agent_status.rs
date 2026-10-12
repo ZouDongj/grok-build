@@ -344,9 +344,10 @@ pub struct QuotaChipState {
     pub reset_week: Option<u32>,
 }
 
-/// `⚡22%·39%` — usage percent of the 5h and 7d windows (official shows the
-/// same two numbers on the account page). Warning colour when a window is
-/// nearly exhausted.
+/// `Q 22%/39% R5+6` — usage percent of the 5h/7d windows + available reset
+/// counts. Plain ASCII only: ⚡/⟳/· are ambiguous-width glyphs that most
+/// terminal fonts render 2-columns-wide while the layout reserves 1,
+/// overlapping the neighbours.
 pub fn quota_chip(
     q: &QuotaChipState,
     theme: &Theme,
@@ -369,11 +370,11 @@ pub fn quota_chip(
         style
     };
     let resets = match (q.reset_five, q.reset_week) {
-        (Some(f), Some(w)) => format!(" ⟳{f}+{w}"),
+        (Some(f), Some(w)) => format!(" R{f}+{w}"),
         _ => String::new(),
     };
     Some(Line::from(Span::styled(
-        format!("⚡{five}%·{week}%{resets}"),
+        format!("Q {five}%/{week}%{resets}"),
         style,
     )))
 }
@@ -1009,5 +1010,48 @@ mod tests {
             .collect();
         assert_eq!(row.trim(), "XX");
         assert!(!row.contains(SEPARATOR));
+    }
+}
+
+#[cfg(test)]
+mod quota_chip_tests {
+    use super::*;
+
+    fn theme() -> Theme {
+        Theme::current()
+    }
+
+    /// The chip must be plain-ASCII width-safe (ambiguous-width glyphs like
+    /// ⚡/⟳/· render 2-wide in most fonts and overlap neighbours) and must
+    /// carry both window percentages plus reset counts.
+    #[test]
+    fn quota_chip_is_ascii_and_complete() {
+        let q = QuotaChipState {
+            five_hour_pct: Some(8),
+            week_pct: Some(58),
+            reset_five: Some(5),
+            reset_week: Some(5),
+        };
+        let line = quota_chip(&q, &theme(), false).expect("chip renders");
+        let owned: Vec<String> = line
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        let text: String = owned.concat();
+        assert_eq!(text, "Q 8%/58% R5+5");
+        // Every char is width-1: no ambiguous-width glyphs can sneak in.
+        assert!(text.chars().all(|c| c.is_ascii()));
+    }
+
+    #[test]
+    fn quota_chip_hides_without_five_hour() {
+        let q = QuotaChipState {
+            five_hour_pct: None,
+            week_pct: Some(40),
+            reset_five: None,
+            reset_week: None,
+        };
+        assert!(quota_chip(&q, &theme(), false).is_none());
     }
 }
