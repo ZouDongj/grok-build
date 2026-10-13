@@ -4553,6 +4553,29 @@ pub(crate) fn execute(
                 vec![(text, interjection_id, blocks)],
             );
         }
+        Effect::QuotaFetch { agent_id, force } => {
+            let _ = force; // rate limiting happened at the dispatch layer
+            let tx = acp_tx.clone();
+            tasks.spawn(async move {
+                let request = acp::ExtRequest::new(
+                    "x.ai/quota/get",
+                    serde_json::value::to_raw_value(&serde_json::json!({}))
+                        .expect("serialize quota/get params")
+                        .into(),
+                );
+                let state = match acp_send(request, &tx).await {
+                    Ok(resp) => {
+                        let wrapper: serde_json::Value =
+                            serde_json::from_str(resp.0.get()).unwrap_or_default();
+                        wrapper
+                            .get("result")
+                            .map(crate::views::agent_status::parse_quota_state)
+                    }
+                    Err(_) => None,
+                };
+                TaskResult::QuotaLoaded { agent_id, state }
+            });
+        }
         Effect::FetchCatalogEntry { kind, name } => {
             let tx = acp_tx.clone();
             tasks

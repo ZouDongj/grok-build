@@ -559,6 +559,8 @@ pub struct AppView {
     /// `Some` only while a `/login` (or 401-triggered re-auth) initiated from an active session is in progress.
     /// `None` at startup so the normal login-then-load flow is preserved.
     pub auth_return_view: Option<ActiveView>,
+    /// Global quota-fetch budget (30s shared across triggers).
+    pub quota_last_fetch: Option<std::time::Instant>,
     pub agents: IndexMap<AgentId, AgentView>,
     /// Monotonically increasing counter for agent ID allocation.
     /// IDs are never reused after `shift_remove`, to avoid collisions.
@@ -1382,6 +1384,7 @@ impl AppView {
             active_view: ActiveView::Welcome,
             auth_return_view: None,
             agents: IndexMap::new(),
+            quota_last_fetch: None,
             next_agent_id: 0,
             models,
             registry: ActionRegistry::defaults(),
@@ -2314,6 +2317,28 @@ impl AppView {
     /// Handle a terminal event. Routes through the input layer stack:
     /// Pending action check (double-press confirmation)
     /// Quit always goes through double-press confirmation, even when escalated from agent-level (e.g., Ctrl-C while cancelling).
+    /// Rate-limited quota fetch (pull path). `force` bypasses the 30s
+    /// window (clicks/session-ready); regular triggers (send, hover) share
+    /// the budget so mouse traffic never hammers the API.
+    pub fn maybe_fetch_quota(
+        &mut self,
+        agent_id: crate::app::agent::AgentId,
+        force: bool,
+    ) -> Vec<crate::app::actions::Effect> {
+        if !force
+            && self
+                .quota_last_fetch
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(30))
+        {
+            return vec![];
+        }
+        if !self.agents.contains_key(&agent_id) {
+            return vec![];
+        }
+        self.quota_last_fetch = Some(std::time::Instant::now());
+        vec![crate::app::actions::Effect::QuotaFetch { agent_id, force }]
+    }
+
     pub fn handle_input(&mut self, ev: &Event) -> InputOutcome {
         self.handle_input_at_with_paste_provenance(ev, Instant::now(), PasteProvenance::Terminal)
     }

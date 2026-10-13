@@ -89,6 +89,7 @@ fn test_app() -> AppView {
         active_view: ActiveView::Welcome,
         auth_return_view: None,
         agents: IndexMap::new(),
+            quota_last_fetch: None,
         next_agent_id: 0,
         models: ModelState::default(),
         registry: crate::actions::ActionRegistry::defaults(),

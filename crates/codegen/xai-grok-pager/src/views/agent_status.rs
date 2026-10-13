@@ -356,6 +356,33 @@ pub struct QuotaWindow {
     pub next_reset_ms: Option<u64>,
 }
 
+/// Parse the quota payload (shared by the x.ai/quota/update notification
+/// handler and the x.ai/quota/get response) into the chip state.
+pub fn parse_quota_state(v: &serde_json::Value) -> QuotaChipState {
+    let window = |key: &str| {
+        v.pointer(&format!("/{key}/used")).and_then(|x| x.as_u64()).map(|used| QuotaWindow {
+            used,
+            total: v.pointer(&format!("/{key}/total")).and_then(|x| x.as_u64()).unwrap_or(0),
+            used_pct: v
+                .pointer(&format!("/{key}/pct"))
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0)
+                .min(100) as u8,
+            next_reset_ms: v.pointer(&format!("/{key}/nextReset")).and_then(|x| x.as_u64()),
+        })
+    };
+    let five = window("fiveHour");
+    let week = window("week");
+    QuotaChipState {
+        five_hour_pct: five.as_ref().map(|w| w.used_pct),
+        week_pct: week.as_ref().map(|w| w.used_pct),
+        reset_five: v.get("resetFive").and_then(|n| n.as_u64()).map(|n| n as u32),
+        reset_week: v.get("resetWeek").and_then(|n| n.as_u64()).map(|n| n as u32),
+        five_hour: five,
+        week,
+    }
+}
+
 /// `Q 22%/39% R5+6` — usage percent of the 5h/7d windows + available reset
 /// counts. Plain ASCII only: ⚡/⟳/· are ambiguous-width glyphs that most
 /// terminal fonts render 2-columns-wide while the layout reserves 1,

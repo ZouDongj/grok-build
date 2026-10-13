@@ -2168,18 +2168,10 @@ fn schedule_quota_refresh(gateway: &AcpGatewaySender<acp::AgentSide>, session_id
         .ok();
 }
 
-/// Push the compact quota chip payload to the pager (x.ai/quota/update).
-fn emit_quota_update(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &str) {
-    let Ok(snapshot) = fetch_quota_snapshot() else {
-        return;
-    };
-    let pct_of = |limit: &Value| {
-        (
-            limit.get("currentValue").and_then(Value::as_u64).unwrap_or(0),
-            limit.get("usage").and_then(Value::as_u64).unwrap_or(0),
-            limit.get("percentage").and_then(Value::as_u64).unwrap_or(0),
-        )
-    };
+/// The quota chip payload (windows + resets) shared by the push
+/// notification and the pull ext (x.ai/quota/get).
+fn quota_chip_payload() -> Option<Value> {
+    let snapshot = fetch_quota_snapshot().ok()?;
     let mut five = None;
     let mut week = None;
     for limit in snapshot
@@ -2205,13 +2197,20 @@ fn emit_quota_update(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &st
         }
     }
     let resets = snapshot.get("resets").cloned().unwrap_or(json!(null));
-    let payload = json!({
-        "sessionId": session_id,
+    Some(json!({
         "fiveHour": five,
         "week": week,
         "resetFive": resets.get("available_five_hour_resets").and_then(Value::as_array).map(|a| a.len()),
         "resetWeek": resets.get("available_week_resets").and_then(Value::as_array).map(|a| a.len()),
-    });
+    }))
+}
+
+/// Push the compact quota chip payload to the pager (x.ai/quota/update).
+fn emit_quota_update(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &str) {
+    let Some(mut payload) = quota_chip_payload() else {
+        return;
+    };
+    payload["sessionId"] = json!(session_id);
     if let Ok(raw) = serde_json::value::to_raw_value(&payload) {
         gateway.forward_fire_and_forget(acp::ExtNotification::new(
             "x.ai/quota/update",
@@ -4192,6 +4191,18 @@ impl acp::Agent for ZcodeAgent {
             "x.ai/auth/check_subscription" => {
                 let raw = serde_json::value::to_raw_value(&json!({ "meta": {} }))
                     .expect("serialize check_subscription");
+                return Ok(acp::ExtResponse::new(raw.into()));
+            }
+            // Pull-style quota fetch (the pager's race-free path: it asks
+            // only after the session pane is registered). Same payload as
+            // the x.ai/quota/update push.
+            "x.ai/quota/get" => {
+                let body = match quota_chip_payload() {
+                    Some(payload) => json!({"result": payload}),
+                    None => json!({"error": "quota fetch failed"}),
+                };
+                let raw =
+                    serde_json::value::to_raw_value(&body).expect("serialize quota get");
                 return Ok(acp::ExtResponse::new(raw.into()));
             }
             "x.ai/billing" => {

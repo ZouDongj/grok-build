@@ -497,7 +497,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 let cwd = agent.session.cwd.clone();
                 crate::app::session_hooks::fire_session_start(&sid, &cwd.to_string_lossy());
             }
-            handle_session_created(app, agent_id, session_id, new_models, modes)
+            let mut effects = handle_session_created(app, agent_id, session_id, new_models, modes);
+            effects.extend(app.maybe_fetch_quota(agent_id, true));
+            effects
         }
         TaskResult::SessionFailed {
             agent_id,
@@ -625,6 +627,12 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             vec![]
         }
         TaskResult::GateRefreshed { settings } => handle_gate_refreshed(app, settings),
+        TaskResult::QuotaLoaded { agent_id, state } => {
+            if let Some(agent) = app.agents.get_mut(&agent_id) {
+                agent.quota_state = state;
+            }
+            vec![]
+        }
         TaskResult::SessionLoaded {
             agent_id,
             session_id,
@@ -641,7 +649,7 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
                 let cwd = agent.session.cwd.clone();
                 crate::app::session_hooks::fire_session_start(&sid, &cwd.to_string_lossy());
             }
-            handle_session_loaded(
+            let mut effects = handle_session_loaded(
                 app,
                 agent_id,
                 session_id,
@@ -651,7 +659,9 @@ pub(super) fn dispatch_task_result(result: TaskResult, app: &mut AppView) -> Vec
             restore_summary,
             restore_degree,
             running_prompt_id,
-            )
+            );
+            effects.extend(app.maybe_fetch_quota(agent_id, true));
+            effects
         }
         TaskResult::SessionMetaFromDisk {
             agent_id,

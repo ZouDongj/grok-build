@@ -58,11 +58,11 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 if self.hit_quota.contains(mouse.column, mouse.row) {
-                    // Toggle the quota detail modal (windows + resets + how
-                    // to use a reset card).
+                    // Toggle the quota detail modal and force a fresh fetch
+                    // (opening the usage view should show current numbers).
                     if self.quota_state.is_some() {
                         self.show_quota_detail = !self.show_quota_detail;
-                        return InputOutcome::Changed;
+                        return InputOutcome::Action(Action::RefreshQuota { force: true });
                     }
                 }
                 if self.hit_workflow_status.contains(mouse.column, mouse.row) {
@@ -1110,7 +1110,12 @@ impl AgentView {
                 changed |= self.hit_bg_status.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_goal_status.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_workflow_status.update_hover(mouse.column, mouse.row);
+                let quota_was_hovered = self.hit_quota.hovered;
                 changed |= self.hit_quota.update_hover(mouse.column, mouse.row);
+                if !quota_was_hovered && self.hit_quota.hovered {
+                    // Hover dwell on the chip refreshes (rate-limited).
+                    return InputOutcome::Action(Action::RefreshQuota { force: false });
+                }
                 changed |= self.hit_bg_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_catalog_close.update_hover(mouse.column, mouse.row);
                 changed |= self.hit_cwd.update_hover(mouse.column, mouse.row);

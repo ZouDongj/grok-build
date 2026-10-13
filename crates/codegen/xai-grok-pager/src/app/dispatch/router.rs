@@ -413,7 +413,14 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
             }
             vec![]
         }
-        Action::SendPrompt(text) => dispatch_send_prompt(app, text),
+        Action::SendPrompt(text) => {
+            let mut effects = dispatch_send_prompt(app, text);
+            // Fresh quota numbers with every user turn (rate-limited).
+            if let crate::app::app_view::ActiveView::Agent(id) = app.active_view {
+                effects.extend(app.maybe_fetch_quota(id, false));
+            }
+            effects
+        }
         Action::RevisePlan(text) => super::prompt::dispatch_revise_plan(app, text),
         Action::SubmitFollowUp(text) => dispatch_send_prompt_inner(app, text, false, true, true),
         Action::SendSlashCommandPreservingDraft(text) => {
@@ -1066,6 +1073,13 @@ fn dispatch_inner(action: Action, app: &mut AppView) -> Vec<Effect> {
         Action::OpenTutorial => dispatch_open_tutorial(app),
         Action::RenameSession { title } => dispatch_rename_session(app, title),
         Action::ResetSessionTitleToAuto => dispatch_reset_session_title(app),
+        Action::RefreshQuota { force } => {
+            if let crate::app::app_view::ActiveView::Agent(id) = app.active_view {
+                app.maybe_fetch_quota(id, force)
+            } else {
+                vec![]
+            }
+        }
         Action::ShowContextInfo => dispatch_show_context_info(app),
         Action::ShowUsage => dispatch_show_usage(app),
         Action::ManageBilling => dispatch_manage_billing(app),

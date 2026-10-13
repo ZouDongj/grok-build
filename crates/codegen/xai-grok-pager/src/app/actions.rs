@@ -34,6 +34,9 @@ pub enum SwitchModelError {
 #[cfg_attr(test, derive(strum::AsRefStr))]
 #[allow(clippy::large_enum_variant)]
 pub enum Action {
+    /// Refresh the coding-plan quota chip (pull path, rate-limited unless
+    /// forced; click/session-ready force, send/hover are limited).
+    RefreshQuota { force: bool },
     /// Quit the application.
     Quit,
     /// Restart the binary to pick up a downloaded update.
@@ -2043,6 +2046,8 @@ pub enum Effect {
         auto: bool,
     },
     /// Send a mid-turn interjection via x.ai/interject ext method.
+    /// Pull the quota state from the agent (x.ai/quota/get) for a session.
+    QuotaFetch { agent_id: crate::app::agent::AgentId, force: bool },
     SendInterject {
         agent_id: AgentId,
         session_id: acp::SessionId,
@@ -2423,6 +2428,10 @@ pub enum TaskResult {
         timed_out: bool,
     },
     /// Session was loaded (resumed) successfully.
+    QuotaLoaded {
+        agent_id: crate::app::agent::AgentId,
+        state: Option<crate::views::agent_status::QuotaChipState>,
+    },
     SessionLoaded {
         agent_id: AgentId,
         session_id: acp::SessionId,

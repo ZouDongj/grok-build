@@ -80,6 +80,7 @@ pub(crate) fn test_app() -> AppView {
         active_view: ActiveView::Welcome,
         auth_return_view: None,
         agents: indexmap::IndexMap::new(),
+            quota_last_fetch: None,
         next_agent_id: 0,
         models: ModelState::default(),
         registry: ActionRegistry::defaults(),
