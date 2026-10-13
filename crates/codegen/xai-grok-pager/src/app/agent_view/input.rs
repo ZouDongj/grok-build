@@ -454,6 +454,21 @@ impl AgentView {
         if let Some(outcome) = self.handle_workflows_overlay_input(ev) {
             return outcome;
         }
+        if self.show_quota_detail && self.quota_state.is_some() {
+            if let Event::Key(key) = ev
+                && key.kind != KeyEventKind::Release
+            {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.show_quota_detail = false;
+                        return InputOutcome::Changed;
+                    }
+                    _ => {
+                        return InputOutcome::Changed;
+                    }
+                }
+            }
+        }
         if self.show_goal_detail && self.goal_state.is_some() {
             if let Event::Key(key) = ev
                 && key.kind != KeyEventKind::Release

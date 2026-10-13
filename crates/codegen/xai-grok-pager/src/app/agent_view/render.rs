@@ -4262,6 +4262,17 @@ impl AgentView {
         {
             prompt_post_flush = Some(clear.into());
         }
+        if self.show_quota_detail
+            && let Some(ref q) = self.quota_state
+        {
+            let overlay_rect = crate::views::quota_detail::render_quota_detail(
+                buf,
+                area,
+                q,
+                &theme,
+            );
+            self.frame_occluder_rects.push(overlay_rect);
+        }
         if self.show_goal_detail
             && let Some(ref goal) = self.goal_state
         {

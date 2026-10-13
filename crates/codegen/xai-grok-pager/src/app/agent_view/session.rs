@@ -280,6 +280,7 @@ impl AgentView {
             hit_workflow_status: Default::default(),
             hit_quota: Default::default(),
             quota_state: None,
+            show_quota_detail: false,
             hit_goal_close: Default::default(),
             hit_bg_button: Default::default(),
             last_bg_click: None,

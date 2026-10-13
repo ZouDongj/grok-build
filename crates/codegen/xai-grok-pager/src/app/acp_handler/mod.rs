@@ -664,22 +664,38 @@ fn handle_quota_update(notif: &acp::ExtNotification, app: &mut AppView) -> bool 
     };
     let sid = acp::SessionId::new(session_id.to_string());
     let Some(SessionMatch::Root(id)) = find_session_match(app, &sid) else {
+        tracing::debug!(session_id, "quota update DROPPED — no agent match");
         return false;
     };
     let Some(agent) = app.agents.get_mut(&id) else {
         return false;
     };
+    tracing::debug!(session_id, agent = ?id, "quota chip state set");
+    let window = |key: &str| {
+        v.pointer(&format!("/{key}/used")).and_then(|x| x.as_u64()).map(|used| {
+            crate::views::agent_status::QuotaWindow {
+                used,
+                total: v.pointer(&format!("/{key}/total")).and_then(|x| x.as_u64()).unwrap_or(0),
+                used_pct: v
+                    .pointer(&format!("/{key}/pct"))
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(0)
+                    .min(100) as u8,
+                next_reset_ms: v
+                    .pointer(&format!("/{key}/nextReset"))
+                    .and_then(|x| x.as_u64()),
+            }
+        })
+    };
+    let five = window("fiveHour");
+    let week = window("week");
     agent.quota_state = Some(crate::views::agent_status::QuotaChipState {
-        five_hour_pct: v
-            .pointer("/fiveHour/pct")
-            .and_then(|p| p.as_u64())
-            .map(|p| p.min(100) as u8),
-        week_pct: v
-            .pointer("/week/pct")
-            .and_then(|p| p.as_u64())
-            .map(|p| p.min(100) as u8),
+        five_hour_pct: five.as_ref().map(|w| w.used_pct),
+        week_pct: week.as_ref().map(|w| w.used_pct),
         reset_five: v.get("resetFive").and_then(|n| n.as_u64()).map(|n| n as u32),
         reset_week: v.get("resetWeek").and_then(|n| n.as_u64()).map(|n| n as u32),
+        five_hour: five,
+        week,
     });
     true
 }

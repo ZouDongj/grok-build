@@ -1067,6 +1067,8 @@ pub struct AgentView {
     pub hit_quota: HitArea,
     /// Coding-plan quota chip state (x.ai/quota/update).
     pub quota_state: Option<crate::views::agent_status::QuotaChipState>,
+    /// Quota detail modal toggle (chip click).
+    pub show_quota_detail: bool,
     pub hit_goal_close: HitArea,
     pub hit_bg_button: HitArea,
     pub(crate) last_bg_click: Option<Instant>,

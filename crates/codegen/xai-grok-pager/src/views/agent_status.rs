@@ -334,14 +334,26 @@ pub fn goal_status_line(
     ])
 }
 
-/// Compact coding-plan quota chip state (5h / 7d window usage percent +
-/// available reset counts) for the status bar.
+/// Coding-plan quota state for the status-bar chip and the detail modal.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QuotaChipState {
     pub five_hour_pct: Option<u8>,
     pub week_pct: Option<u8>,
     pub reset_five: Option<u32>,
     pub reset_week: Option<u32>,
+    /// Full window facts for the detail modal (used/total + next-reset).
+    pub five_hour: Option<QuotaWindow>,
+    pub week: Option<QuotaWindow>,
+}
+
+/// One quota window's raw facts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct QuotaWindow {
+    pub used: u64,
+    pub total: u64,
+    /// Used percentage from the API (the chip displays REMAINING = 100-pct).
+    pub used_pct: u8,
+    pub next_reset_ms: Option<u64>,
 }
 
 /// `Q 22%/39% R5+6` — usage percent of the 5h/7d windows + available reset
@@ -369,12 +381,17 @@ pub fn quota_chip(
     } else {
         style
     };
+    // REMAINING percentages (the official account page shows remaining;
+    // the API's pct is used-share, so invert it).
+    let rem_five = 100 - five;
+    let rem_week = 100 - week;
     let resets = match (q.reset_five, q.reset_week) {
-        (Some(f), Some(w)) => format!(" R{f}+{w}"),
+        (Some(f), Some(w)) => format!(" R {f}+{w}"),
         _ => String::new(),
     };
+    let _ = (five, week);
     Some(Line::from(Span::styled(
-        format!("Q {five}%/{week}%{resets}"),
+        format!("Q {rem_five}%/{rem_week}%{resets}"),
         style,
     )))
 }
@@ -1022,8 +1039,9 @@ mod quota_chip_tests {
     }
 
     /// The chip must be plain-ASCII width-safe (ambiguous-width glyphs like
-    /// ⚡/⟳/· render 2-wide in most fonts and overlap neighbours) and must
-    /// carry both window percentages plus reset counts.
+    /// ⚡/⟳/· render 2-wide in most fonts and overlap neighbours), show
+    /// REMAINING share (the API pct is used-share), keep spacing uniform
+    /// ("Q " and "R "), and carry both windows plus reset counts.
     #[test]
     fn quota_chip_is_ascii_and_complete() {
         let q = QuotaChipState {
@@ -1031,6 +1049,8 @@ mod quota_chip_tests {
             week_pct: Some(58),
             reset_five: Some(5),
             reset_week: Some(5),
+            five_hour: None,
+            week: None,
         };
         let line = quota_chip(&q, &theme(), false).expect("chip renders");
         let owned: Vec<String> = line
@@ -1039,7 +1059,7 @@ mod quota_chip_tests {
             .map(|s| s.content.to_string())
             .collect();
         let text: String = owned.concat();
-        assert_eq!(text, "Q 8%/58% R5+5");
+        assert_eq!(text, "Q 92%/42% R 5+5");
         // Every char is width-1: no ambiguous-width glyphs can sneak in.
         assert!(text.chars().all(|c| c.is_ascii()));
     }
@@ -1051,6 +1071,8 @@ mod quota_chip_tests {
             week_pct: Some(40),
             reset_five: None,
             reset_week: None,
+            five_hour: None,
+            week: None,
         };
         assert!(quota_chip(&q, &theme(), false).is_none());
     }

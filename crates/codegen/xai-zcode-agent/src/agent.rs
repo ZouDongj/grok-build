@@ -2150,6 +2150,24 @@ fn use_quota_reset(reset_type: &str) -> Result<Value, String> {
     Ok(resp)
 }
 
+/// Rate-limited quota chip refresh (the startup emission can race the
+/// pager's registration window when the pane isn't focused during load —
+/// the turn-completion path heals it). One emission per 5 minutes.
+fn schedule_quota_refresh(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &str) {
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(300)) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    let gateway = gateway.clone();
+    let sid = session_id.to_string();
+    std::thread::Builder::new()
+        .name("quota-chip-refresh".into())
+        .spawn(move || emit_quota_update(&gateway, &sid))
+        .ok();
+}
+
 /// Push the compact quota chip payload to the pager (x.ai/quota/update).
 fn emit_quota_update(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &str) {
     let Ok(snapshot) = fetch_quota_snapshot() else {
@@ -2169,20 +2187,28 @@ fn emit_quota_update(gateway: &AcpGatewaySender<acp::AgentSide>, session_id: &st
         .and_then(Value::as_array)
         .unwrap_or(&Vec::new())
     {
+        let window = |l: &Value| {
+            json!({
+                "used": l.get("currentValue").and_then(Value::as_u64).unwrap_or(0),
+                "total": l.get("usage").and_then(Value::as_u64).unwrap_or(0),
+                "pct": l.get("percentage").and_then(Value::as_u64).unwrap_or(0),
+                "nextReset": l.get("nextResetTime").and_then(Value::as_u64),
+            })
+        };
         match (
             limit.get("number").and_then(Value::as_u64),
             limit.get("unit").and_then(Value::as_u64),
         ) {
-            (Some(5), Some(3)) => five = Some(pct_of(limit)),
-            (Some(1), Some(6)) => week = Some(pct_of(limit)),
+            (Some(5), Some(3)) => five = Some(window(limit)),
+            (Some(1), Some(6)) => week = Some(window(limit)),
             _ => {}
         }
     }
     let resets = snapshot.get("resets").cloned().unwrap_or(json!(null));
     let payload = json!({
         "sessionId": session_id,
-        "fiveHour": five.map(|(u, t, p)| json!({"used": u, "total": t, "pct": p})),
-        "week": week.map(|(u, t, p)| json!({"used": u, "total": t, "pct": p})),
+        "fiveHour": five,
+        "week": week,
         "resetFive": resets.get("available_five_hour_resets").and_then(Value::as_array).map(|a| a.len()),
         "resetWeek": resets.get("available_week_resets").and_then(Value::as_array).map(|a| a.len()),
     });
@@ -6638,6 +6664,7 @@ fn handle_event(
             push_context_usage(gateway, shared, &state, &acp_session);
             push_todos(gateway, &state, &acp_session);
             sync_kernel_title(state.kernel_id.borrow().as_ref(), &state.cwd.borrow());
+            schedule_quota_refresh(gateway, acp_session.0.as_ref());
             drain_pending_continuation(gateway, shared, &acp_session);
         }
         return;

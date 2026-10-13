@@ -58,11 +58,12 @@ impl AgentView {
                     return InputOutcome::Changed;
                 }
                 if self.hit_quota.contains(mouse.column, mouse.row) {
-                    // Prefill the composer with /quota (full windows + reset
-                    // actions) rather than firing it — quota use is explicit.
-                    self.prompt.set_text("/quota");
-                    self.set_active_pane(AgentPane::Prompt, false);
-                    return InputOutcome::Changed;
+                    // Toggle the quota detail modal (windows + resets + how
+                    // to use a reset card).
+                    if self.quota_state.is_some() {
+                        self.show_quota_detail = !self.show_quota_detail;
+                        return InputOutcome::Changed;
+                    }
                 }
                 if self.hit_workflow_status.contains(mouse.column, mouse.row) {
                     self.show_workflows = !self.show_workflows;
