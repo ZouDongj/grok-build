@@ -3,7 +3,7 @@ use xai_grok_tools::implementations::grok_build::{
     SCHEDULER_CREATE_TOOL_NAME, loop_schedule_instruction, loop_usage_message,
 };
 
-use crate::slash::command::{
+use crate::slash::command::{AppCtx, 
     CommandExecCtx, CommandResult, ScheduledTaskPreview, SlashCommand, slash_meta,
 };
 
@@ -88,6 +88,12 @@ impl SlashCommand for LoopCommand {
         args_required: true,
         arg_placeholder: "[interval] <prompt>",
         required_tools: LOOP_REQUIRED_TOOLS,
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

@@ -3,7 +3,7 @@ use xai_grok_tools::implementations::grok_build::{
     IMAGE_GEN_TOOL_NAME, IMAGINE_COMMAND_NAME, imagine_instruction, imagine_usage_message,
 };
 
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 const REQUIRED_TOOLS: &[&str] = &[IMAGE_GEN_TOOL_NAME];
 
@@ -18,6 +18,12 @@ impl SlashCommand for ImagineCommand {
         args_required: true,
         arg_placeholder: "description of the image to generate",
         required_tools: REQUIRED_TOOLS,
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

@@ -4,7 +4,7 @@
 //! `x.ai/memory/dream` like `/compact`, with a start line, a spinner, and a typed outcome, instead
 //! of a silent prompt turn. The registry hides them until the shell advertises its own builtins.
 
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 pub struct FlushCommand;
 
@@ -14,6 +14,12 @@ impl SlashCommand for FlushCommand {
         description: "Save this session's memory to disk now",
         usage: "/flush",
         session_scoped: true,
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {
@@ -29,6 +35,12 @@ impl SlashCommand for DreamCommand {
         description: "Consolidate memory now (merge observations into topics)",
         usage: "/dream",
         session_scoped: true,
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

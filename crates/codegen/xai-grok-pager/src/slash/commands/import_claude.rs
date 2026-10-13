@@ -5,7 +5,7 @@
 //! The agent view overlays the modal on top of the active session, the same selection UI as the welcome screen's Ctrl-I shortcut.
 
 use crate::app::actions::Action;
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 /// Open the interactive Claude settings import modal in the active session.
 pub struct ImportClaudeCommand;
@@ -15,6 +15,12 @@ impl SlashCommand for ImportClaudeCommand {
         name: "import-claude",
         description: "Open the Claude settings import modal",
         usage: "/import-claude",
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

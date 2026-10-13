@@ -1,7 +1,7 @@
 //! `/feedback`: send a report inline or open the feedback modal.
 
 use crate::app::actions::Action;
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 /// Bare `/feedback` opens the feedback modal in every screen mode; `/feedback <text>` sends immediately,
 /// without a model turn and without waiting on the prompt queue.
@@ -14,6 +14,12 @@ impl SlashCommand for FeedbackCommand {
         usage: "/feedback [text]",
         takes_args: true,
         arg_placeholder: "[feedback text]",
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn submission_refusal(&self, args: &str, voice_owns_prompt: bool) -> Option<&'static str> {

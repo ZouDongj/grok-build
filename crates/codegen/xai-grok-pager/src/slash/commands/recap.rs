@@ -5,7 +5,7 @@
 //! The recap arrives asynchronously as a scrollback line and is never added to the model conversation.
 
 use crate::app::actions::Action;
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 pub struct RecapCommand;
 
@@ -16,6 +16,12 @@ impl SlashCommand for RecapCommand {
         description: "Summarize the session so far",
         usage: "/recap",
         session_scoped: true,
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {

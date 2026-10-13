@@ -8,7 +8,7 @@
 //! `/auto` is hard-hidden when the auto permission-mode feature is off.
 
 use crate::app::actions::{Action, PermissionModeKind};
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 /// Toggle auto permission mode (LLM classifier).
 pub struct AutoCommand;
@@ -18,6 +18,12 @@ impl SlashCommand for AutoCommand {
         name: "auto",
         description: "Toggle auto mode (classifier approves safe tools)",
         usage: "/auto",
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, ctx: &mut CommandExecCtx, _args: &str) -> CommandResult {

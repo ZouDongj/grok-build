@@ -4,7 +4,7 @@ use xai_grok_tools::implementations::grok_build::{
     imagine_video_usage_message,
 };
 
-use crate::slash::command::{CommandExecCtx, CommandResult, SlashCommand, slash_meta};
+use crate::slash::command::{AppCtx, CommandExecCtx, CommandResult, SlashCommand, slash_meta};
 
 const REQUIRED_TOOLS: &[&str] = &[IMAGE_TO_VIDEO_TOOL_NAME];
 
@@ -19,6 +19,12 @@ impl SlashCommand for ImagineVideoCommand {
         args_required: true,
         arg_placeholder: "description of the video to generate",
         required_tools: REQUIRED_TOOLS,
+    }
+
+    /// Hidden on the zcode backend: grok-shell server-side feature the
+    /// zcode kernel does not host (entrance closed, not erroring).
+    fn visible(&self, _ctx: &AppCtx) -> bool {
+        !crate::app::session_hooks::zcode_backend_active()
     }
 
     fn run(&self, _ctx: &mut CommandExecCtx, args: &str) -> CommandResult {

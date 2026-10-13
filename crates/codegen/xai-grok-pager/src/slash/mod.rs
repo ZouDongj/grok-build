@@ -1859,26 +1859,30 @@ mod tests {
         .unwrap();
         ctrl.registry_mut()
             .set_acp_commands(&[agent_client_protocol::AvailableCommand::new(
-                "acme:login".to_string(),
-                "Acme account login".to_string(),
+                "acme:context".to_string(),
+                "Acme context skill".to_string(),
             )
-            .meta(meta)]);
+            .meta({
+                let mut m = meta.clone();
+                m.insert("bareName".to_string(), serde_json::json!("context"));
+                m
+            })]);
 
         let state = SlashState::default();
         let models = ModelState::default();
-        ctrl.refresh(&state, "/login", 6, &models);
+        ctrl.refresh(&state, "/context", 7, &models);
         let snapshot = state.snapshot();
         let login = snapshot
             .matches
             .iter()
-            .find(|row| row.display == "/login")
-            .expect("builtin /login");
+            .find(|row| row.display == "/context")
+            .expect("builtin /context");
         assert_eq!(login.provenance, Some(CommandProvenance::Builtin));
         assert!(!login.description.contains("built-in"));
         let skill = snapshot
             .matches
             .iter()
-            .find(|row| row.display == "/acme:login")
+            .find(|row| row.display == "/acme:context")
             .expect("qualified skill");
         assert_eq!(
             skill.provenance,
@@ -1886,19 +1890,19 @@ mod tests {
                 source: "acme".to_string()
             })
         );
-        assert_eq!(skill.description, "Acme account login");
-        assert!(ctrl.registry().get("login").is_some_and(|c| !c.is_skill()));
+        assert_eq!(skill.description, "Acme context skill");
+        assert!(ctrl.registry().get("context").is_some_and(|c| !c.is_skill()));
         assert!(
             ctrl.registry()
-                .get("acme:login")
+                .get("acme:context")
                 .is_some_and(|c| c.is_skill())
         );
 
-        ctrl.refresh(&state, "/acme:login", 11, &models);
+        ctrl.refresh(&state, "/acme:context", 13, &models);
         let snapshot = state.snapshot();
         assert_eq!(
             snapshot.selection().map(|row| row.display.as_str()),
-            Some("/acme:login"),
+            Some("/acme:context"),
             "exact qualified query should select the skill"
         );
     }
@@ -2614,15 +2618,22 @@ mod tests {
             ("/", "/always-approve"),
             ("/alw", "/always-approve"),
             ("/always-approve", "/always-approve"),
-            ("/", "/auto"),
-            ("/au", "/auto"),
-            ("/auto", "/auto"),
         ] {
             ctrl.refresh(&state, query, query.len(), &models);
             let snapshot = state.snapshot();
             assert!(
                 snapshot.matches.iter().any(|row| row.display == display),
                 "{display} missing from completion for query {query:?}"
+            );
+        }
+        // /auto (grok-shell classifier mode) is entrance-closed on the
+        // default zcode backend — it must NOT appear even when available.
+        for query in ["/", "/au", "/auto"] {
+            ctrl.refresh(&state, query, query.len(), &models);
+            let snapshot = state.snapshot();
+            assert!(
+                !snapshot.matches.iter().any(|row| row.display == "/auto"),
+                "/auto must stay hidden on the zcode backend (query {query:?})"
             );
         }
     }
