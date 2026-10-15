@@ -285,6 +285,20 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   在 3.14 不出现）。本机桌面升级到 3.15.x 后启动器自动切换，届时重跑回归即可。
 - 桌面版升级会自动被 zgrok 采用（启动器选最高版本目录）。
 
+## todo 面板可见性（根因：数据一直通，面板默认藏）
+
+- **数据链路从来没断**：内核 todo 表 → push_todos（TodoWrite result 即时 +
+  turn 完成 + **load_session 恢复**）→ ACP Plan → 面板。回归一直绿。
+- **用户看不到的根因**：上游 grok 的 `update_todos` 注释明言"Does NOT
+  auto-show the todo pane. Users toggle it with Ctrl-T"——面板默认隐藏，
+  等 Ctrl-T。这是 grok 原生设计；ZCode 官方是模型一写就自动出现。
+- **修复**：`update_todos` 收到非空条目即 `overlay.show()`（官方行为）；
+  Ctrl-T 仍可手动开关；清空不自动隐藏（尊重用户显式折叠）。
+- **两个修复一起**：load_session 补推 todos（resume 恢复面板——此前要等
+  下一次 TodoWrite/回合结束才出现）。
+- 实机（herdr）：模型写三项待办 → 面板立现（✓/□ 状态正确）→ /exit →
+  grok --resume → **面板自动恢复**。todo 单测 16/16。
+
 ## 额度芯片 v3（用户反馈迭代）
 
 - **剩余语义**：芯片显示剩余（`Q 54%/87% R 5+5` = 5h/7d 剩余占比 + 重置卡）；

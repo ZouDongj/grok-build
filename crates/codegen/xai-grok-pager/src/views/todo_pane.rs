@@ -217,9 +217,17 @@ impl TodoPane {
 
     /// Replace all todo items (called from ACP Plan handler).
     ///
-    /// Does NOT auto-show the todo pane. Users toggle it with Ctrl-T.
+    /// AUTO-SHOWS the pane when items arrive (official ZCode behavior: the
+    /// plan appears the moment the model writes it). Ctrl-T still toggles;
+    /// emptying the list does NOT auto-hide (the user may collapse it
+    /// deliberately — an explicit toggle wins until new items arrive).
     pub fn update_todos(&mut self, items: Vec<TodoItem>) {
+        let arriving = !items.is_empty();
         self.todos = items;
+        if arriving {
+            self.overlay.show();
+            self.on_state_change();
+        }
     }
 
     fn compute_counts(items: &[TodoItem]) -> TodoCounts {

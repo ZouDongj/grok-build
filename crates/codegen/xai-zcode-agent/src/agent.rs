@@ -2815,6 +2815,12 @@ impl acp::Agent for ZcodeAgent {
             push_context_usage(&self.gateway, &self.shared, &state, &args.session_id);
             sync_kernel_title(state.kernel_id.borrow().as_ref(), &state.cwd.borrow());
         }
+        // Restore the todo pane from the ledger: the live paths push on
+        // TodoWrite results and turn end, but a resumed session with
+        // existing todos would show an empty pane until the next write.
+        if let Some(state) = self.shared.state.borrow().sessions.get(&args.session_id).cloned() {
+            push_todos(&self.gateway, &state, &args.session_id);
+        }
         tracing::info!(%session_id, "zcode session resumed");
         self.defer_available_commands(args.session_id.clone());
         let mut response = acp::LoadSessionResponse::new();
