@@ -462,15 +462,6 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                 }
             }
         }
-        debug_log(&format!(
-            "push_model_state: effort={:?} current={:?} meta_keys={:?}",
-            thought_level,
-            state.current_model_id.0.as_ref(),
-            state.available_models.iter()
-                .find(|m| m.model_id.0.as_ref() == state.current_model_id.0.as_ref())
-                .and_then(|m| m.meta.as_ref())
-                .map(|m| m.keys().collect::<Vec<_>>())
-        ));
         if let Ok(params) = serde_json::value::to_raw_value(&state) {
             self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
                 "x.ai/models/update",
