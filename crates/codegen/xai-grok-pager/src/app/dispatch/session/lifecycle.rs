@@ -1398,8 +1398,46 @@ pub(in crate::app::dispatch) fn handle_session_created(
         }
         agent.bind_session_id(session_id);
         if let Some(m) = new_models {
+            // The response models DON'T carry the agent's _meta.reasoningEffort
+            // injection (the agent's push_model_state notification arrives
+            // separately). Preserve any effort the models/update already set
+            // on the current model so the composer tag survives this overwrite.
+            let prev_effort = agent.session.models.reasoning_effort;
+            let prev_meta_effort = agent
+                .session
+                .models
+                .current
+                .as_ref()
+                .and_then(|id| agent.session.models.available.get(id))
+                .and_then(|info| {
+                    xai_grok_shell::sampling::types::parse_reasoning_effort_meta(
+                        info.meta.as_ref(),
+                    )
+                });
             app.models = Some(m).into();
             agent.session.models = app.models.clone();
+            if let Some(eff) = prev_effort.or(prev_meta_effort) {
+                agent.session.models.reasoning_effort = Some(eff);
+                // Also inject into the current model's meta so the render
+                // fallback finds it.
+                if let Some(current) = agent.session.models.current.clone() {
+                    if let Some(info) = agent.session.models.available.get_mut(&current) {
+                        if let Some(meta) = info.meta.as_mut() {
+                            meta.insert(
+                                "reasoningEffort".to_string(),
+                                serde_json::json!(eff.to_string()),
+                            );
+                        } else {
+                            let mut meta = serde_json::Map::new();
+                            meta.insert(
+                                "reasoningEffort".to_string(),
+                                serde_json::json!(eff.to_string()),
+                            );
+                            info.meta = Some(meta);
+                        }
+                    }
+                }
+            }
         }
         if agent.apply_session_modes(modes) {
             app.default_yolo = false;
