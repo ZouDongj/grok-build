@@ -426,14 +426,28 @@ pub fn stop_params(session_id: &str) -> Value {
     json!({"sessionId": session_id})
 }
 
-pub fn set_model_params(session_id: &str, provider_id: &str, model_id: &str) -> Value {
+/// setModel params; `effort` carries the user's persisted reasoning level
+/// (model.json) — None lets the kernel apply its own default.
+pub fn set_model_params(
+    session_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    effort: Option<&str>,
+) -> Value {
+    let mut model = json!({
+        "providerId": provider_id,
+        "modelId": model_id,
+    });
+    // The kernel REQUIRES a reasoningLevel for coding-plan models ("Reasoning
+    // level is required" on omission). Use the persisted preference, else the
+    // kernel's default from the catalog reasoning levels, else "high".
+    let level = effort
+        .map(str::to_string)
+        .unwrap_or_else(|| std::env::var("ZGROK_DEFAULT_EFFORT").unwrap_or_else(|_| "high".into()));
+    model["options"] = json!({"reasoningLevel": level});
     json!({
         "sessionId": session_id,
-        "model": {
-            "providerId": provider_id,
-            "modelId": model_id,
-            "options": {"reasoningLevel": "max"},
-        }
+        "model": model,
     })
 }
 

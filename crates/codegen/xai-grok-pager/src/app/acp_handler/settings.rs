@@ -35,6 +35,23 @@ pub(super) fn handle_models_update(notif: &acp::ExtNotification, app: &mut AppVi
                 .session
                 .models
                 .update_catalog(new_models.available.clone());
+            // The zcode backend surfaces the kernel's persisted effort on
+            // the current model's _meta; refresh the displayed effort so the
+            // composer tag matches (e.g. after resume with effort=max).
+            if let Some(ref current) = agent.session.models.current {
+                if let Some(info) = agent.session.models.available.get(current) {
+                    let meta_effort = crate::acp::model_state::ModelState::from(Some(
+                        acp::SessionModelState::new(
+                            current.clone(),
+                            vec![info.clone()],
+                        ),
+                    ))
+                    .reasoning_effort;
+                    if meta_effort != agent.session.models.reasoning_effort {
+                        agent.session.models.reasoning_effort = meta_effort;
+                    }
+                }
+            }
         }
         true
     } else {

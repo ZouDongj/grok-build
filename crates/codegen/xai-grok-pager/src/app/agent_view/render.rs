@@ -2364,7 +2364,28 @@ impl AgentView {
         let usage_warning_text: Option<String> = warning.as_ref().map(|(t, _)| t.clone());
         let usage_warning = usage_warning_text.as_deref();
         let usage_warning_critical = warning.is_some_and(|(_, critical)| critical);
-        let model_label = match self.session.models.reasoning_effort {
+        // Prefer the tracked effort; fall back to the current model's
+        // _meta.reasoningEffort (the zcode backend injects it on every
+        // models/update — the authoritative source regardless of whether a
+        // ModelChanged notification landed).
+        let meta_effort = self
+            .session
+            .models
+            .current
+            .as_ref()
+            .and_then(|id| self.session.models.available.get(id))
+            .and_then(|info| {
+                xai_grok_shell::sampling::types::parse_reasoning_effort_meta(info.meta.as_ref())
+            })
+            .map(|e| e.to_string());
+        let effort = self
+            .session
+            .models
+            .reasoning_effort
+            .as_ref()
+            .map(|e| e.to_string())
+            .or(meta_effort);
+        let model_label = match effort {
             Some(eff) => format!("{model_id} ({eff})"),
             None => model_id,
         };

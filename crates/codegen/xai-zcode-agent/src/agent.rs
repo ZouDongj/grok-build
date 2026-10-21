@@ -410,7 +410,11 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
             .or_else(|| read.pointer("/thoughtLevel"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .or_else(|| latest_persisted_thought_level(session_id.split('/').next().unwrap_or(session_id)));
+            .or_else(|| latest_persisted_thought_level(session_id))
+            // The persisted preference is the final fallback — it's what
+            // setModel just passed, so it's authoritative for fresh sessions
+            // whose ledger entry hasn't committed yet.
+            .or_else(load_effort_preference);
         let Some(mut state) = model_state_from_settings(&read) else {
             return;
         };
@@ -443,17 +447,17 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         // Surface the kernel's persisted reasoning effort on the current
         // model's meta so the pager's composer shows the effort tag after
         // resume/new sessions (in-session /effort already flows live).
-        if let Some(level) = thought_level {
+        if let Some(ref level) = thought_level {
             if let Some(current) = state
                 .available_models
                 .iter_mut()
                 .find(|m| m.model_id.0.as_ref() == state.current_model_id.0.as_ref())
             {
                 if let Some(m) = current.meta.as_mut() {
-                    m.insert("reasoningEffort".to_string(), json!(level));
+                    m.insert("reasoningEffort".to_string(), json!(level.clone()));
                 } else {
                     let mut m = serde_json::Map::new();
-                    m.insert("reasoningEffort".to_string(), json!(level));
+                    m.insert("reasoningEffort".to_string(), json!(level.clone()));
                     current.meta = Some(m);
                 }
             }
@@ -473,6 +477,7 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                 "update": {
                     "sessionUpdate": "model_changed",
                     "model_id": current.0.as_ref(),
+                    "reasoningEffort": thought_level,
                 },
             });
             if let Ok(params) = serde_json::value::to_raw_value(&payload) {
@@ -2343,10 +2348,16 @@ fn quota_reply_text(snapshot: &Value) -> String {
 /// setModel with a short retry: 0.16.9 materializes account entitlements
 /// asynchronously after kernel start, and a first-touch setModel for an
 /// account provider can race that ("Provider Registry 中不存在 Model").
-async fn set_model_with_retry(kernel: &Kernel, session_id: &str, provider: &str, model: &str) {
+async fn set_model_with_retry(
+    kernel: &Kernel,
+    session_id: &str,
+    provider: &str,
+    model: &str,
+    effort: Option<&str>,
+) {
     for attempt in 0..6 {
         match kernel
-            .call("session/setModel", kernel::set_model_params(session_id, provider, model))
+            .call("session/setModel", kernel::set_model_params(session_id, provider, model, effort))
             .await
         {
             Ok(_) => return,
@@ -2622,7 +2633,8 @@ impl acp::Agent for ZcodeAgent {
         // race that and fail, leaving the session on the default provider,
         // so retry briefly.
         if let Some((provider, model)) = load_model_preference() {
-            set_model_with_retry(&kernel, &session_id, &provider, &model).await;
+            let effort = load_effort_preference();
+            set_model_with_retry(&kernel, &session_id, &provider, &model, effort.as_deref()).await;
         }
         let acp_session = acp::SessionId::new(session_id.clone());
         let state = Rc::new(SessionState::new());
@@ -2692,7 +2704,8 @@ impl acp::Agent for ZcodeAgent {
         // Resume restores the conversation but not the model runtime —
         // revive it or the first send fails with ZCODE_RUNTIME_MODEL_UNAVAILABLE.
         if let Some((provider, model)) = load_model_preference() {
-            set_model_with_retry(&kernel, &session_id, &provider, &model).await;
+            let effort = load_effort_preference();
+            set_model_with_retry(&kernel, &session_id, &provider, &model, effort.as_deref()).await;
         }
         v4_subscribe(&kernel, &session_id);
         let state = Rc::new(SessionState::new());
@@ -3721,6 +3734,17 @@ impl acp::Agent for ZcodeAgent {
         args: acp::SetSessionModelRequest,
     ) -> acp::Result<acp::SetSessionModelResponse> {
         debug_log("acp: set_session_model");
+        // /model X [effort] and /effort ride meta.reasoningEffort; persist so
+        // FRESH sessions start on the user's chosen level.
+        let effort = args
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("reasoningEffort"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if let Some(level) = effort.as_deref() {
+            save_effort_preference(level);
+        }
         let kernel = self.kernel()?;
         let model = &*args.model_id.0;
         let provider = load_model_preference().map(|(p, _)| p).unwrap_or(DEFAULT_PROVIDER.to_string());
@@ -3728,7 +3752,7 @@ impl acp::Agent for ZcodeAgent {
         let mut switched = false;
         for attempt in 0..3 {
             match kernel
-                .call("session/setModel", kernel::set_model_params(&self.session_kernel_id(&args.session_id), &provider, model))
+                .call("session/setModel", kernel::set_model_params(&self.session_kernel_id(&args.session_id), &provider, model, effort.as_deref()))
                 .await
             {
                 Ok(_) => {
@@ -5490,11 +5514,42 @@ fn load_model_preference() -> Option<(String, String)> {
     ))
 }
 
+/// The persisted reasoning effort; None until the user picks one — fresh
+/// sessions then start on the KERNEL's default, not a hardcoded max.
+fn load_effort_preference() -> Option<String> {
+    let path = dirs_config_file("model.json")?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    value
+        .get("effort")
+        .and_then(Value::as_str)
+        .filter(|e| matches!(*e, "low" | "high" | "max"))
+        .map(str::to_string)
+}
+
+fn save_effort_preference(level: &str) {
+    use std::io::Write;
+    let Some(path) = dirs_config_file("model.json") else { return };
+    let mut value: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("effort".to_string(), json!(level));
+        let _ = std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(value.to_string().as_bytes()));
+    }
+}
+
 fn dirs_config_file(name: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
-        .or_else(|| Some(std::path::PathBuf::from(zcode_home())))
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
+        })
         .map(|base| base.join("zcode-tui").join(name))
 }
 
