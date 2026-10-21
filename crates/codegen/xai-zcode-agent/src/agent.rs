@@ -404,6 +404,13 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
             return;
         };
         debug_log("push_model_state: session/read ok");
+        // The kernel's persisted reasoning effort rides the read result.
+        let thought_level = read
+            .pointer("/session/thoughtLevel")
+            .or_else(|| read.pointer("/thoughtLevel"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| latest_persisted_thought_level(session_id.split('/').next().unwrap_or(session_id)));
         let Some(mut state) = model_state_from_settings(&read) else {
             return;
         };
@@ -431,6 +438,24 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                         None => m.clone(),
                     })
                     .collect();
+            }
+        }
+        // Surface the kernel's persisted reasoning effort on the current
+        // model's meta so the pager's composer shows the effort tag after
+        // resume/new sessions (in-session /effort already flows live).
+        if let Some(level) = thought_level {
+            if let Some(current) = state
+                .available_models
+                .iter_mut()
+                .find(|m| m.model_id.0.as_ref() == state.current_model_id.0.as_ref())
+            {
+                if let Some(m) = current.meta.as_mut() {
+                    m.insert("reasoningEffort".to_string(), json!(level));
+                } else {
+                    let mut m = serde_json::Map::new();
+                    m.insert("reasoningEffort".to_string(), json!(level));
+                    current.meta = Some(m);
+                }
             }
         }
         if let Ok(params) = serde_json::value::to_raw_value(&state) {
@@ -1254,6 +1279,30 @@ fn rewind_points(session_id: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// The latest persisted reasoning effort for a session from the ledger
+/// (runtime/model_selection entries carry thoughtLevel). None when the
+/// session never set one.
+fn latest_persisted_thought_level(kernel_sid: &str) -> Option<String> {
+    let home = zcode_home();
+    let con = rusqlite::Connection::open_with_flags(
+        std::path::Path::new(&home).join(".zcode/cli/db/db.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    con.query_row(
+        "SELECT COALESCE(json_extract(data, '$.thoughtLevel'), \
+           json_extract(data, '$.modelSelection.options.reasoningLevel')) \
+         FROM session_entry \
+         WHERE session_id = ?1 AND type = 'runtime/model_selection' \
+         AND (json_extract(data, '$.thoughtLevel') IS NOT NULL \
+            OR json_extract(data, '$.modelSelection.options.reasoningLevel') IS NOT NULL) \
+         ORDER BY time_created DESC LIMIT 1",
+        [kernel_sid],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
 }
 
 /// The kernel message id of the Nth real user message, if present.
@@ -2621,8 +2670,19 @@ impl acp::Agent for ZcodeAgent {
         let kernel = self.ensure_kernel().await?;
         let session_id = args.session_id.0.as_ref().to_string();
         enable_dynamic_workflows(&kernel, &args.cwd.to_string_lossy()).await;
+        // The kernel's resume accepts a thoughtLevel migration hint; feed the
+        // ledger's latest persisted effort so the resumed session RESTORES
+        // its reasoning level (the kernel reads it for old sessions without
+        // a runtime/model_selection entry, and re-affirms it otherwise).
+        let resume_params = {
+            let mut params = kernel::resume_params(&session_id);
+            if let Some(level) = latest_persisted_thought_level(&session_id) {
+                params["thoughtLevel"] = json!(level);
+            }
+            params
+        };
         let resumed = kernel
-            .call("session/resume", kernel::resume_params(&session_id))
+            .call("session/resume", resume_params)
             .await
             .map_err(|e| acp::Error::internal_error().data(format!("session/resume failed: {e}")))?;
         kernel

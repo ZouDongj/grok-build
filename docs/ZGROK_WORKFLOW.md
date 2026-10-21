@@ -285,6 +285,24 @@ settings 文件。v4 订阅模型（conversation/subscribe rows）是后续深�
   在 3.14 不出现）。本机桌面升级到 3.15.x 后启动器自动切换，届时重跑回归即可。
 - 桌面版升级会自动被 zgrok 采用（启动器选最高版本目录）。
 
+## effort 持久化（resume/新建恢复标识）
+
+- **默认强度**：GLM-5.3 内核默认（low/high/max 三档中的默认——不设置时按
+  内核缺省，当前是 high 档位序列的默认；输入框只有你显式设过 effort 才有标识）。
+- **持久化链路**：内核把 effort 存 `session_entry` 表 `runtime/model_selection`
+  行——**顶层 `thoughtLevel`（旧形状）或 `modelSelection.options.reasoningLevel`
+  （新形状）**，两种都要读。恢复三件套：
+  1. `session/resume` 带 `thoughtLevel` 迁移提示（内核对老会话/冷恢复生效）；
+  2. `session/read` 的 `/session/thoughtLevel` 读回；
+  3. **账本兜底**：前两者没有时直接查 session_entry 最新值。
+  读到后注入当前模型的 `_meta.reasoningEffort`（wire 键名，注意不是 `meta`），
+  pager 输入框右下角标识恢复。
+- **内核 FK 竞态（内核侧 bug，记录不修）**：新会话首回合完成前 setThoughtLevel
+  → `model_selection.persist_failed: FOREIGN KEY`（session 行还没提交）。影响：
+  刚建会话立刻设 effort 然后重启会丢；跑一轮对话后设置则正常持久化。
+- **主题说明**：上游 tarball 就是 6 主题 + auto；非 truecolor 终端会再过滤
+  truecolor 专属主题——不是我们删的。
+
 ## todo 面板可见性（根因：数据一直通，面板默认藏）
 
 - **数据链路从来没断**：内核 todo 表 → push_todos（TodoWrite result 即时 +
