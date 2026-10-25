@@ -13,6 +13,18 @@ use crate::kernel::{self, Kernel, KernelMessage, TurnEvent};
 
 const DEFAULT_PROVIDER: &str = "account:bigmodel-individual-coding-plan";
 const DEFAULT_MODEL: &str = "GLM-5.3";
+/// The free-token "Start Plan" account provider — same bigmodel account,
+/// separate entitlement bucket (active while 智谱 runs free-token campaigns).
+/// Registry models GLM-5.3-Flash/GLM-5.2/GLM-5-Turbo, anthropic endpoint
+/// zcode.z.ai/api/v1/zcode-plan/anthropic, auth = the zcode JWT as the
+/// anthropic x-api-key (the desktop host's resolveCurrent shape). The
+/// registry keeps ONE active plan per family: switching flips the account
+/// snapshot's `current` flag before setModel.
+const START_PLAN_PROVIDER: &str = "account:bigmodel-start-plan";
+/// Picker marker for Start Plan models: the pager only sends back a model id,
+/// so the provider switch rides a suffix (`GLM-5.2@start`). Stripped before
+/// the id reaches the kernel.
+const START_PLAN_SUFFIX: &str = "@start";
 
 pub struct ZcodeAgent {
     gateway: AcpGatewaySender<acp::AgentSide>,
@@ -511,13 +523,13 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
             return;
         };
         let (provider_id, current) = (main.0, main.1);
-        let mut models = crate::catalog::bundled_models(&home, provider_id);
+        let mut models = combined_model_catalog(&home);
         if models.is_empty() {
             return;
         }
-        let current_id = acp::ModelId::new(current.to_string());
+        let current_id = acp::ModelId::new(display_model_id(provider_id, current));
         if !models.iter().any(|m| m.model_id == current_id) {
-            models.insert(0, acp::ModelInfo::new(current.to_string(), current.to_string()));
+            models.insert(0, acp::ModelInfo::new(current_id.0.clone(), current.to_string()));
         }
         let catalog = acp::SessionModelState::new(current_id, models);
         if let Ok(raw) = serde_json::value::to_raw_value(&catalog) {
@@ -604,7 +616,6 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
             return;
         }
         self.shared.account_pushed.set(true);
-        let provider = DEFAULT_PROVIDER;
         let revision = format!(
             "host:{}",
             std::time::SystemTime::now()
@@ -616,38 +627,67 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         // builtin revision and drops mismatches — the revision is per-boot, so
         // wait for THIS kernel's own provider_registry.ready log entry.
         let based_on = kernel_builtin_revision(kernel.boot_epoch_ms());
-        // The pushed provider entry carries its model list too (zod allows
-        // builtinModelIds beside access) — without it the kernel only knows
-        // the session's current model. The list MUST match what the kernel's
-        // own builtin registry declares (the desktop package the launcher
-        // picks), or unknown ids poison the whole entry.
-        let model_ids: Vec<String> = Some(std::path::PathBuf::from(zcode_home()))
-            .map(|home| kernel_builtin_model_ids(&home, provider))
-            .unwrap_or_default();
-        let params = json!({
-            "revision": revision,
-            "basedOnZCodeBuiltinRevision": based_on,
-            "providers": {
-                provider: {
+        let home = std::path::PathBuf::from(zcode_home());
+        // Entitle BOTH account providers in one snapshot: the coding plan and
+        // the (weekend-free) start plan — model selection decides which one
+        // a session rides. `current` marks the user's preferred provider.
+        let preferred =
+            load_model_preference().map(|(p, _)| p).unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
+        let mut providers = serde_json::Map::new();
+        let mut states = serde_json::Map::new();
+        for provider in [DEFAULT_PROVIDER, START_PLAN_PROVIDER] {
+            let mut model_ids: Vec<String> = kernel_builtin_model_ids(&home, provider);
+            if model_ids.is_empty() {
+                // Registry without the start-plan entry (pre-0.16.9 file):
+                // keep the snapshot to what the kernel actually knows.
+                continue;
+            }
+            // The registry lists three start-plan models but the plan endpoint
+            // also serves GLM-5.3 (picker advertises it; appended ids do not
+            // poison the entry — registry-verified).
+            if provider == START_PLAN_PROVIDER && !model_ids.iter().any(|m| m == DEFAULT_MODEL) {
+                model_ids.push(DEFAULT_MODEL.to_string());
+            }
+            // The pushed provider entry carries its model list too (zod allows
+            // builtinModelIds beside access) — without it the kernel only knows
+            // the session's current model. The list MUST stay within what the
+            // kernel's own builtin registry knows (the desktop package the
+            // launcher picks), or unknown ids poison the whole entry.
+            //
+            // zod-strict: access accepts exactly {type, entitled} (the mode/
+            // accountType come from the kernel's own builtin registry).
+            providers.insert(
+                provider.into(),
+                json!({
                     "builtinModelIds": model_ids,
-                    // zod-strict: access accepts exactly {type, entitled}.
                     "access": {
                         "type": "zhipu-account",
                         "entitled": true,
                     }
-                }
-            },
-            "states": {
-                provider: {
+                }),
+            );
+            states.insert(
+                provider.into(),
+                json!({
                     "availability": "available",
                     "entitled": true,
-                    "current": true,
-                }
-            },
-        });
+                    "current": provider == preferred,
+                }),
+            );
+        }
         debug_log(&format!(
-            "account push payload: models={model_ids:?} basedOn={based_on}"
+            "account push payload: providers={} preferred={preferred} basedOn={based_on}",
+            serde_json::Value::Object(providers.clone())
+                .as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default()
         ));
+        let params = json!({
+            "revision": revision,
+            "basedOnZCodeBuiltinRevision": based_on,
+            "providers": providers,
+            "states": states,
+        });
         match kernel.call("provider/updateAccountConfig", params).await {
             Ok(result) => debug_log(&format!(
                 "account config pushed: {}",
@@ -1323,12 +1363,7 @@ fn rewind_message_id(session_id: &str, target_prompt_index: usize) -> Option<Str
 /// `X-Bigmodel-Authorization` the coding-plan maas JWT (the bigmodel OAuth
 /// access token). Team-scope headers only apply to team plans — omitted.
 fn official_mcp_auth_headers() -> Option<Value> {
-    let home = zcode_home();
-    let path = std::path::Path::new(&home).join(".zcode/v2/credentials.json");
-    let store: Value = serde_json::from_str(
-        &std::fs::read_to_string(path).ok()?,
-    )
-    .ok()?;
+    let store = credential_store()?;
     let jwt = decrypt_credential(store.get("zcodejwttoken")?.as_str()?);
     let maas = decrypt_credential(store.get("oauth:bigmodel:access_token")?.as_str()?);
     if jwt.is_empty() || maas.is_empty() {
@@ -1341,6 +1376,26 @@ fn official_mcp_auth_headers() -> Option<Value> {
             "X-Bigmodel-Authorization": format!("Bearer {maas}"),
         },
     }))
+}
+
+/// The decrypted v2 credential store, read in-process only.
+fn credential_store() -> Option<Value> {
+    let home = zcode_home();
+    let path = std::path::Path::new(&home).join(".zcode/v2/credentials.json");
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+/// Request-time auth for the Start Plan provider (`start-plan` account
+/// access): the zcode JWT rides as the anthropic x-api-key — the same
+/// material the desktop host's resolveCurrent returns for planKind
+/// start-plan. Values are never logged; only header names reach the log.
+fn start_plan_jwt() -> Option<String> {
+    let store = credential_store()?;
+    let jwt = decrypt_credential(store.get("zcodejwttoken")?.as_str()?);
+    if jwt.trim().is_empty() {
+        return None;
+    }
+    Some(jwt)
 }
 
 /// The kernel's prompt ledger for the composer's up-arrow recall.
@@ -2355,9 +2410,10 @@ async fn set_model_with_retry(
     model: &str,
     effort: Option<&str>,
 ) {
+    let level = normalize_effort(model, effort);
     for attempt in 0..6 {
         match kernel
-            .call("session/setModel", kernel::set_model_params(session_id, provider, model, effort))
+            .call("session/setModel", kernel::set_model_params(session_id, provider, model, Some(&level)))
             .await
         {
             Ok(_) => return,
@@ -3746,13 +3802,23 @@ impl acp::Agent for ZcodeAgent {
             save_effort_preference(level);
         }
         let kernel = self.kernel()?;
-        let model = &*args.model_id.0;
-        let provider = load_model_preference().map(|(p, _)| p).unwrap_or(DEFAULT_PROVIDER.to_string());
+        // The picker sends back whatever id the catalog advertised — the
+        // marker routes Start Plan picks to their provider.
+        let (model, provider) = resolve_model_selection(&args.model_id.0);
         debug_log(&format!("set_session_model: setModel {provider}/{model}"));
+        // The registry keeps ONE active zhipu-account plan per family — the
+        // provider marked `current` in the account snapshot. Persist the new
+        // preference and re-push BEFORE setModel so the target provider is
+        // the current one (start-plan picks fail model-not-found otherwise).
+        let previous = load_model_preference();
+        save_model_preference(&provider, &model);
+        self.shared.account_pushed.set(false);
+        self.push_account_config(&kernel).await;
         let mut switched = false;
+        let level = normalize_effort(&model, effort.as_deref());
         for attempt in 0..3 {
             match kernel
-                .call("session/setModel", kernel::set_model_params(&self.session_kernel_id(&args.session_id), &provider, model, effort.as_deref()))
+                .call("session/setModel", kernel::set_model_params(&self.session_kernel_id(&args.session_id), &provider, &model, Some(&level)))
                 .await
             {
                 Ok(_) => {
@@ -3763,11 +3829,21 @@ impl acp::Agent for ZcodeAgent {
                     debug_log(&format!("set_session_model: setModel FAILED (attempt {}): {error}", attempt + 1));
                     // Registry-miss usually means the pushed account snapshot
                     // decayed — re-push before retrying.
+                    self.shared.account_pushed.set(false);
                     self.push_account_config(&kernel).await;
                 }
             }
         }
         if !switched {
+            // Roll the preference back so fresh sessions don't start on a
+            // provider the registry just rejected.
+            let (p, m) = previous.unwrap_or((DEFAULT_PROVIDER.to_string(), DEFAULT_MODEL.to_string()));
+            save_model_preference(&p, &m);
+            if let Some(level) = load_effort_preference() {
+                save_effort_preference(&level);
+            }
+            self.shared.account_pushed.set(false);
+            self.push_account_config(&kernel).await;
             return Err(acp::Error::internal_error().data("setModel failed after retries"));
         }
         debug_log("set_session_model: setModel ok");
@@ -5433,10 +5509,24 @@ pub fn model_state_from_model(model: &Value) -> Option<acp::SessionModelState> {
             .pointer("/ref/modelId")
             .and_then(Value::as_str)?
             .to_string();
-        let mut info = acp::ModelInfo::new(model_id.clone(), {
-            let label = entry.get("label").and_then(Value::as_str).unwrap_or(&model_id);
-            label.to_string()
-        });
+        // Entries carry their provider: Start Plan ones keep the picker
+        // marker so the selection matches the combined catalog.
+        let provider_id = entry
+            .pointer("/ref/providerId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let display_id = display_model_id(provider_id, &model_id);
+        let label = entry
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap_or(&model_id)
+            .to_string();
+        let name = if display_id.ends_with(START_PLAN_SUFFIX) {
+            format!("{label} (Start)")
+        } else {
+            label
+        };
+        let mut info = acp::ModelInfo::new(display_id, name);
         if let Some(window) = entry.get("contextWindow").and_then(Value::as_u64) {
             let mut meta = acp::Meta::new();
             meta.insert("totalContextTokens".to_string(), json!(window));
@@ -5450,7 +5540,13 @@ pub fn model_state_from_model(model: &Value) -> Option<acp::SessionModelState> {
     let current = model
         .pointer("/current/modelId")
         .and_then(Value::as_str)
-        .map(|id| acp::ModelId::new(id.to_string()))
+        .map(|id| {
+            let provider_id = model
+                .pointer("/current/providerId")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            acp::ModelId::new(display_model_id(provider_id, id))
+        })
         .unwrap_or_else(|| models[0].model_id.clone());
     Some(acp::SessionModelState::new(current, models))
 }
@@ -5514,6 +5610,75 @@ fn load_model_preference() -> Option<(String, String)> {
     ))
 }
 
+/// Persist the active provider/model (fresh sessions start on it), keeping
+/// any effort preference that shares the file.
+fn save_model_preference(provider: &str, model: &str) {
+    use std::io::Write;
+    let Some(path) = dirs_config_file("model.json") else { return };
+    let mut value: Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_else(|| json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("providerId".to_string(), json!(provider));
+        obj.insert("modelId".to_string(), json!(model));
+        let _ = std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(value.to_string().as_bytes()));
+    }
+}
+
+/// A model id as the pager sees it: Start Plan models carry the switch
+/// marker so the picker can offer both plans at once.
+fn display_model_id(provider: &str, model: &str) -> String {
+    if provider == START_PLAN_PROVIDER {
+        format!("{model}{START_PLAN_SUFFIX}")
+    } else {
+        model.to_string()
+    }
+}
+
+/// Split a picker model id back into (kernel model id, provider): the
+/// marker routes to the Start Plan provider. Bare ids are the coding
+/// plan's catalog entries and must route there even when the stored
+/// preference currently names the start plan (switching back).
+fn resolve_model_selection(picked: &str) -> (String, String) {
+    match picked.strip_suffix(START_PLAN_SUFFIX) {
+        Some(model) => (model.to_string(), START_PLAN_PROVIDER.to_string()),
+        None => (picked.to_string(), DEFAULT_PROVIDER.to_string()),
+    }
+}
+
+/// The combined picker catalog: the coding plan's models (bare ids) plus the
+/// Start Plan's (marker-suffixed ids, "(Start)" label) so both entitlement
+/// buckets are reachable from one list. GLM-5.3 also rides Start — the
+/// official client serves it there today (live-verified), so surface it even
+/// though the builtin registries don't list it under the start plan.
+fn combined_model_catalog(home: &std::path::Path) -> Vec<acp::ModelInfo> {
+    let mut models: Vec<acp::ModelInfo> = crate::catalog::bundled_models(home, DEFAULT_PROVIDER);
+    let start_models = crate::catalog::bundled_models(home, START_PLAN_PROVIDER);
+    let mut start_has_default_model = false;
+    for info in start_models {
+        start_has_default_model |= info.model_id.0.as_ref() == DEFAULT_MODEL;
+        let mut labeled = acp::ModelInfo::new(
+            format!("{}{START_PLAN_SUFFIX}", info.model_id.0),
+            format!("{} (Start)", info.model_id.0),
+        );
+        labeled.meta = info.meta;
+        models.push(labeled);
+    }
+    if !start_has_default_model
+        && models
+            .iter()
+            .any(|m| !m.model_id.0.ends_with(START_PLAN_SUFFIX) && m.model_id.0.as_ref() == DEFAULT_MODEL)
+    {
+        models.push(acp::ModelInfo::new(
+            format!("{DEFAULT_MODEL}{START_PLAN_SUFFIX}"),
+            format!("{DEFAULT_MODEL} (Start)"),
+        ));
+    }
+    models
+}
+
 /// The persisted reasoning effort; None until the user picks one — fresh
 /// sessions then start on the KERNEL's default, not a hardcoded max.
 fn load_effort_preference() -> Option<String> {
@@ -5525,6 +5690,40 @@ fn load_effort_preference() -> Option<String> {
         .and_then(Value::as_str)
         .filter(|e| matches!(*e, "low" | "high" | "max"))
         .map(str::to_string)
+}
+
+/// Effort actually sendable to `model`: the registry requires SOME level and
+/// rejects unsupported ones (GLM-5-Turbo takes disabled/enabled, not high).
+/// Falls back high, else the model's strongest listed level.
+fn normalize_effort(model: &str, requested: Option<&str>) -> String {
+    let home = std::path::PathBuf::from(zcode_home());
+    let levels: Vec<String> = combined_model_catalog(&home)
+        .into_iter()
+        .find(|m| {
+            m.model_id.0.as_ref() == model
+                || m.model_id.0.strip_suffix(START_PLAN_SUFFIX) == Some(model)
+        })
+        .and_then(|m| {
+            m.meta
+                .as_ref()
+                .and_then(|meta| meta.get("reasoningEfforts"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+        })
+        .unwrap_or_default();
+    if let Some(level) = requested {
+        if levels.iter().any(|l| l == level) {
+            return level.to_string();
+        }
+    }
+    if levels.iter().any(|l| l == "high") {
+        return "high".to_string();
+    }
+    levels.last().cloned().unwrap_or_else(|| "high".to_string())
 }
 
 fn save_effort_preference(level: &str) {
@@ -6998,16 +7197,45 @@ async fn handle_server_request(
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let reply = match coding_plan_api_key(&provider_id) {
-            Some(api_key) => json!({
-                "headersApplied": true,
-                "requestAuth": {"apiKey": api_key},
-            }),
-            None => json!({
-                "headersApplied": false,
-                "errorMessage": "no coding-plan credential for provider",
-            }),
+        // The request carries the provider's accountAccess — branch on the
+        // mode, not the id, so both families (zai/bigmodel) route correctly.
+        let mode = params
+            .pointer("/accountAccess/mode")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let reply = if mode == "start-plan" || provider_id.contains("start-plan") {
+            // Start-plan rides the zcode.z.ai plan endpoint with the ZCODE
+            // JWT as the anthropic x-api-key — exactly the desktop host's
+            // resolveCurrent for planKind=start-plan (apiKey only, no
+            // headers; headers-only replies die in the vercel adapter's
+            // loadApiKey before the request goes out).
+            match start_plan_jwt() {
+                Some(jwt) => json!({
+                    "headersApplied": true,
+                    "requestAuth": {"apiKey": jwt},
+                }),
+                None => json!({
+                    "headersApplied": false,
+                    "errorMessage": "start-plan credentials unavailable (zcode jwt missing)",
+                }),
+            }
+        } else {
+            match coding_plan_api_key(&provider_id) {
+                Some(api_key) => json!({
+                    "headersApplied": true,
+                    "requestAuth": {"apiKey": api_key},
+                }),
+                None => json!({
+                    "headersApplied": false,
+                    "errorMessage": "no coding-plan credential for provider",
+                }),
+            }
         };
+        debug_log(&format!(
+            "runtime headers: provider={provider_id} mode={mode} applied={}",
+            reply.get("headersApplied").and_then(Value::as_bool).unwrap_or(false)
+        ));
         if let Some(kernel) = shared.state.borrow().kernel.clone() {
             let _ = kernel.reply(envelope_id, reply);
         }

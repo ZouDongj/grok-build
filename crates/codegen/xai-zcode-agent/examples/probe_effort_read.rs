@@ -25,8 +25,9 @@ async fn main() -> anyhow::Result<()> {
                         }
                         AcpClientMessage::RequestPermission(p) => {
                             if let Some(o) = p.options.first() {
+                                let pick = o.option_id.clone();
                                 let _ = p.response_tx.send(Ok(acp::RequestPermissionResponse::new(
-                                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(o.option_id.clone())),
+                                    acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(pick)),
                                 )));
                             }
                         }
