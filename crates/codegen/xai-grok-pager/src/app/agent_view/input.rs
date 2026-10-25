@@ -133,6 +133,7 @@ impl AgentView {
         self.persistent_text_selection.is_none()
             && self.highlighted_link_idx.is_none()
             && !self.show_goal_detail
+            && !self.show_quota_detail
             && !self.show_workflows
             && self.rewind_state.is_none()
             && self.btw_state.is_none()
@@ -2353,6 +2354,33 @@ mod jump_backout_key_tests {
         assert!(
             !agent.no_esc_consumer_pending(),
             "an open /jump picker consumes Esc"
+        );
+    }
+    /// Same contract for the quota detail modal: with it open, Esc must close
+    /// the modal inside `handle_input`, not exit the dashboard overlay to the
+    /// session picker.
+    #[test]
+    fn quota_detail_modal_is_an_esc_consumer() {
+        let mut agent = make_agent();
+        assert!(
+            agent.no_esc_consumer_pending(),
+            "baseline: no Esc consumer pending"
+        );
+        agent.quota_state = Some(crate::views::agent_status::parse_quota_state(
+            &serde_json::json!({
+                "fiveHour": {"used": 10, "total": 100, "pct": 10},
+                "week": {"used": 20, "total": 100, "pct": 20},
+            }),
+        ));
+        agent.show_quota_detail = true;
+        assert!(
+            !agent.no_esc_consumer_pending(),
+            "an open quota detail modal consumes Esc"
+        );
+        agent.show_quota_detail = false;
+        assert!(
+            agent.no_esc_consumer_pending(),
+            "closing the modal releases Esc"
         );
     }
     /// The Left-arrow mirror: an open picker fails `is_empty_focused_prompt`, so the overlay Left back-out defers to the picker's own handling.
