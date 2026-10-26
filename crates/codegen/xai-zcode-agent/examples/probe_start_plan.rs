@@ -27,6 +27,10 @@ async fn main() -> anyhow::Result<()> {
     local
         .run_until(async move {
             std::fs::create_dir_all(WORKDIR)?;
+            // The live plan may be expired (free-token campaigns come and
+            // go); pin the cache to entitled so the @start mechanics stay
+            // e2e-testable. The live verdict is probe_start_status's job.
+            xai_zcode_agent::start_plan_probe_seed_cache(true);
             let (client, agent_channel) = acp_channels();
             let gateway = xai_acp_lib::AcpGatewaySender::new(agent_channel.tx);
             let agent = Rc::new(xai_zcode_agent::ZcodeAgent::new(gateway, "zcode"));

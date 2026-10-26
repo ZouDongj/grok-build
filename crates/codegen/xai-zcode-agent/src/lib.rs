@@ -11,6 +11,9 @@ mod catalog;
 mod kernel;
 
 pub use agent::ZcodeAgent;
+pub use agent::{
+    start_plan_entitled_probe, start_plan_probe_seed_cache, start_plan_status_probe,
+};
 pub use kernel::{Kernel, KernelMessage};
 
 pub const KERNEL_BIN_DEFAULT: &str = "zcode";

@@ -430,6 +430,32 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         let Some(mut state) = model_state_from_settings(&read) else {
             return;
         };
+        // Reconcile the cached catalog with the start-plan verdict: the
+        // quota thread may have flipped the cache since the catalog was
+        // built (free-token campaign expired or restarted). The rebuilt
+        // catalog then flows to the pager via the usual merge + notify.
+        {
+            let stale_catalog = self.shared.state.borrow().catalog.clone();
+            if let Some(cat) = stale_catalog {
+                let has_start = cat
+                    .available_models
+                    .iter()
+                    .any(|m| m.model_id.0.ends_with(START_PLAN_SUFFIX));
+                if has_start != start_plan_available_cached() {
+                    let home = std::path::PathBuf::from(zcode_home());
+                    let rebuilt =
+                        acp::SessionModelState::new(cat.current_model_id.clone(), combined_model_catalog(&home));
+                    if let Ok(raw) = serde_json::value::to_raw_value(&rebuilt) {
+                        self.gateway.forward_fire_and_forget(acp::ExtNotification::new(
+                            "x.ai/models/update",
+                            raw.into(),
+                        ));
+                    }
+                    self.shared.state.borrow_mut().catalog = Some(rebuilt);
+                    debug_log("push_model_state: catalog rebuilt after start-plan verdict change");
+                }
+            }
+        }
         // Prefer the cached full catalog; runtime session/read entries are
         // AUTHORITATIVE for models they list (kernel-resolved context
         // window, modalities, reasoning levels) and override the fold.
@@ -635,7 +661,14 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
             load_model_preference().map(|(p, _)| p).unwrap_or_else(|| DEFAULT_PROVIDER.to_string());
         let mut providers = serde_json::Map::new();
         let mut states = serde_json::Map::new();
-        for provider in [DEFAULT_PROVIDER, START_PLAN_PROVIDER] {
+        // The billing check may say the start plan is gone — leave its
+        // provider out of the snapshot entirely then (an entitled snapshot
+        // for a dead plan makes every @start request die at the endpoint).
+        let push_providers: Vec<&str> = [DEFAULT_PROVIDER, START_PLAN_PROVIDER]
+            .into_iter()
+            .filter(|p| *p == DEFAULT_PROVIDER || start_plan_available_cached())
+            .collect();
+        for provider in push_providers {
             let mut model_ids: Vec<String> = kernel_builtin_model_ids(&home, provider);
             if model_ids.is_empty() {
                 // Registry without the start-plan entry (pre-0.16.9 file):
@@ -666,12 +699,21 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
                     }
                 }),
             );
+            // A preference naming a provider that is no longer pushed must
+            // not make the kernel start sessions on a ghost — fall back to
+            // the coding plan in the snapshot's `current` flag.
+            let snapshot_current =
+                if provider == preferred || (provider == DEFAULT_PROVIDER && !providers.contains_key(preferred.as_str())) {
+                    true
+                } else {
+                    false
+                };
             states.insert(
                 provider.into(),
                 json!({
                     "availability": "available",
                     "entitled": true,
-                    "current": provider == preferred,
+                    "current": snapshot_current,
                 }),
             );
         }
@@ -728,6 +770,10 @@ fn session_cwd_and_kernel(&self, session_id: &str) -> acp::Result<(String, Kerne
         self.shared.state.borrow_mut().kernel = Some(kernel.clone());
         // Register the runtime provider (all official models) and cache the
         // full catalog — session/read alone only reports the current model.
+        // Prime the start-plan entitlement first so the catalog and the
+        // account snapshot below agree from the first push (blocking HTTPS,
+        // first run only; ≤6s worst case at startup).
+        prime_start_plan_cache();
         self.refresh_catalog(&kernel).await;
         self.push_account_config(&kernel).await;
         let pump_shared = Rc::clone(&self.shared);
@@ -1396,6 +1442,234 @@ fn start_plan_jwt() -> Option<String> {
         return None;
     }
     Some(jwt)
+}
+
+/// Start-plan entitlement truth: the zcode-plan billing API the official
+/// client itself validates against (`/api/v1/zcode-plan/billing/current`,
+/// Bearer zcode JWT). `data.plans` lists the account's ACTIVE plan periods —
+/// the desktop reads the same array for its `startPlanExpired` flag
+/// (status "expired"). Live-verified shapes: an account without the start
+/// plan returns `plans: []`; a paid subscription shows up in bigmodel's
+/// separate subscription-list API, not here. None = check failed
+/// (network/credentials) — callers must treat the plan as still offered so
+/// a transient error never hides working entries.
+fn start_plan_entitled_remote() -> Option<bool> {
+    let jwt = start_plan_jwt()?;
+    let body: Value = ureq::get("https://zcode.z.ai/api/v1/zcode-plan/billing/current")
+        .set("Authorization", &format!("Bearer {jwt}"))
+        .timeout(std::time::Duration::from_secs(6))
+        .call()
+        .ok()?
+        .into_json()
+        .ok()?;
+    verdict_from_billing_current(&body)
+}
+
+/// Decide start-plan availability from a billing/current body. Unrecognized
+/// shapes yield None (caller keeps the previous verdict).
+fn verdict_from_billing_current(body: &Value) -> Option<bool> {
+    let plans = body.pointer("/data/plans")?.as_array()?;
+    let now_epoch = body
+        .pointer("/data/server_time")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+    let is_start = |p: &Value| {
+        ["planType", "planName", "planCode", "product", "name", "title", "description"]
+            .iter()
+            .any(|k| {
+                p.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.to_ascii_lowercase().contains("start"))
+            })
+    };
+    let start_plans: Vec<&Value> = plans.iter().filter(|p| is_start(p)).collect();
+    if start_plans.is_empty() {
+        // The API answered; the start plan is simply absent.
+        return Some(false);
+    }
+    Some(start_plans.iter().any(|p| {
+        let status_expired = ["status", "planStatus"]
+            .iter()
+            .any(|k| {
+                p.get(*k)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.eq_ignore_ascii_case("expired"))
+            });
+        if status_expired {
+            return false;
+        }
+        // Expire fields arrive either as epoch seconds or as
+        // "YYYY-MM-DD HH:MM:SS"; a past timestamp means gone.
+        let expire_raw: Option<String> = ["expireAt", "expireTime", "expiredAt", "endTime", "valid"]
+            .iter()
+            .find_map(|k| {
+                p.get(*k).and_then(|v| {
+                    v.as_u64()
+                        .map(|n| n.to_string())
+                        .or_else(|| v.as_str().map(str::to_string))
+                })
+            });
+        let expired_by_time = match expire_raw.as_deref() {
+            Some(s) if s.len() >= 19 && s.as_bytes()[4] == b'-' => {
+                // Lexical compare works for the fixed format.
+                let now_str = epoch_to_datetime(now_epoch);
+                &s[..19] < now_str.as_str()
+            }
+            Some(s) => s.parse::<u64>().ok().is_some_and(|ts| ts > 0 && ts < now_epoch),
+            None => false,
+        };
+        !expired_by_time
+    }))
+}
+
+/// `1792983222` -> `2026-10-26 02:53:42` (UTC; consistent with the
+/// server_time epoch the same body carries — both sides of the compare use
+/// the server's clock domain, so the zone cancels).
+fn epoch_to_datetime(epoch: u64) -> String {
+    // Days since epoch -> civil date (Howard Hinnant's algorithm).
+    let days = epoch / 86400;
+    let secs = epoch % 86400;
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+}
+
+/// Cached start-plan availability: (checked_at, entitled). Global because the
+/// catalog builders are sync and run on arbitrary tasks. Unchecked reads as
+/// available (previous behavior) so a failed first check never hides entries.
+static START_PLAN_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
+    std::sync::Mutex::new(None);
+const START_PLAN_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+fn start_plan_available_cached() -> bool {
+    match *START_PLAN_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((_, entitled)) => entitled,
+        None => true,
+    }
+}
+
+/// True when the cache is empty or older than the TTL — caller should refresh.
+fn start_plan_cache_stale() -> bool {
+    match *START_PLAN_CACHE.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((at, _)) => at.elapsed() >= START_PLAN_TTL,
+        None => true,
+    }
+}
+
+fn store_start_plan_cache(entitled: bool) {
+    let mut cache = START_PLAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = Some((std::time::Instant::now(), entitled));
+}
+
+/// Refresh the cache with a blocking HTTPS check; returns the verdict when
+/// the check succeeded. A None verdict keeps the previous value. Blocking —
+/// run off the async loop (startup path or the quota thread).
+fn refresh_start_plan_cache() -> Option<bool> {
+    let verdict = start_plan_entitled_remote()?;
+    store_start_plan_cache(verdict);
+    Some(verdict)
+}
+
+/// Blocking check for startup: only blocks when the cache is empty (first
+/// run ever); afterwards a stale cache is refreshed lazily elsewhere.
+fn prime_start_plan_cache() {
+    let empty = {
+        let cache = START_PLAN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        cache.is_none()
+    };
+    if empty {
+        let _ = refresh_start_plan_cache();
+    }
+}
+
+/// Probe wrapper: run the entitlement check without touching the cache.
+pub fn start_plan_entitled_probe() -> Option<bool> {
+    start_plan_entitled_remote()
+}
+
+/// E2E-probe hook: seed the availability cache directly. The live verdict
+/// (`start_plan_entitled_probe`) still answers what the API says; this only
+/// pins the catalog/account-push behavior so the @start mechanics stay
+/// testable while the campaign is offline. Hidden — not for normal use.
+#[doc(hidden)]
+pub fn start_plan_probe_seed_cache(entitled: bool) {
+    store_start_plan_cache(entitled);
+}
+
+/// Sanitized bodies of the start-plan status endpoints, for probes and
+/// debugging: recursive redaction of credential-ish fields, values truncated.
+pub fn start_plan_status_probe() -> Value {    fn redact(v: &Value) -> Value {
+        let truncate = |s: &str| {
+            if s.len() > 60 {
+                format!("{}…({}B)", &s[..60], s.len())
+            } else {
+                s.to_string()
+            }
+        };
+        match v {
+            Value::Object(map) => Value::Object(
+                map.iter()
+                    .map(|(k, x)| {
+                        let kl = k.to_ascii_lowercase();
+                        if ["token", "key", "secret", "jwt", "authorization", "apikey", "api_key"]
+                            .iter()
+                            .any(|bad| kl.contains(bad))
+                        {
+                            (k.clone(), Value::String("<redacted>".into()))
+                        } else {
+                            (k.clone(), redact(x))
+                        }
+                    })
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(redact).collect()),
+            Value::String(s) => Value::String(truncate(s)),
+            other => other.clone(),
+        }
+    }
+    let apikey = coding_plan_api_key(DEFAULT_PROVIDER).unwrap_or_default();
+    let jwt = start_plan_jwt().unwrap_or_default();
+    let fetch = |url: &str, name: &str, value: &str| -> Value {
+        match ureq::get(url)
+            .set(name, value)
+            .timeout(std::time::Duration::from_secs(6))
+            .call()
+        {
+            Ok(r) => {
+                let body: Value = r.into_json().unwrap_or(Value::Null);
+                json!({"ok": true, "body": redact(&body)})
+            }
+            Err(ureq::Error::Status(code, r)) => {
+                let body: Value = r.into_json().unwrap_or(Value::Null);
+                json!({"ok": false, "status": code, "body": redact(&body)})
+            }
+            Err(e) => json!({"ok": false, "error": e.to_string()}),
+        }
+    };
+    json!({
+        "billingCurrent": if jwt.is_empty() { json!({"ok": false, "error": "no jwt"}) } else {
+            fetch("https://zcode.z.ai/api/v1/zcode-plan/billing/current", "Authorization", &format!("Bearer {jwt}"))
+        },
+        "billingBalance": if jwt.is_empty() { json!({"ok": false, "error": "no jwt"}) } else {
+            fetch("https://zcode.z.ai/api/v1/zcode-plan/billing/balance", "Authorization", &format!("Bearer {jwt}"))
+        },
+        "subscriptionList": if apikey.is_empty() { json!({"ok": false, "error": "no api key"}) } else {
+            fetch("https://bigmodel.cn/api/biz/subscription/list", "authorization", &apikey)
+        },
+    })
 }
 
 /// The kernel's prompt ledger for the composer's up-arrow recall.
@@ -2687,8 +2961,16 @@ impl acp::Agent for ZcodeAgent {
         // kernel default is fine when absent. 0.16.9 loads account
         // entitlements asynchronously at startup — an immediate setModel can
         // race that and fail, leaving the session on the default provider,
-        // so retry briefly.
+        // so retry briefly. A preference naming the start plan while its
+        // entitlement is gone falls back to the coding plan (fresh sessions
+        // must not start on a provider no longer in the snapshot).
         if let Some((provider, model)) = load_model_preference() {
+            let (provider, model) = if provider == START_PLAN_PROVIDER && !start_plan_available_cached()
+            {
+                (DEFAULT_PROVIDER.to_string(), DEFAULT_MODEL.to_string())
+            } else {
+                (provider, model)
+            };
             let effort = load_effort_preference();
             set_model_with_retry(&kernel, &session_id, &provider, &model, effort.as_deref()).await;
         }
@@ -2724,6 +3006,13 @@ impl acp::Agent for ZcodeAgent {
                 .name("quota-chip-fetch".into())
                 .spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(800));
+                    // Piggyback the start-plan entitlement refresh: the
+                    // free-token campaigns expire, and the next picker
+                    // rebuild follows the cache (push_model_state
+                    // reconciles catalog vs cache verdict).
+                    if start_plan_cache_stale() {
+                        let _ = refresh_start_plan_cache();
+                    }
                     emit_quota_update(&gateway, &sid);
                 })
                 .ok();
@@ -5655,26 +5944,31 @@ fn resolve_model_selection(picked: &str) -> (String, String) {
 /// though the builtin registries don't list it under the start plan.
 fn combined_model_catalog(home: &std::path::Path) -> Vec<acp::ModelInfo> {
     let mut models: Vec<acp::ModelInfo> = crate::catalog::bundled_models(home, DEFAULT_PROVIDER);
-    let start_models = crate::catalog::bundled_models(home, START_PLAN_PROVIDER);
-    let mut start_has_default_model = false;
-    for info in start_models {
-        start_has_default_model |= info.model_id.0.as_ref() == DEFAULT_MODEL;
-        let mut labeled = acp::ModelInfo::new(
-            format!("{}{START_PLAN_SUFFIX}", info.model_id.0),
-            format!("{} (Start)", info.model_id.0),
-        );
-        labeled.meta = info.meta;
-        models.push(labeled);
-    }
-    if !start_has_default_model
-        && models
-            .iter()
-            .any(|m| !m.model_id.0.ends_with(START_PLAN_SUFFIX) && m.model_id.0.as_ref() == DEFAULT_MODEL)
-    {
-        models.push(acp::ModelInfo::new(
-            format!("{DEFAULT_MODEL}{START_PLAN_SUFFIX}"),
-            format!("{DEFAULT_MODEL} (Start)"),
-        ));
+    // The start plan comes and goes (free-token campaigns expire). When the
+    // billing check last said gone, leave its entries out of the picker
+    // entirely; a fresh entitled verdict brings them back.
+    if start_plan_available_cached() {
+        let start_models = crate::catalog::bundled_models(home, START_PLAN_PROVIDER);
+        let mut start_has_default_model = false;
+        for info in start_models {
+            start_has_default_model |= info.model_id.0.as_ref() == DEFAULT_MODEL;
+            let mut labeled = acp::ModelInfo::new(
+                format!("{}{START_PLAN_SUFFIX}", info.model_id.0),
+                format!("{} (Start)", info.model_id.0),
+            );
+            labeled.meta = info.meta;
+            models.push(labeled);
+        }
+        if !start_has_default_model
+            && models
+                .iter()
+                .any(|m| !m.model_id.0.ends_with(START_PLAN_SUFFIX) && m.model_id.0.as_ref() == DEFAULT_MODEL)
+        {
+            models.push(acp::ModelInfo::new(
+                format!("{DEFAULT_MODEL}{START_PLAN_SUFFIX}"),
+                format!("{DEFAULT_MODEL} (Start)"),
+            ));
+        }
     }
     models
 }
@@ -7654,5 +7948,87 @@ mod workflow_delta_tests {
         assert!(runs[0].get("resultPreview").is_none());
         assert_eq!(runs[0]["actors"].as_array().unwrap().len(), 1);
         assert_eq!(runs[0]["actors"][0]["siteId"], "a#2");
+    }
+}
+
+#[cfg(test)]
+mod start_plan_tests {
+    use super::*;
+
+    #[test]
+    fn billing_current_absent_plan_is_expired() {
+        let body = json!({"code": 0, "data": {"plans": [], "server_time": 1792983222}});
+        assert_eq!(verdict_from_billing_current(&body), Some(false));
+    }
+
+    #[test]
+    fn billing_current_active_start_plan_by_status() {
+        let body = json!({
+            "code": 0,
+            "data": {
+                "server_time": 1792983222,
+                "plans": [
+                    {"planType": "individual-coding-plan", "status": "VALID"},
+                    {"planType": "start-plan", "status": "VALID",
+                     "expireAt": "2030-01-01 00:00:00"},
+                ],
+            },
+        });
+        assert_eq!(verdict_from_billing_current(&body), Some(true));
+    }
+
+    #[test]
+    fn billing_current_expired_status_wins() {
+        let body = json!({
+            "code": 0,
+            "data": {
+                "server_time": 1792983222,
+                "plans": [{"planType": "start-plan", "status": "expired"}],
+            },
+        });
+        assert_eq!(verdict_from_billing_current(&body), Some(false));
+    }
+
+    #[test]
+    fn billing_current_past_epoch_expire_wins() {
+        let body = json!({
+            "code": 0,
+            "data": {
+                "server_time": 1792983222,
+                "plans": [{"planType": "start-plan", "status": "VALID",
+                           "expireAt": 1000000000u64}],
+            },
+        });
+        assert_eq!(verdict_from_billing_current(&body), Some(false));
+    }
+
+    #[test]
+    fn billing_current_unrecognized_shape_is_none() {
+        assert_eq!(verdict_from_billing_current(&json!({"code": 3001})), None);
+        assert_eq!(verdict_from_billing_current(&json!({"code": 0, "data": {}})), None);
+    }
+
+    #[test]
+    fn epoch_to_datetime_known_value() {
+        assert_eq!(epoch_to_datetime(1792983222), "2026-10-26 02:53:42");
+        assert_eq!(epoch_to_datetime(0), "1970-01-01 00:00:00");
+    }
+
+    #[test]
+    fn combined_catalog_gates_start_entries_on_cache() {
+        let home = std::path::PathBuf::from(zcode_home());
+        store_start_plan_cache(false);
+        let without = combined_model_catalog(&home);
+        assert!(
+            !without.iter().any(|m| m.model_id.0.ends_with(START_PLAN_SUFFIX)),
+            "an expired verdict must hide the @start entries"
+        );
+        store_start_plan_cache(true);
+        let with = combined_model_catalog(&home);
+        assert!(
+            with.iter().any(|m| m.model_id.0.ends_with(START_PLAN_SUFFIX)),
+            "an entitled verdict must offer the @start entries"
+        );
+        store_start_plan_cache(false);
     }
 }
